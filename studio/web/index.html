@@ -1,0 +1,126 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>KenauShorts Studio — Always-On PC Engine</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;600;700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="/style.css">
+</head>
+<body>
+  <!-- Sidebar Navigation -->
+  <aside>
+    <div class="brand">
+      <div class="logo-badge">K</div>
+      <div class="brand-text">
+        <h2>KenauShorts</h2>
+        <span class="sub">Shorts Automation Studio</span>
+      </div>
+    </div>
+
+    <nav aria-label="Main Navigation">
+      <button data-page="overview" class="nav-btn active">
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="7" height="7"></rect><rect x="14" y="3" width="7" height="7"></rect><rect x="14" y="14" width="7" height="7"></rect><rect x="3" y="14" width="7" height="7"></rect></svg>
+        <span>Overview</span>
+      </button>
+
+      <button data-page="library" class="nav-btn">
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="m22 8-6 4 6 4V8Z"></path><rect x="2" y="6" width="14" height="12" rx="2"></rect></svg>
+        <span>Drafts & Library</span>
+      </button>
+
+      <button data-page="subreddits" class="nav-btn">
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"></circle><path d="M12 8v8M8 12h8"></path></svg>
+        <span>Subreddits</span>
+      </button>
+
+      <button data-page="style" class="nav-btn">
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"></circle><path d="m4.93 4.93 4.24 4.24M14.83 14.83l4.24 4.24M14.83 9.17l4.24-4.24M4.93 19.07l4.24-4.24"></path></svg>
+        <span>Channel & Style</span>
+      </button>
+
+      <button data-page="connections" class="nav-btn">
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"></path><path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"></path></svg>
+        <span>Connections</span>
+      </button>
+
+      <button data-page="automation" class="nav-btn">
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"></circle><polyline points="12 6 12 12 16 14"></polyline></svg>
+        <span>Automation</span>
+      </button>
+
+      <button data-page="logs" class="nav-btn">
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="4 17 10 11 4 5"></polyline><line x1="12" y1="19" x2="20" y2="19"></line></svg>
+        <span>Live Logs</span>
+      </button>
+    </nav>
+
+    <div class="sidebar-footer">
+      <div class="host-info">
+        <div class="status-indicator online" id="status-dot"></div>
+        <span id="connection-status">Online • PC Daemon</span>
+      </div>
+      <button class="wizard-btn" id="btn-open-wizard">⚙ Setup Wizard</button>
+    </div>
+  </aside>
+
+  <!-- Main View Container -->
+  <main>
+    <header class="topbar">
+      <div>
+        <span class="eyebrow" id="page-eyebrow">DASHBOARD</span>
+        <h1 id="page-title">Overview</h1>
+      </div>
+      <div class="topbar-actions">
+        <span class="badge" id="badge-mode">Idle</span>
+        <button class="btn btn-secondary" id="btn-quick-preview">+ Create Preview Draft</button>
+        <button class="btn btn-primary" id="btn-quick-run">⚡ Run & Publish</button>
+      </div>
+    </header>
+
+    <div id="notification-bar"></div>
+
+    <section id="content-view" class="content-view">
+      <!-- Injected by app.js based on selected page -->
+    </section>
+  </main>
+
+  <!-- Video Player & Editor Modal -->
+  <dialog id="video-modal">
+    <div class="modal-box">
+      <div class="modal-header">
+        <h3 id="modal-title">Review Draft</h3>
+        <button class="modal-close" id="btn-close-modal">✕</button>
+      </div>
+      <div class="modal-body" id="modal-body">
+        <!-- Video Player & Edit Controls -->
+      </div>
+    </div>
+  </dialog>
+
+  <!-- First-Run Onboarding Wizard Modal -->
+  <dialog id="wizard-modal">
+    <div class="modal-box wizard-box">
+      <div class="modal-header">
+        <div>
+          <h3>Welcome to KenauShorts</h3>
+          <p class="sub">Set up your local channel in 3 simple steps.</p>
+        </div>
+        <button class="modal-close" id="btn-close-wizard">✕</button>
+      </div>
+      <div class="wizard-steps">
+        <div class="wizard-step active" id="step-indicator-1">1. Branding</div>
+        <div class="wizard-step" id="step-indicator-2">2. AI Provider</div>
+        <div class="wizard-step" id="step-indicator-3">3. Subreddits</div>
+      </div>
+      <div class="modal-body" id="wizard-body">
+        <!-- Wizard step forms -->
+      </div>
+    </div>
+  </dialog>
+
+  <script src="/app.js"></script>
+</body>
+</html>

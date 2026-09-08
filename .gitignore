@@ -1,0 +1,58 @@
+# Credentials & Secrets
+.env
+.env.*
+!.env.example
+client_secret*.json
+token*.json
+studio-secrets.json
+*secret*
+*credential*
+
+# Databases & Runtime State
+config.json
+*.sqlite3
+*.sqlite3-journal
+state.json
+studio-settings.json
+.pipeline.lock
+.studio.lock
+
+# Media & Temporary Output
+work/
+out/
+logs/
+*.log
+*.mp4
+*.m4a
+*.webm
+*.png
+*.jpg
+*.jpeg
+!assets/default_avatar.png
+!assets/sample*
+
+# Python & Virtual Environments
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+ENV/
+env/
+.pytest_cache/
+
+# OS Specific
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# IDE & Editors
+.vscode/
+.idea/
+*.swp
+*.swo
+*~

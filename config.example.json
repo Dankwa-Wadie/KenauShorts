@@ -1,0 +1,104 @@
+{
+  "account": {
+    "name": "Your Channel",
+    "handle": "@YourChannel",
+    "avatar": "assets/default_avatar.png",
+    "verified": true
+  },
+  "discovery": {
+    "subreddits": [
+      { "name": "technology", "category": "Tech", "min_score": 300 },
+      { "name": "gadgets", "category": "Tech", "min_score": 250 },
+      { "name": "pcgaming", "category": "Gaming", "min_score": 300 },
+      { "name": "space", "category": "Science", "min_score": 200 },
+      { "name": "artificial", "category": "AI", "min_score": 150 }
+    ],
+    "youtube_channels": [
+      {
+        "name": "NASA",
+        "channel": "UCLA_DiR1FfKNvjuUpBHmylQ",
+        "licence": "public-domain"
+      },
+      {
+        "name": "NOAA",
+        "channel": "UCe9IxQeBttZIYl5c43ycf9g",
+        "licence": "public-domain"
+      },
+      {
+        "name": "Library of Congress",
+        "channel": "UCbObxjfi3W9YKnDS0PgadNA",
+        "licence": "public-domain"
+      }
+    ],
+    "news_rss": [
+      "https://feeds.bbci.co.uk/news/world/rss.xml",
+      "https://www.theverge.com/rss/index.xml",
+      "https://feeds.arstechnica.com/arstechnica/index"
+    ],
+    "per_channel": 6,
+    "max_age_hours": 168
+  },
+  "editorial": {
+    "provider_order": ["gemini", "anthropic", "openai"],
+    "gemini_model": "gemini-1.5-flash",
+    "anthropic_model": "claude-3-5-sonnet-20241022",
+    "openai_model": "gpt-4o-mini",
+    "system_prompt": "You are the senior editorial director for a modern short-form video channel. Select the single most compelling, timely, and visually engaging story from the candidates. Write an urgent, punchy headline under 12 words in ALL-CAPS monospace tone, a concise 2-sentence YouTube description, and 4 relevant hashtags."
+  },
+  "posting": {
+    "max_clip_seconds": 35,
+    "max_download_attempts": 3,
+    "privacy": "private",
+    "category_id": "28",
+    "encoder": "auto",
+    "fps": 30,
+    "video_bitrate": "6M",
+    "x264_preset": "veryfast",
+    "crf": 20,
+    "tags": [
+      "shorts",
+      "tech",
+      "news",
+      "trending"
+    ]
+  },
+  "layout": {
+    "canvas_width": 1080,
+    "canvas_height": 1920,
+    "background": "#000000",
+    "side_margin": 72,
+    "video_margin": 36,
+    "vertical_bias": 0.38,
+    "avatar_size": 96,
+    "avatar_zoom": 1.25,
+    "avatar_trim": true,
+    "header_gap": 22,
+    "name_size": 44,
+    "handle_size": 36,
+    "name_color": "#FFFFFF",
+    "handle_color": "#8B98A5",
+    "verified_color": "#1D9BF0",
+    "verified_size": 40,
+    "header_to_headline": 48,
+    "headline_size": 76,
+    "headline_color": "#FFFFFF",
+    "headline_line_spacing": 14,
+    "headline_wrap_chars": 0,
+    "headline_uppercase": true,
+    "headline_to_video": 52,
+    "video_aspect": "16:9",
+    "corner_radius": 40,
+    "border_width": 6,
+    "border_color": "#1D9BF0",
+    "mono_font": "auto",
+    "ui_font": "auto"
+  },
+  "story_layout": {
+    "card_opacity": 0.85,
+    "background_dim": 0.35,
+    "background_zoom": 1.2,
+    "background_anchor_x": 0.12,
+    "background_anchor_y": 0.1,
+    "vertical_bias": 0.42
+  }
+}
