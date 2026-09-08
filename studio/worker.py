@@ -7,10 +7,12 @@ from __future__ import annotations
 import json
 import logging
 import sys
+import time
 import uuid
 from pathlib import Path
 
 from core import agent, render, render_story
+from core.state import State
 from studio import store
 
 LOG = logging.getLogger("kenaushorts.worker")
@@ -57,6 +59,22 @@ def work(action: str, key: str) -> None:
                 )
                 store.put("videos", key, record)
                 LOG.info("Upload complete for %s -> %s", key, vid_id)
+
+                # Without this, an upload triggered from the Studio (as
+                # opposed to a full core.agent run) never reaches state.json —
+                # the same story could be picked and re-uploaded again later.
+                candidate_key = record.get("candidate", {}).get("key")
+                if candidate_key:
+                    state = State(store.ROOT / "state.json")
+                    state.mark_posted({
+                        "key": candidate_key,
+                        "headline": record.get("headline", ""),
+                        "title": record["title"],
+                        "video_path": record["video"],
+                        "youtube_id": vid_id,
+                        "dry_run": False,
+                        "at": time.time(),
+                    })
 
             except Exception as e:
                 record.update(status="failed", error=str(e))

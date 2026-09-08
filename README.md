@@ -127,9 +127,18 @@ KenauShorts/
 │   ├── start.py               # 1-Click launcher
 │   ├── install_service.py     # Background daemon installer (Win/Mac/Linux)
 │   └── test_setup.py          # Pre-flight diagnostic tool
+├── tests/                     # Unit tests (stdlib unittest, no extra dependency)
 ├── docs/                      # In-depth setup and API guides
 └── config.example.json        # Template configuration
 ```
+
+### Running the test suite
+
+```bash
+python3 -m unittest discover -s tests
+```
+
+Render tests are skipped automatically if `ffmpeg`/`ffprobe` aren't on `PATH`; everything else runs with no network access and no API keys.
 
 ---
 
@@ -146,6 +155,7 @@ KenauShorts/
 - [Getting Started Guide](docs/GETTING_STARTED.md)
 - [Windows Setup Guide](docs/WINDOWS_GUIDE.md)
 - [macOS Setup Guide](docs/MACOS_GUIDE.md)
+- [Linux Setup Guide](docs/LINUX_GUIDE.md)
 - [YouTube Data API & OAuth Setup](docs/YOUTUBE_API_SETUP.md)
 
 ---

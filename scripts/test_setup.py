@@ -53,6 +53,22 @@ def main() -> None:
     except ImportError:
         print("❌ FAIL Pillow: Missing! Run pip install Pillow")
 
+    # 4b. System fonts — a headless/minimal Linux install often has none at
+    # all, which silently falls back to a tiny bitmap font on every card.
+    try:
+        sys.path.insert(0, str(ROOT))
+        from core.render import MONO_CANDIDATES, UI_CANDIDATES, _RESOLVED_FONTS, load_font
+        load_font(MONO_CANDIDATES, 76, role="preflight_mono")
+        load_font(UI_CANDIDATES, 44, role="preflight_ui")
+        mono_ok = "Default bitmap font" not in _RESOLVED_FONTS.get("preflight_mono", "")
+        ui_ok = "Default bitmap font" not in _RESOLVED_FONTS.get("preflight_ui", "")
+        print(f"{check_mark(mono_ok)} Headline font: {_RESOLVED_FONTS.get('preflight_mono', 'unknown')}")
+        print(f"{check_mark(ui_ok)} UI font: {_RESOLVED_FONTS.get('preflight_ui', 'unknown')}")
+        if not (mono_ok and ui_ok) and platform.system() == "Linux":
+            print("   ℹ️  Install fonts-dejavu-core / fonts-liberation (see docs/LINUX_GUIDE.md)")
+    except Exception as e:
+        print(f"⚠️  Could not check system fonts: {e}")
+
     # 5. yt-dlp
     ytdlp_path = shutil.which("yt-dlp")
     print(f"{check_mark(bool(ytdlp_path))} yt-dlp: {ytdlp_path or 'Not Found on PATH (pip install yt-dlp)'}")

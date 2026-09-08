@@ -24,7 +24,16 @@ import time
 import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from typing import Any
 from urllib.parse import parse_qs, urlsplit
+
+if __name__ == "__main__" and __package__ is None:
+    # A background-service manager (launchd/systemd/Task Scheduler) invokes
+    # this file by its raw path rather than `python -m studio.server`, which
+    # leaves the repo root off sys.path — the `from studio import store`
+    # below would otherwise fail with "No module named 'studio'" every time
+    # the service tries to start.
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from studio import store
 
@@ -201,29 +210,195 @@ def automation_loop() -> None:
         except Exception as e:
             LOG.error("Automation error: %s", e)
 
+HEX_COLOR_RE = re.compile(r"^#[0-9A-Fa-f]{6}$")
+
+def _is_number(v: Any) -> bool:
+    return isinstance(v, (int, float)) and not isinstance(v, bool)
+
+def _is_int(v: Any) -> bool:
+    return isinstance(v, int) and not isinstance(v, bool)
+
+def validate_settings_config(patch: dict) -> dict:
+    """
+    Validate a config.json write coming from the Studio UI.
+
+    The Style/Automation pages fetch the current config, mutate a couple of
+    fields, and POST the whole object back rather than a diff — so instead of
+    trusting that payload wholesale (which would let any page that gets past
+    the CSRF/Origin check overwrite config.json with arbitrary content), this
+    validates every field it recognises and merges only those onto the
+    existing on-disk config. Unrecognised keys are dropped rather than
+    rejected, since the frontend round-trips sections it doesn't itself edit.
+    """
+    if not isinstance(patch, dict):
+        raise ValueError("Settings must be an object")
+
+    cfg: dict[str, Any] = {}
+
+    account = patch.get("account", {})
+    if not isinstance(account, dict):
+        raise ValueError("Invalid account settings")
+    out = {}
+    if "name" in account:
+        if not isinstance(account["name"], str) or not account["name"].strip() or len(account["name"]) > 100:
+            raise ValueError("Invalid channel name")
+        out["name"] = account["name"]
+    if "handle" in account:
+        if not isinstance(account["handle"], str) or len(account["handle"]) > 100:
+            raise ValueError("Invalid channel handle")
+        out["handle"] = account["handle"]
+    if "avatar" in account:
+        if not isinstance(account["avatar"], str) or len(account["avatar"]) > 500:
+            raise ValueError("Invalid avatar path")
+        out["avatar"] = account["avatar"]
+    if "verified" in account:
+        if not isinstance(account["verified"], bool):
+            raise ValueError("Invalid verified flag")
+        out["verified"] = account["verified"]
+    if out:
+        cfg["account"] = out
+
+    layout = patch.get("layout", {})
+    if not isinstance(layout, dict):
+        raise ValueError("Invalid layout settings")
+    out = {}
+    if "border_color" in layout:
+        if not isinstance(layout["border_color"], str) or not HEX_COLOR_RE.match(layout["border_color"]):
+            raise ValueError("Border color must be a hex value like #1D9BF0")
+        out["border_color"] = layout["border_color"]
+    if "corner_radius" in layout:
+        v = layout["corner_radius"]
+        if not _is_int(v) or not 0 <= v <= 200:
+            raise ValueError("Corner radius must be 0-200")
+        out["corner_radius"] = v
+    if "headline_size" in layout:
+        v = layout["headline_size"]
+        if not _is_int(v) or not 20 <= v <= 160:
+            raise ValueError("Headline size must be 20-160")
+        out["headline_size"] = v
+    if out:
+        cfg["layout"] = out
+
+    posting = patch.get("posting", {})
+    if not isinstance(posting, dict):
+        raise ValueError("Invalid posting settings")
+    out = {}
+    if "max_clip_seconds" in posting:
+        v = posting["max_clip_seconds"]
+        if not _is_int(v) or not 3 <= v <= 60:
+            raise ValueError("Max clip seconds must be 3-60")
+        out["max_clip_seconds"] = v
+    if "privacy" in posting:
+        if posting["privacy"] not in ("private", "unlisted", "public"):
+            raise ValueError("Invalid privacy setting")
+        out["privacy"] = posting["privacy"]
+    if "tags" in posting:
+        tags = posting["tags"]
+        if not isinstance(tags, list) or len(tags) > 40 or any(not isinstance(t, str) or len(t) > 60 for t in tags):
+            raise ValueError("Use up to 40 short tags")
+        out["tags"] = tags
+    if out:
+        cfg["posting"] = out
+
+    editorial = patch.get("editorial", {})
+    if not isinstance(editorial, dict):
+        raise ValueError("Invalid editorial settings")
+    out = {}
+    if "system_prompt" in editorial:
+        v = editorial["system_prompt"]
+        if not isinstance(v, str) or len(v) > 12000:
+            raise ValueError("System prompt is too long")
+        out["system_prompt"] = v
+    if "provider_order" in editorial:
+        order = editorial["provider_order"]
+        if (not isinstance(order, list) or not order
+                or any(p not in ("gemini", "anthropic", "openai") for p in order)
+                or len(set(order)) != len(order)):
+            raise ValueError("Choose each editorial provider at most once")
+        out["provider_order"] = order
+    if out:
+        cfg["editorial"] = out
+
+    discovery = patch.get("discovery", {})
+    if not isinstance(discovery, dict):
+        raise ValueError("Invalid discovery settings")
+    out = {}
+    if "subreddits" in discovery:
+        subs = discovery["subreddits"]
+        if not isinstance(subs, list) or len(subs) > 60:
+            raise ValueError("Use up to 60 subreddits")
+        for s in subs:
+            if isinstance(s, str):
+                if not s.strip() or len(s) > 60:
+                    raise ValueError("Invalid subreddit name")
+            elif isinstance(s, dict):
+                if not isinstance(s.get("name"), str) or not s["name"].strip() or len(s["name"]) > 60:
+                    raise ValueError("Invalid subreddit name")
+                if "min_score" in s and (not _is_int(s["min_score"]) or not 0 <= s["min_score"] <= 100000):
+                    raise ValueError("Invalid subreddit min_score")
+            else:
+                raise ValueError("Invalid subreddit entry")
+        out["subreddits"] = subs
+    if "news_rss" in discovery:
+        feeds = discovery["news_rss"]
+        if not isinstance(feeds, list) or len(feeds) > 40:
+            raise ValueError("Use up to 40 RSS feeds")
+        for url in feeds:
+            if not isinstance(url, str) or len(url) > 500 or urlsplit(url).scheme != "https":
+                raise ValueError("RSS sources must be HTTPS URLs")
+        out["news_rss"] = feeds
+    if out:
+        cfg["discovery"] = out
+
+    story_layout = patch.get("story_layout", {})
+    if not isinstance(story_layout, dict):
+        raise ValueError("Invalid story layout settings")
+    out = {}
+    for key in ("card_opacity", "background_dim", "background_zoom",
+                "background_anchor_x", "background_anchor_y", "vertical_bias"):
+        if key in story_layout:
+            v = story_layout[key]
+            if not _is_number(v) or not 0 <= v <= 3:
+                raise ValueError(f"Invalid value for {key}")
+            out[key] = v
+    if out:
+        cfg["story_layout"] = out
+
+    existing = get_config()
+    for section, values in cfg.items():
+        existing.setdefault(section, {}).update(values)
+    return existing
+
+CSP_HEADER = (
+    "default-src 'self'; script-src 'self' 'unsafe-inline'; "
+    "style-src 'self' 'unsafe-inline'; img-src 'self' data:; media-src 'self'; "
+    "connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'"
+)
+
 class StudioHandler(BaseHTTPRequestHandler):
     def log_message(self, format, *args):
         pass  # Suppress default noisy console logs
+
+    def allowed(self) -> bool:
+        # The Studio is a loopback-only service. Checking Host (rather than
+        # trusting the socket is local) defeats DNS rebinding, where a remote
+        # page's own JS resolves an attacker domain to 127.0.0.1 mid-session.
+        return self.headers.get("Host") in (f"127.0.0.1:{PORT}", f"localhost:{PORT}")
 
     def send_json(self, data: Any, status: int = 200) -> None:
         raw = json.dumps(data).encode("utf-8")
         self.send_response(status)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(raw)))
-        self.send_header("Access-Control-Allow-Origin", "*")
-        self.send_header("Access-Control-Allow-Headers", "*")
-        self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("X-Content-Type-Options", "nosniff")
         self.end_headers()
         self.wfile.write(raw)
 
-    def do_OPTIONS(self):
-        self.send_response(204)
-        self.send_header("Access-Control-Allow-Origin", "*")
-        self.send_header("Access-Control-Allow-Headers", "*")
-        self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
-        self.end_headers()
-
     def do_GET(self):
+        if not self.allowed():
+            self.send_json({"error": "Local access only"}, 403)
+            return
         parsed = urlsplit(self.path)
         path = parsed.path
         query = parse_qs(parsed.query)
@@ -233,6 +408,7 @@ class StudioHandler(BaseHTTPRequestHandler):
             with GUARD:
                 cfg = get_automation_settings()
                 self.send_json({
+                    "csrf": CSRF,
                     "online": is_online(),
                     "active_job": ACTIVE_JOB,
                     "busy": store.busy(),
@@ -288,23 +464,39 @@ class StudioHandler(BaseHTTPRequestHandler):
             self.send_json({"config": cfg, "automation": auto})
             return
 
-        # Media serving from out/ or assets/
+        # Media serving from out/ or assets/. The path is resolved (which
+        # collapses ".." segments) before the containment check, and the
+        # check uses is_relative_to on the resolved path rather than testing
+        # unresolved .parents — the previous version compared literal path
+        # components, so "/media/out/../../../../etc/passwd" satisfied the
+        # "out" in media_path.parents test while actually reading outside
+        # both directories once the OS resolved it.
         if path.startswith("/media/"):
-            rel = path[7:]
-            media_path = ROOT / rel
-            if media_path.exists() and media_path.is_file() and (ROOT / "out" in media_path.parents or ROOT / "assets" in media_path.parents):
+            rel = path[len("/media/"):]
+            try:
+                media_path = (ROOT / rel).resolve()
+            except (OSError, ValueError):
+                self.send_error(404, "Media not found")
+                return
+            out_dir = (ROOT / "out").resolve()
+            assets_dir = (ROOT / "assets").resolve()
+            if media_path.is_file() and (media_path.is_relative_to(out_dir) or media_path.is_relative_to(assets_dir)):
                 self._serve_file(media_path)
                 return
             self.send_error(404, "Media not found")
             return
 
-        # Static Web UI serving
+        # Static Web UI serving — same resolve-then-contain pattern as above.
         if path == "/" or path == "/index.html":
             self._serve_file(WEB_DIR / "index.html")
             return
 
-        static_file = WEB_DIR / path.lstrip("/")
-        if static_file.exists() and static_file.is_file():
+        web_dir = WEB_DIR.resolve()
+        try:
+            static_file = (WEB_DIR / path.lstrip("/")).resolve()
+        except (OSError, ValueError):
+            static_file = None
+        if static_file and static_file.is_relative_to(web_dir) and static_file.is_file():
             self._serve_file(static_file)
             return
 
@@ -314,30 +506,42 @@ class StudioHandler(BaseHTTPRequestHandler):
     def do_POST(self):
         parsed = urlsplit(self.path)
         path = parsed.path
-        length = int(self.headers.get("Content-Length", 0))
-        body = self.rfile.read(length) if length > 0 else b"{}"
+
+        if (not self.allowed()
+                or self.headers.get("Origin") not in (f"http://127.0.0.1:{PORT}", f"http://localhost:{PORT}")
+                or not secrets.compare_digest(self.headers.get("X-Studio-Token", ""), CSRF)):
+            # Wrong Host defeats DNS rebinding; wrong Origin or a missing/stale
+            # CSRF token means the request wasn't issued by this server's own
+            # page — reject before touching config, keys, or jobs.
+            self.send_json({"error": "Reopen the app to reconnect securely"}, 403)
+            return
 
         try:
+            length = int(self.headers.get("Content-Length", "0"))
+            if length > 65536:
+                raise ValueError("Request body too large")
+            body = self.rfile.read(length) if length > 0 else b"{}"
             data = json.loads(body.decode("utf-8")) if body else {}
-        except Exception:
-            data = {}
+            if not isinstance(data, dict):
+                raise ValueError("Invalid request")
+            with GUARD:
+                result = self.mutate(path, data)
+            self.send_json(result if result is not None else {"status": "ok"})
+        except (ValueError, KeyError, TypeError) as e:
+            self.send_json({"error": str(e)}, 400)
+        except Exception as e:
+            LOG.error("POST %s failed: %s", path, e)
+            self.send_json({"error": "The action could not be completed. Check the local service log."}, 500)
 
+    def mutate(self, path: str, data: dict) -> dict | None:
         if path == "/api/job":
-            action = data.get("action", "")
-            key = data.get("key", "")
-            try:
-                job = start_job(action, key)
-                self.send_json(job)
-            except ValueError as e:
-                self.send_json({"error": str(e)}, 400)
-            return
+            return start_job(data.get("action", ""), data.get("key", ""))
 
         if path == "/api/video":
             vid_id = data.get("id", "")
             record = store.get("videos", vid_id)
             if not record:
-                self.send_json({"error": "Video not found"}, 404)
-                return
+                raise ValueError("Video not found")
             if "title" in data:
                 record["title"] = data["title"]
             if "description" in data:
@@ -345,21 +549,21 @@ class StudioHandler(BaseHTTPRequestHandler):
             if "headline" in data:
                 record["headline"] = data["headline"]
             store.put("videos", vid_id, record)
-            self.send_json(record)
-            return
+            return record
 
         if path == "/api/connections":
-            # Save API keys securely
             secrets_path = ROOT / "studio-secrets.json"
             existing = read_json(secrets_path, {})
-            allowed = ("GEMINI_API_KEY", "ANTHROPIC_API_KEY", "OPENAI_API_KEY", "YOUTUBE_API_KEY", "REDDIT_CLIENT_ID", "REDDIT_CLIENT_SECRET")
+            allowed_keys = ("GEMINI_API_KEY", "ANTHROPIC_API_KEY", "OPENAI_API_KEY",
+                            "YOUTUBE_API_KEY", "REDDIT_CLIENT_ID", "REDDIT_CLIENT_SECRET")
             for k, v in data.items():
-                if k in allowed:
+                if k in allowed_keys:
+                    if not isinstance(v, str) or len(v) > 4096:
+                        raise ValueError("Invalid API key")
                     existing[k] = v.strip()
             write_json(secrets_path, existing, private=True)
             store.load_secrets()
-            self.send_json({"status": "saved"})
-            return
+            return {"status": "saved"}
 
         if path == "/api/subreddits":
             cfg = get_config()
@@ -368,71 +572,92 @@ class StudioHandler(BaseHTTPRequestHandler):
 
             action = data.get("action", "add")
             if action == "add":
-                sub_name = data.get("name", "").strip().lower().replace("r/", "")
-                cat = data.get("category", "General")
-                min_score = int(data.get("min_score", 200))
-                # Remove if existing duplicate
+                sub_name = str(data.get("name", "")).strip().lower().replace("r/", "")
+                if not sub_name or len(sub_name) > 60:
+                    raise ValueError("Invalid subreddit name")
+                cat = str(data.get("category", "General"))[:60]
+                try:
+                    min_score = int(data.get("min_score", 200))
+                except (TypeError, ValueError):
+                    raise ValueError("Invalid min_score")
+                if not 0 <= min_score <= 100000:
+                    raise ValueError("Invalid min_score")
                 subreddits = [s for s in subreddits if (s.get("name") if isinstance(s, dict) else s) != sub_name]
+                if len(subreddits) >= 60:
+                    raise ValueError("Use up to 60 subreddits")
                 subreddits.append({"name": sub_name, "category": cat, "min_score": min_score})
                 discovery["subreddits"] = subreddits
                 save_config(cfg)
-                self.send_json({"status": "added", "subreddits": subreddits})
+                return {"status": "added", "subreddits": subreddits}
             elif action == "delete":
-                sub_name = data.get("name", "").strip().lower().replace("r/", "")
+                sub_name = str(data.get("name", "")).strip().lower().replace("r/", "")
                 discovery["subreddits"] = [s for s in subreddits if (s.get("name") if isinstance(s, dict) else s) != sub_name]
                 save_config(cfg)
-                self.send_json({"status": "deleted", "subreddits": discovery["subreddits"]})
+                return {"status": "deleted", "subreddits": discovery["subreddits"]}
             else:
-                self.send_json({"error": "Unknown subreddit action"}, 400)
-            return
+                raise ValueError("Unknown subreddit action")
 
         if path == "/api/subreddits/test":
             from core.scrape_reddit import fetch_subreddit_posts
-            sub_name = data.get("name", "").strip().lower().replace("r/", "")
-            if not sub_name:
-                self.send_json({"error": "Subreddit name required"}, 400)
-                return
+            sub_name = str(data.get("name", "")).strip().lower().replace("r/", "")
+            if not sub_name or len(sub_name) > 60:
+                raise ValueError("Subreddit name required")
             posts = fetch_subreddit_posts(sub_name, limit=5)
-            self.send_json({"subreddit": sub_name, "count": len(posts), "sample": posts[:3]})
-            return
+            return {"subreddit": sub_name, "count": len(posts), "sample": posts[:3]}
 
         if path == "/api/settings":
-            cfg = data.get("config")
+            cfg_patch = data.get("config")
             auto = data.get("automation")
-            if cfg:
-                save_config(cfg)
-            if auto:
+            if cfg_patch is not None:
+                save_config(validate_settings_config(cfg_patch))
+            if auto is not None:
+                if (not isinstance(auto, dict)
+                        or not isinstance(auto.get("enabled"), bool)
+                        or not _is_number(auto.get("interval_hours"))
+                        or not 1 <= auto["interval_hours"] <= 168
+                        or auto.get("mode") not in ("preview", "publish")):
+                    raise ValueError("Choose an interval of 1-168 hours and a valid mode")
                 current_auto = get_automation_settings()
                 current_auto.update(auto)
                 write_json(ROOT / "studio-settings.json", current_auto)
-            self.send_json({"status": "updated"})
-            return
+            return {"status": "updated"}
 
         if path == "/api/wizard":
             # First-run onboarding wizard configuration
             cfg = get_config()
             account = cfg.setdefault("account", {})
             if "name" in data:
+                if not isinstance(data["name"], str) or not data["name"].strip() or len(data["name"]) > 100:
+                    raise ValueError("Invalid channel name")
                 account["name"] = data["name"]
             if "handle" in data:
+                if not isinstance(data["handle"], str) or len(data["handle"]) > 100:
+                    raise ValueError("Invalid channel handle")
                 account["handle"] = data["handle"]
             if "subreddits" in data:
-                cfg.setdefault("discovery", {})["subreddits"] = data["subreddits"]
+                subs = data["subreddits"]
+                if not isinstance(subs, list) or len(subs) > 60:
+                    raise ValueError("Invalid subreddits list")
+                cfg.setdefault("discovery", {})["subreddits"] = subs
             save_config(cfg)
 
             if "api_key" in data and "provider" in data:
-                prov = data["provider"].lower()
+                prov = str(data["provider"]).lower()
+                if prov not in ("gemini", "anthropic", "openai"):
+                    raise ValueError("Invalid provider")
+                api_key = data["api_key"]
+                if not isinstance(api_key, str) or len(api_key) > 4096:
+                    raise ValueError("Invalid API key")
                 key_name = f"{prov.upper()}_API_KEY"
                 secrets_path = ROOT / "studio-secrets.json"
                 sec = read_json(secrets_path, {})
-                sec[key_name] = data["api_key"].strip()
+                sec[key_name] = api_key.strip()
                 write_json(secrets_path, sec, private=True)
                 store.load_secrets()
 
-            self.send_json({"status": "wizard_completed"})
-            return
+            return {"status": "wizard_completed"}
 
-        self.send_error(404, "Endpoint not found")
+        raise ValueError("Unknown action")
 
     def _serve_file(self, file_path: Path) -> None:
         if not file_path.exists() or not file_path.is_file():
@@ -441,20 +666,71 @@ class StudioHandler(BaseHTTPRequestHandler):
 
         mime, _ = mimetypes.guess_type(str(file_path))
         mime = mime or "application/octet-stream"
+        size = file_path.stat().st_size
+        start, end, status = 0, size - 1, 200
+
+        # Video scrubbing in the Library modal needs byte-range requests —
+        # without Accept-Ranges the browser can only play from the start.
+        byte_range = self.headers.get("Range", "")
+        if byte_range:
+            match = re.fullmatch(r"bytes=(\d+)-(\d*)", byte_range)
+            if not match:
+                self.send_error(416, "Invalid range")
+                return
+            start = int(match[1])
+            end = min(int(match[2]), end) if match[2] else end
+            if start > end:
+                self.send_error(416, "Invalid range")
+                return
+            status = 206
 
         try:
-            with open(file_path, "rb") as f:
-                content = f.read()
-            self.send_response(200)
+            self.send_response(status)
             self.send_header("Content-Type", mime)
-            self.send_header("Content-Length", str(len(content)))
+            self.send_header("Content-Length", str(end - start + 1))
+            self.send_header("Accept-Ranges", "bytes")
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("X-Content-Type-Options", "nosniff")
+            self.send_header("Content-Security-Policy", CSP_HEADER)
+            if status == 206:
+                self.send_header("Content-Range", f"bytes {start}-{end}/{size}")
             self.end_headers()
-            self.wfile.write(content)
+            with file_path.open("rb") as f:
+                f.seek(start)
+                remaining = end - start + 1
+                while remaining:
+                    chunk = f.read(min(65536, remaining))
+                    if not chunk:
+                        break
+                    self.wfile.write(chunk)
+                    remaining -= len(chunk)
+        except (BrokenPipeError, ConnectionResetError):
+            pass
         except Exception as e:
-            self.send_error(500, f"Error serving file: {e}")
+            LOG.error("Error serving file %s: %s", file_path, e)
 
 def run_server(port: int = PORT) -> None:
     store.load_secrets()
+    store.import_legacy()
+
+    # Restart recovery: a job or upload that was mid-flight when the process
+    # died last time should never look "running" forever, and an upload in
+    # particular must not be silently retried — it may have already reached
+    # YouTube before the crash.
+    for job in store.records("jobs"):
+        if job.get("status") == "running":
+            job.update(status="interrupted", stage="Interrupted — inspect before retrying",
+                       finished_at=store.now())
+            store.put("jobs", job["id"], job)
+    if not store.busy():
+        for r in store.records("videos"):
+            if r.get("status") in ("uploading", "rendering"):
+                r.update(
+                    status="upload_unknown" if r["status"] == "uploading" else "render_failed",
+                    error="The previous job was interrupted. Review before retrying.",
+                )
+                store.put("videos", r["id"], r)
+
     server_address = ("127.0.0.1", port)
     httpd = ThreadingHTTPServer(server_address, StudioHandler)
     LOG.info("KenauShorts Studio running at http://127.0.0.1:%d/", port)

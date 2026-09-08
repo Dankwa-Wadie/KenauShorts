@@ -4,8 +4,8 @@ from __future__ import annotations
 import contextlib
 import logging
 import platform
+import shutil
 import subprocess
-import sys
 from typing import Generator
 
 LOG = logging.getLogger("kenaushorts.power")
@@ -39,13 +39,32 @@ def keep_awake(reason: str = "KenauShorts processing video job") -> Generator[No
             LOG.warning("Could not set Windows execution state: %s", e)
 
     elif system == "Linux":
-        # Linux systemd-inhibit or desktop inhibit could be added if running in terminal
-        pass
+        # systemd-inhibit holds the sleep/idle inhibitor lock for exactly as
+        # long as the wrapped child process is alive — the same trick as
+        # `caffeinate -w` above, just via logind's inhibitor API instead of
+        # an IOKit assertion. Ships with systemd, which covers the desktop
+        # and server distros this project targets (Ubuntu, Debian, Fedora,
+        # Arch); on a non-systemd distro this just logs and renders anyway,
+        # the same graceful degradation as any other sleep-prevention
+        # failure here.
+        if shutil.which("systemd-inhibit"):
+            try:
+                proc = subprocess.Popen(
+                    ["systemd-inhibit", "--what=sleep:idle", "--mode=block",
+                     "--who=KenauShorts", f"--why={reason}", "sleep", "infinity"],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+                LOG.debug("systemd-inhibit started on Linux")
+            except Exception as e:
+                LOG.warning("Could not start systemd-inhibit: %s", e)
+        else:
+            LOG.debug("systemd-inhibit not found — sleep is not being prevented on this Linux system")
 
     try:
         yield
     finally:
-        if system == "Darwin" and proc is not None:
+        if system in ("Darwin", "Linux") and proc is not None:
             try:
                 proc.terminate()
                 proc.wait(timeout=2)

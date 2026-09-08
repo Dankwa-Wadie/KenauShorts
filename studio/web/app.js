@@ -5,6 +5,19 @@
 let currentPage = 'overview';
 let activeJobData = null;
 let statusInterval = null;
+let csrfToken = '';
+
+// Every mutating request needs the server's per-run CSRF token (learned from
+// /api/status) or it's rejected — this is what stops a page from another
+// origin/tab from driving the Studio even if it can reach 127.0.0.1.
+async function postJSON(path, body) {
+  const res = await fetch(path, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'X-Studio-Token': csrfToken },
+    body: JSON.stringify(body || {}),
+  });
+  return res;
+}
 
 // Initialize on load
 document.addEventListener('DOMContentLoaded', () => {
@@ -87,6 +100,7 @@ async function pollStatus() {
     const res = await fetch('/api/status');
     if (!res.ok) return;
     const data = await res.json();
+    if (data.csrf) csrfToken = data.csrf;
 
     const dot = document.getElementById('status-dot');
     const statusText = document.getElementById('connection-status');
@@ -135,11 +149,7 @@ function showNotification(msg, type = 'success') {
 function setupQuickActions() {
   document.getElementById('btn-quick-preview').addEventListener('click', async () => {
     try {
-      const res = await fetch('/api/job', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ action: 'preview' })
-      });
+      const res = await postJSON('/api/job', { action: 'preview' });
       const data = await res.json();
       if (data.error) throw new Error(data.error);
       showNotification('Preview draft job started! Check the Library or Logs tab.');
@@ -152,11 +162,7 @@ function setupQuickActions() {
   document.getElementById('btn-quick-run').addEventListener('click', async () => {
     if (!confirm('Run pipeline and publish to YouTube now?')) return;
     try {
-      const res = await fetch('/api/job', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ action: 'run' })
-      });
+      const res = await postJSON('/api/job', { action: 'run' });
       const data = await res.json();
       if (data.error) throw new Error(data.error);
       showNotification('Run & publish job launched! Monitoring progress in Logs.');
@@ -322,11 +328,7 @@ async function saveVideoEdits(id) {
   const description = document.getElementById('edit-desc').value;
 
   try {
-    const res = await fetch('/api/video', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ id, title, headline, description })
-    });
+    const res = await postJSON('/api/video', { id, title, headline, description });
     if (!res.ok) throw new Error('Save failed');
     showNotification('Draft details saved.');
   } catch (e) {
@@ -337,11 +339,7 @@ async function saveVideoEdits(id) {
 async function reRenderDraft(id) {
   await saveVideoEdits(id);
   try {
-    const res = await fetch('/api/job', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ action: 'render', key: id })
-    });
+    const res = await postJSON('/api/job', { action: 'render', key: id });
     const data = await res.json();
     if (data.error) throw new Error(data.error);
     showNotification('Re-render job started! Check terminal for progress.');
@@ -356,11 +354,7 @@ async function uploadDraft(id) {
   await saveVideoEdits(id);
   if (!confirm('Upload this short to your YouTube channel now?')) return;
   try {
-    const res = await fetch('/api/job', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ action: 'upload', key: id })
-    });
+    const res = await postJSON('/api/job', { action: 'upload', key: id });
     const data = await res.json();
     if (data.error) throw new Error(data.error);
     showNotification('Upload job started! Monitoring progress.');
@@ -449,11 +443,7 @@ async function testNewSubreddit() {
   box.innerHTML = `<p style="color: var(--accent); font-size: 13px;">Testing scraper on r/${name}...</p>`;
 
   try {
-    const res = await fetch('/api/subreddits/test', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ name })
-    });
+    const res = await postJSON('/api/subreddits/test', { name });
     const data = await res.json();
     if (data.error) throw new Error(data.error);
 
@@ -481,11 +471,7 @@ async function addNewSubreddit() {
   }
 
   try {
-    const res = await fetch('/api/subreddits', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ action: 'add', name, category, min_score })
-    });
+    const res = await postJSON('/api/subreddits', { action: 'add', name, category, min_score });
     const data = await res.json();
     if (data.error) throw new Error(data.error);
     showNotification(`Added r/${name} to scraping list.`);
@@ -498,11 +484,7 @@ async function addNewSubreddit() {
 async function deleteSubreddit(name) {
   if (!confirm(`Remove r/${name} from discovery?`)) return;
   try {
-    const res = await fetch('/api/subreddits', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ action: 'delete', name })
-    });
+    const res = await postJSON('/api/subreddits', { action: 'delete', name });
     const data = await res.json();
     if (data.error) throw new Error(data.error);
     showNotification(`Removed r/${name}.`);
@@ -585,11 +567,7 @@ async function saveApiKeys() {
   if (openai) payload.OPENAI_API_KEY = openai;
 
   try {
-    const res = await fetch('/api/connections', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(payload)
-    });
+    const res = await postJSON('/api/connections', payload);
     if (!res.ok) throw new Error('Failed to save keys');
     showNotification('API keys securely saved.');
     loadConnections(document.getElementById('content-view'));
@@ -600,11 +578,7 @@ async function saveApiKeys() {
 
 async function connectYouTube() {
   try {
-    const res = await fetch('/api/job', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ action: 'youtube_connect' })
-    });
+    const res = await postJSON('/api/job', { action: 'youtube_connect' });
     const data = await res.json();
     if (data.error) throw new Error(data.error);
     showNotification('Browser opened for YouTube OAuth. Follow Google prompts to approve.');
@@ -669,11 +643,7 @@ async function saveAutomationSettings() {
   const mode = document.getElementById('auto-mode').value;
 
   try {
-    const res = await fetch('/api/settings', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ automation: { enabled, interval_hours, mode } })
-    });
+    const res = await postJSON('/api/settings', { automation: { enabled, interval_hours, mode } });
     if (!res.ok) throw new Error('Update failed');
     showNotification('Automation preferences saved.');
   } catch (e) {
@@ -749,11 +719,7 @@ async function saveStyleSettings() {
     cfg.account = { ...cfg.account, name, handle, verified };
     cfg.layout = { ...cfg.layout, border_color, corner_radius, headline_size };
 
-    await fetch('/api/settings', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ config: cfg })
-    });
+    await postJSON('/api/settings', { config: cfg });
     showNotification('Channel & style settings saved.');
   } catch (e) {
     showNotification(e.message, 'error');
@@ -884,11 +850,7 @@ async function wizardFinish() {
   wizardData.subreddits = subs;
 
   try {
-    const res = await fetch('/api/wizard', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(wizardData)
-    });
+    const res = await postJSON('/api/wizard', wizardData);
     if (!res.ok) throw new Error('Setup failed');
     showNotification('Setup complete! Welcome to KenauShorts.');
     document.getElementById('wizard-modal').close();

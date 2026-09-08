@@ -441,6 +441,18 @@ def probe_duration(video: Path) -> float:
     except Exception:
         return 0.0
 
+def has_audio_stream(video: Path) -> bool:
+    """Whether the source has an audio track — decides how music is mixed."""
+    try:
+        out = subprocess.run(
+            ["ffprobe", "-v", "error", "-select_streams", "a",
+             "-show_entries", "stream=index", "-of", "csv=p=0", str(video)],
+            capture_output=True, text=True, check=True,
+        ).stdout.strip()
+        return bool(out)
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        return False
+
 def composite(
     video: Path,
     overlay: Path,
@@ -452,6 +464,7 @@ def composite(
     poster: Path | None = None,
     config: dict[str, Any] | None = None,
     music: Path | None = None,
+    loop_video: bool = False,
 ) -> float:
     if not shutil.which("ffmpeg"):
         raise RuntimeError("ffmpeg was not found on your PATH. Please install ffmpeg.")
@@ -460,9 +473,18 @@ def composite(
     H = int(layout["canvas_height"])
     x, y, w, h = box
 
+    # Zoom + anchored crop. A watermark burned into a corner of the source can
+    # be pushed outside the frame by zooming in and biasing the crop away from
+    # it — anchor 0.5/0.5 is centred, lower values move the visible window
+    # toward the top-left and so discard the bottom-right.
+    zoom = max(1.0, float(layout.get("background_zoom", 1.0)))
+    ax = min(max(float(layout.get("background_anchor_x", 0.5)), 0.0), 1.0)
+    ay = min(max(float(layout.get("background_anchor_y", 0.5)), 0.0), 1.0)
+    sw, sh = int(w * zoom), int(h * zoom)
+
     fchain = (
-        f"[0:v]scale={w}:{h}:force_original_aspect_ratio=increase,"
-        f"crop={w}:{h},"
+        f"[0:v]scale={sw}:{sh}:force_original_aspect_ratio=increase,"
+        f"crop={w}:{h}:(in_w-out_w)*{ax}:(in_h-out_h)*{ay},"
         f"pad={W}:{H}:{x}:{y}:color={layout['background']},"
         f"setsar=1[stage];"
         f"[stage][1:v]overlay=0:0:format=auto,format=yuv420p[v]"
@@ -471,14 +493,57 @@ def composite(
     cmd = ["ffmpeg", "-y", "-hide_banner", "-loglevel", "error"]
     if start_seconds:
         cmd += ["-ss", str(start_seconds)]
+    # A short mascot loop must repeat to fill the target duration. Without
+    # this, -shortest truncates the whole render to the mascot's length — a
+    # 5-second clip silently caps every post at 5 seconds.
+    if loop_video:
+        cmd += ["-stream_loop", "-1"]
     cmd += ["-i", str(video), "-loop", "1", "-i", str(overlay)]
+
+    # Music is input 2 when present. -stream_loop -1 repeats it indefinitely so
+    # a 20-second track still covers a 30-second clip; -shortest then trims it.
+    if music:
+        cmd += ["-stream_loop", "-1", "-i", str(music)]
 
     if max_seconds:
         cmd += ["-t", str(max_seconds)]
 
-    cmd += ["-filter_complex", fchain, "-map", "[v]"]
+    audio_cfg = (config or {}).get("audio", {})
+    music_vol = float(audio_cfg.get("music_volume", 0.35))
+    src_vol = float(audio_cfg.get("source_audio_volume", 1.0))
+    fade = float(audio_cfg.get("fade_out_seconds", 1.5))
+    src_has_audio = has_audio_stream(video)
+
+    amap: list[str] = []
+    if music:
+        dur = max_seconds or probe_duration(video) or 30.0
+        fade_start = max(0.0, float(dur) - fade)
+        if src_has_audio:
+            # Duck the music under the original audio rather than replacing it.
+            fchain += (
+                f";[0:a]volume={src_vol}[a0]"
+                f";[2:a]volume={music_vol},afade=t=out:st={fade_start:.2f}:d={fade}[a1]"
+                f";[a0][a1]amix=inputs=2:duration=first:dropout_transition=0,"
+                f"aresample=48000[a]"
+            )
+        else:
+            fchain += (
+                f";[2:a]volume={music_vol},afade=t=out:st={fade_start:.2f}:d={fade},"
+                f"aresample=48000[a]"
+            )
+        amap = ["-map", "[a]"]
+    elif src_has_audio:
+        amap = ["-map", "0:a"]
+
+    cmd += ["-filter_complex", fchain, "-map", "[v]"] + amap
     cmd += video_encoder_args(config or {})
-    cmd += ["-pix_fmt", "yuv420p", "-movflags", "+faststart", str(out)]
+    cmd += [
+        "-pix_fmt", "yuv420p",
+        "-r", str((config or {}).get("posting", {}).get("fps", 30)),
+    ]
+    if amap:
+        cmd += ["-c:a", "aac", "-b:a", "128k", "-ar", "48000"]
+    cmd += ["-movflags", "+faststart", "-shortest", str(out)]
 
     LOG.info("Rendering short: %s", " ".join(cmd))
     out.parent.mkdir(parents=True, exist_ok=True)
@@ -503,6 +568,7 @@ def render(
     account: Account | None = None,
     max_seconds: float | None = None,
     poster: Path | None = None,
+    music: Path | None = None,
 ) -> RenderResult:
     cfg = config or {}
     layout = {**DEFAULT_LAYOUT, **cfg.get("layout", {})}
@@ -510,6 +576,6 @@ def render(
 
     overlay_path = out.parent / f"{out.stem}_overlay.png"
     box = build_overlay(headline, acct, layout, overlay_path)
-    dur = composite(video, overlay_path, box, layout, out, max_seconds=max_seconds, poster=poster, config=cfg)
+    dur = composite(video, overlay_path, box, layout, out, max_seconds=max_seconds, poster=poster, config=cfg, music=music)
 
     return RenderResult(output=out, overlay=overlay_path, video_box=box, duration=dur, poster=poster)

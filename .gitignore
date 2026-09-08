@@ -29,6 +29,7 @@ logs/
 *.jpg
 *.jpeg
 !assets/default_avatar.png
+!assets/default_mascot.mp4
 !assets/sample*
 
 # Python & Virtual Environments

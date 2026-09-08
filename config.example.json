@@ -36,14 +36,29 @@
       "https://feeds.arstechnica.com/arstechnica/index"
     ],
     "per_channel": 6,
-    "max_age_hours": 168
+    "max_age_hours": 168,
+    "youtube_queries": [],
+    "youtube_cc_only": true,
+    "wikimedia_sections": [],
+    "wikimedia_days_back": 2,
+    "wikipedia_queries": [],
+    "free_images_only": true
   },
   "editorial": {
     "provider_order": ["gemini", "anthropic", "openai"],
     "gemini_model": "gemini-1.5-flash",
     "anthropic_model": "claude-3-5-sonnet-20241022",
     "openai_model": "gpt-4o-mini",
+    "max_candidates": 3,
     "system_prompt": "You are the senior editorial director for a modern short-form video channel. Select the single most compelling, timely, and visually engaging story from the candidates. Write an urgent, punchy headline under 12 words in ALL-CAPS monospace tone, a concise 2-sentence YouTube description, and 4 relevant hashtags."
+  },
+  "story": {
+    "mascot": "assets/default_mascot.mp4"
+  },
+  "audio": {
+    "music_volume": 0.35,
+    "source_audio_volume": 1.0,
+    "fade_out_seconds": 1.5
   },
   "posting": {
     "max_clip_seconds": 35,

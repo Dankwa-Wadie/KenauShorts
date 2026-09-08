@@ -130,3 +130,53 @@ def draft(video_stem: str, video_path: Path, poster_path: Path, headline: str, t
     }
     put("videos", record["id"], record)
     return record
+
+def import_legacy() -> None:
+    """
+    Backfill Studio video records from out/*.mp4 files that predate the
+    sqlite store, or that were rendered by a CLI run before core.agent
+    started registering drafts directly — otherwise a file sitting right
+    there in out/ never shows up in the Library.
+
+    state.json's "posted" entries carry their own video_path, so this
+    matches on that directly rather than parsing it back out of a filename.
+    """
+    state_path = ROOT / "state.json"
+    out_dir = ROOT / "out"
+    if not state_path.exists() or not out_dir.exists():
+        return
+    try:
+        state_data = json.loads(state_path.read_text(encoding="utf-8"))
+    except Exception:
+        return
+
+    posted_by_path: dict[str, dict[str, Any]] = {}
+    for entry in state_data.get("posted", []):
+        video_path = entry.get("video_path")
+        if video_path:
+            posted_by_path[str(Path(video_path))] = entry
+
+    for video in sorted(out_dir.glob("*.mp4")):
+        if "_edit_" in video.stem:
+            continue  # a re-render's own draft is created by studio.worker directly
+        if get("videos", video.stem):
+            continue  # already indexed
+
+        old = posted_by_path.get(str(video), {})
+        uploaded = bool(old.get("youtube_id")) and not old.get("dry_run")
+        poster = video.with_suffix(".png")
+        put("videos", video.stem, {
+            "id": video.stem,
+            "created_at": dt.datetime.fromtimestamp(video.stat().st_mtime, dt.timezone.utc).isoformat(),
+            "status": "uploaded" if uploaded else "ready",
+            "video": str(video),
+            "poster": str(poster) if poster.exists() else "",
+            "headline": old.get("headline", video.stem),
+            "title": old.get("title", old.get("headline", "")),
+            "description": "",
+            "config": {},
+            "candidate": {"key": old.get("key", "")},
+            "youtube_id": old.get("youtube_id", "") if uploaded else "",
+            "error": "",
+            "legacy": True,
+        })

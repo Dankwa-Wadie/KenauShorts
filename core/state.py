@@ -69,8 +69,9 @@ class State:
 
     def mark_posted(self, entry: dict[str, Any]) -> None:
         self.posted.append(entry)
-        if "url" in entry:
-            self.seen[entry["url"]] = time.time()
+        key = entry.get("key") or entry.get("url")
+        if key:
+            self.seen[key] = time.time()
         self.save()
 
     def get_reddit_cursor(self, category: str) -> int:

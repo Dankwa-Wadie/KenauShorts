@@ -17,6 +17,7 @@ ffmpeg -version
 If you get an error that `ffmpeg` was not found, see:
 - [Windows Guide](WINDOWS_GUIDE.md)
 - [macOS Guide](MACOS_GUIDE.md)
+- [Linux Guide](LINUX_GUIDE.md)
 
 ---
 
