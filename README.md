@@ -94,7 +94,7 @@ The wizard sets up AI editorial and discovery, but **publishing to YouTube is a 
 | | Used for | Where you get it | How you provide it |
 |---|---|---|---|
 | Gemini API key | AI editorial (picking stories, writing headlines) | [Google **AI Studio**](https://aistudio.google.com/app/apikey) | Paste it in the Connections tab |
-| YouTube OAuth client | Uploading the rendered video | Google **Cloud Console** (a different product) | Download `client_secret.json`, then click *Connect* once in the Studio |
+| YouTube OAuth client | Uploading the rendered video | [Google **Cloud Console** (a different product)(https://console.cloud.google.com/) | Download `client_secret.json`, then click *Connect* once in the Studio |
 
 Uploading a video requires your explicit consent, so Google doesn't allow it via a pasted API key at all, regardless of which product issued it — this is a Google API restriction, not a limitation of this app. Follow **[docs/YOUTUBE_API_SETUP.md](docs/YOUTUBE_API_SETUP.md)** to create the OAuth client, then in the Studio's **Connections** tab click **Connect / Authorize YouTube**. This opens a real Google sign-in window in your browser — that's expected, not an error. Approve access once and it's saved to `token.json` for every future run.
 
