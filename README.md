@@ -94,9 +94,21 @@ The wizard sets up AI editorial and discovery, but **publishing to YouTube is a 
 | | Used for | Where you get it | How you provide it |
 |---|---|---|---|
 | Gemini API key | AI editorial (picking stories, writing headlines) | [Google **AI Studio**](https://aistudio.google.com/app/apikey) | Paste it in the Connections tab |
-| YouTube OAuth client | Uploading the rendered video | [Google **Cloud Console** (a different product)(https://console.cloud.google.com/) | Download `client_secret.json`, then click *Connect* once in the Studio |
+| YouTube OAuth client | Uploading the rendered video | [Google **Cloud Console** (a different product)](https://console.cloud.google.com/) | Download `client_secret.json`, then click *Connect* once in the Studio |
 
-Uploading a video requires your explicit consent, so Google doesn't allow it via a pasted API key at all, regardless of which product issued it — this is a Google API restriction, not a limitation of this app. Follow **[docs/YOUTUBE_API_SETUP.md](docs/YOUTUBE_API_SETUP.md)** to create the OAuth client, then in the Studio's **Connections** tab click **Connect / Authorize YouTube**. This opens a real Google sign-in window in your browser — that's expected, not an error. Approve access once and it's saved to `token.json` for every future run.
+Uploading a video requires your explicit consent, so Google doesn't allow it via a pasted API key at all, regardless of which product issued it — this is a Google API restriction, not a limitation of this app.
+
+**Creating the OAuth client:**
+
+1. Go to [Google Cloud Console](https://console.cloud.google.com/) and create a project.
+2. Left sidebar → **APIs & Services** → **Enabled APIs & services** → **+ Enable APIs and Services** at the top.
+3. Search **YouTube Data API v3**, click it, click **Enable**, then click **Manage**.
+4. Left sidebar → **Credentials** → **+ Create Credentials** → **OAuth client ID**.
+   - If prompted to configure the app's audience/branding first (first OAuth client in a new project), fill in the basics (app name, support email) and continue.
+5. Application type → **Desktop app** (not "Web application") → give it a name → **Create**.
+6. Click **Download JSON**, rename it to `client_secret.json`, and place it in your `KenauShorts/` root folder.
+
+Then in the Studio's **Connections** tab, click **Connect / Authorize YouTube** once. This opens a real Google sign-in window in your browser — that's expected, not an error. Approve access and it's saved to `token.json` for every future run. Full walkthrough with troubleshooting notes: **[docs/YOUTUBE_API_SETUP.md](docs/YOUTUBE_API_SETUP.md)**.
 
 ---
 

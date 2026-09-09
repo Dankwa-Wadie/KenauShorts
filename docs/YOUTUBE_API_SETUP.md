@@ -16,43 +16,29 @@ To let KenauShorts upload rendered videos directly to your YouTube channel as Sh
 
 ## Step 2: Enable the YouTube Data API v3
 
-1. In the left navigation menu, go to **APIs & Services** → **Library**.
-2. Search for **YouTube Data API v3**.
-3. Click on it and click **Enable**.
+1. In the left sidebar, go to **APIs & Services**.
+2. Click **Enabled APIs & services**.
+3. Click **+ Enable APIs and Services** at the top — this opens the API Library.
+4. Search for **YouTube Data API v3**, click it, then click **Enable**.
+5. Click **Manage** on the page that appears after enabling it.
 
 ---
 
-## Step 3: Configure the OAuth Consent Screen
+## Step 3: Create a Desktop OAuth Client
 
-1. Go to **APIs & Services** → **OAuth consent screen**.
-2. Select **External** and click **Create**.
-3. Fill in the required fields:
-   - **App name**: `KenauShorts`
-   - **User support email**: Your personal email
-   - **Developer contact information**: Your personal email
-4. Click **Save and Continue**.
-5. Under **Scopes**, click **Add or Remove Scopes**:
-   - Filter and select: `https://www.googleapis.com/auth/youtube.upload`
-   - Click **Update** and then **Save and Continue**.
-6. Under **Test users**:
-   - Click **Add Users** and enter the Gmail address that owns the YouTube channel you want to upload to.
-   - Click **Save and Continue**.
-
----
-
-## Step 4: Create Desktop Client ID
-
-1. Go to **APIs & Services** → **Credentials**.
+1. In the left sidebar, go to **Credentials**.
 2. Click **+ Create Credentials** → **OAuth client ID**.
-3. Set **Application type** to:
-   **Desktop app** *(Important: Do NOT select "Web application")*.
-4. Name it `KenauShorts Desktop Client` and click **Create**.
-5. In the dialog that appears, click **Download JSON**.
+   - If this is the first OAuth client in the project, Google will first ask you to configure the app's audience/branding (app name, support email) — fill that in when prompted and continue; it doesn't need anything beyond the basics for personal use.
+3. Set **Application type** to **Desktop app** *(important — do not choose "Web application")*.
+4. Give it a name (e.g. `KenauShorts Desktop Client`) and click **Create**.
+5. Click **Download JSON** on the confirmation dialog (or find it later under **Credentials** → **Clients** → your client → the download icon).
 6. Rename the downloaded file to `client_secret.json` and save it directly in your `KenauShorts/` root folder.
 
+> If Google puts your project's OAuth consent in **Testing** mode, only Google accounts you've explicitly added as test users can complete sign-in — add the Gmail address of the channel you're uploading to under **Audience** → **Test users** if you hit an access-blocked screen in Step 4 below.
+
 ---
 
-## Step 5: Authorize Your Channel
+## Step 4: Authorize Your Channel
 
 In the KenauShorts Studio web interface:
 1. Navigate to the **Connections** tab.
