@@ -87,6 +87,17 @@ python3 scripts/start.py
 
 Your browser will automatically open to `http://127.0.0.1:8766/`. The **First-Run Setup Wizard** will guide you through entering your channel name, choosing your AI provider, and selecting your starting subreddits.
 
+### 5. Authorize YouTube Uploads
+
+The wizard sets up AI editorial and discovery, but **publishing to YouTube is a separate, one-time step** — and it's easy to confuse with the AI key setup above because Google has two look-alike products involved:
+
+| | Used for | Where you get it | How you provide it |
+|---|---|---|---|
+| Gemini API key | AI editorial (picking stories, writing headlines) | [Google **AI Studio**](https://aistudio.google.com/app/apikey) | Paste it in the Connections tab |
+| YouTube OAuth client | Uploading the rendered video | Google **Cloud Console** (a different product) | Download `client_secret.json`, then click *Connect* once in the Studio |
+
+Uploading a video requires your explicit consent, so Google doesn't allow it via a pasted API key at all, regardless of which product issued it — this is a Google API restriction, not a limitation of this app. Follow **[docs/YOUTUBE_API_SETUP.md](docs/YOUTUBE_API_SETUP.md)** to create the OAuth client, then in the Studio's **Connections** tab click **Connect / Authorize YouTube**. This opens a real Google sign-in window in your browser — that's expected, not an error. Approve access once and it's saved to `token.json` for every future run.
+
 ---
 
 ## 🤖 Configuring Always-On Background Service
@@ -100,6 +111,14 @@ python3 scripts/install_service.py
 - **Windows**: Creates a Windows Task Scheduler task that launches the engine on login.
 - **macOS**: Registers a `launchd` service in `~/Library/LaunchAgents`.
 - **Linux**: Enables a `systemd --user` background unit.
+
+To remove it again without touching anything else:
+
+```bash
+python3 scripts/uninstall_service.py
+```
+
+For a full reset or permanent removal (deleting generated data, revoking API keys and YouTube access, removing the project itself), see **[docs/UNINSTALLING.md](docs/UNINSTALLING.md)**.
 
 ---
 
@@ -126,6 +145,7 @@ KenauShorts/
 ├── scripts/
 │   ├── start.py               # 1-Click launcher
 │   ├── install_service.py     # Background daemon installer (Win/Mac/Linux)
+│   ├── uninstall_service.py   # Background daemon remover (Win/Mac/Linux)
 │   └── test_setup.py          # Pre-flight diagnostic tool
 ├── tests/                     # Unit tests (stdlib unittest, no extra dependency)
 ├── docs/                      # In-depth setup and API guides
@@ -157,6 +177,7 @@ Render tests are skipped automatically if `ffmpeg`/`ffprobe` aren't on `PATH`; e
 - [macOS Setup Guide](docs/MACOS_GUIDE.md)
 - [Linux Setup Guide](docs/LINUX_GUIDE.md)
 - [YouTube Data API & OAuth Setup](docs/YOUTUBE_API_SETUP.md)
+- [Uninstalling / Resetting](docs/UNINSTALLING.md)
 
 ---
 

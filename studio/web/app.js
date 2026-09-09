@@ -534,8 +534,14 @@ async function loadConnections(container) {
         <!-- YouTube OAuth -->
         <div style="background: var(--bg-card); border: 1px solid var(--border); border-radius: var(--radius-md); padding: 24px;">
           <h3 style="font-size: 16px; margin-bottom: 16px;">YouTube Publishing OAuth</h3>
+          <p style="color: var(--text-muted); font-size: 13px; margin-bottom: 12px;">
+            Uploading a video needs your explicit consent, so this can't be a pasted API key like the ones on the
+            left — Google only allows it through a one-time OAuth sign-in. It's also a different Google product:
+            the AI keys above come from <a href="https://aistudio.google.com/app/apikey" target="_blank" style="color:var(--accent);">Google AI Studio</a>,
+            while this comes from <a href="https://console.cloud.google.com/apis/credentials" target="_blank" style="color:var(--accent);">Google Cloud Console</a>.
+          </p>
           <p style="color: var(--text-muted); font-size: 13px; margin-bottom: 20px;">
-            To publish shorts automatically to your channel, authorize KenauShorts via Google Cloud Console Desktop OAuth.
+            Full walkthrough: <code>docs/YOUTUBE_API_SETUP.md</code> in your installation.
           </p>
 
           <div style="margin-bottom: 20px; padding: 16px; border-radius: var(--radius-sm); background: #101318; border: 1px solid var(--border);">
@@ -543,11 +549,17 @@ async function loadConnections(container) {
               OAuth Status: ${conn.youtube_oauth_ready ? '<span style="color:var(--success)">Connected & Ready</span>' : '<span style="color:var(--warning)">Not Authorized</span>'}
             </div>
             <p style="color: var(--text-muted); font-size: 12px;">
-              ${conn.youtube_client_secret_present ? 'client_secret.json detected in root folder.' : 'Place your client_secret.json in the project root folder.'}
+              ${conn.youtube_client_secret_present
+                ? 'client_secret.json detected in root folder.'
+                : 'No client_secret.json yet — follow docs/YOUTUBE_API_SETUP.md to create a Desktop OAuth client in Google Cloud Console and download it there first.'}
             </p>
           </div>
 
-          <button class="btn btn-secondary" onclick="connectYouTube()">🔑 Connect / Authorize YouTube</button>
+          ${conn.youtube_client_secret_present
+            ? `<button class="btn btn-secondary" onclick="connectYouTube()">🔑 Connect / Authorize YouTube</button>
+               <p class="form-help" style="margin-top: 10px;">This opens a real Google sign-in window in your browser — that's expected, not an error. Approve access, then come back here.</p>`
+            : `<button class="btn btn-secondary" disabled title="Add client_secret.json first — see docs/YOUTUBE_API_SETUP.md">🔑 Connect / Authorize YouTube</button>
+               <p class="form-help" style="margin-top: 10px;">This button unlocks once client_secret.json is in place.</p>`}
         </div>
       </div>
     `;
@@ -579,11 +591,44 @@ async function saveApiKeys() {
 async function connectYouTube() {
   try {
     const res = await postJSON('/api/job', { action: 'youtube_connect' });
-    const data = await res.json();
-    if (data.error) throw new Error(data.error);
-    showNotification('Browser opened for YouTube OAuth. Follow Google prompts to approve.');
+    const job = await res.json();
+    if (job.error) throw new Error(job.error);
+    showNotification('Starting YouTube authorization — a Google sign-in window should open shortly.');
+    watchYoutubeConnectJob(job.id);
   } catch (e) {
     showNotification(e.message, 'error');
+  }
+}
+
+async function watchYoutubeConnectJob(jobId, attempt = 0) {
+  // The initial POST only confirms the background job started, not that the
+  // browser window actually opened — a missing dependency, an occupied
+  // port, or a bad client_secret.json all fail silently after that point
+  // unless something actually checks back on the job and its real error.
+  if (attempt > 40) return; // ~60s, then give up quietly
+  try {
+    const res = await fetch(`/api/job?id=${jobId}`);
+    if (!res.ok) return;
+    const job = await res.json();
+    if (job.status === 'running') {
+      setTimeout(() => watchYoutubeConnectJob(jobId, attempt + 1), 1500);
+      return;
+    }
+    if (job.status === 'completed') {
+      const conn = await fetch('/api/connections').then(r => r.json());
+      if (conn.youtube_oauth_ready) {
+        showNotification('YouTube connected and ready to publish!');
+      } else {
+        showNotification('The authorization window closed without connecting. Check the Logs tab for details.', 'error');
+      }
+    } else {
+      const lastLogLine = (job.log || '').trim().split('\n').filter(Boolean).pop();
+      showNotification(`YouTube authorization failed${lastLogLine ? ': ' + lastLogLine : ''} — see the Logs tab for the full error.`, 'error');
+    }
+    if (currentPage === 'connections') loadConnections(document.getElementById('content-view'));
+  } catch (e) {
+    // Network hiccup on one poll shouldn't stop watching the job.
+    setTimeout(() => watchYoutubeConnectJob(jobId, attempt + 1), 1500);
   }
 }
 

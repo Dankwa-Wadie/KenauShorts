@@ -73,6 +73,23 @@ def main() -> None:
     ytdlp_path = shutil.which("yt-dlp")
     print(f"{check_mark(bool(ytdlp_path))} yt-dlp: {ytdlp_path or 'Not Found on PATH (pip install yt-dlp)'}")
 
+    # 6. YouTube upload dependencies — these fail *silently* deep inside the
+    # Studio's "Connect YouTube" flow (no browser window, no clear error)
+    # rather than at import time, so a gap here is easy to miss until you
+    # actually try to publish.
+    try:
+        import google_auth_oauthlib  # noqa: F401
+        import googleapiclient  # noqa: F401
+        print("✅ PASS YouTube upload libraries: Installed and operational")
+    except ImportError as e:
+        print(f"❌ FAIL YouTube upload libraries: Missing ({e}).")
+        print("   Run: pip install google-auth-oauthlib google-api-python-client google-auth-httplib2")
+
+    client_secret_present = (ROOT / "client_secret.json").exists()
+    token_present = (ROOT / "token.json").exists()
+    print(f"ℹ️  client_secret.json: {'Found' if client_secret_present else 'Not set up yet (see docs/YOUTUBE_API_SETUP.md — only needed before you publish)'}")
+    print(f"ℹ️  token.json: {'Found (already authorized)' if token_present else 'Not yet authorized'}")
+
     print("=" * 60)
     if py_ok and ffmpeg_path:
         print("🎉 Your PC is ready to run KenauShorts!")

@@ -69,6 +69,25 @@ class StudioServerSecurityTests(unittest.TestCase):
         status, _ = self.request("GET", "/api/status", headers={"Host": "attacker.example"})
         self.assertEqual(status, 403)
 
+    def test_get_job_by_id_returns_its_recorded_result(self):
+        # This is what the Connections page polls after starting a
+        # youtube_connect job — without it, a job that fails after the
+        # initial "started" response (missing dependency, port conflict,
+        # bad client_secret.json) has no way to surface its real error.
+        store.put("jobs", "job123", {
+            "id": "job123", "status": "failed",
+            "log": "google-auth-oauthlib not installed",
+        })
+        status, data = self.request("GET", "/api/job?id=job123", headers={"Host": f"127.0.0.1:{self.port}"})
+        self.assertEqual(status, 200)
+        body = json.loads(data)
+        self.assertEqual(body["status"], "failed")
+        self.assertIn("google-auth-oauthlib", body["log"])
+
+    def test_get_job_missing_id_returns_404(self):
+        status, data = self.request("GET", "/api/job?id=does-not-exist", headers={"Host": f"127.0.0.1:{self.port}"})
+        self.assertEqual(status, 404)
+
     def test_post_without_csrf_or_origin_is_rejected(self):
         status, _ = self.request(
             "POST", "/api/job", json.dumps({"action": "preview"}),

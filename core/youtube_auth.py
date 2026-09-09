@@ -20,7 +20,7 @@ SCOPES = ["https://www.googleapis.com/auth/youtube.upload"]
 def authenticate_youtube(
     client_secret_path: Path,
     token_path: Path,
-    port: int = 8080,
+    port: int = 0,
     force: bool = False,
     open_browser: bool = True,
 ) -> bool:
@@ -55,6 +55,12 @@ def authenticate_youtube(
 
     try:
         flow = InstalledAppFlow.from_client_secrets_file(str(client_secret_path), SCOPES)
+        # port=0 asks the OS for any free loopback port rather than a fixed
+        # one — a Desktop-app OAuth client (per the setup guide) supports
+        # this dynamic redirect, so there's no port to pre-register in Cloud
+        # Console. This also sidesteps the very plausible case where 8080 is
+        # already taken by something else on the user's machine, which
+        # otherwise fails this step with no browser opening at all.
         creds = flow.run_local_server(
             port=port,
             open_browser=open_browser,
@@ -74,7 +80,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Authorise YouTube uploads.")
     parser.add_argument("--client-secret", default="client_secret.json")
     parser.add_argument("--token", default="token.json")
-    parser.add_argument("--port", type=int, default=8080)
+    parser.add_argument("--port", type=int, default=0, help="0 (default) picks any free port")
     parser.add_argument("--force", action="store_true")
     args = parser.parse_args()
 

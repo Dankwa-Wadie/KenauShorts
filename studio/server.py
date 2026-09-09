@@ -169,7 +169,7 @@ def start_job(action: str, key: str = "", automatic: bool = False) -> dict:
         elif action in ("upload", "render"):
             command = [python, "-u", "-m", "studio.worker", action, key]
         elif action == "youtube_connect":
-            command = [python, "-u", "-m", "core.youtube_auth", "--port", "8080"]
+            command = [python, "-u", "-m", "core.youtube_auth"]  # port 0 = any free port
         else:
             raise ValueError(f"Unknown job action: {action}")
 
@@ -430,6 +430,15 @@ class StudioHandler(BaseHTTPRequestHandler):
                 self.send_json(record)
             else:
                 self.send_json({"error": "Video not found"}, 404)
+            return
+
+        if path == "/api/job":
+            job_id = query.get("id", [""])[0]
+            record = store.get("jobs", job_id)
+            if record:
+                self.send_json(record)
+            else:
+                self.send_json({"error": "Job not found"}, 404)
             return
 
         if path == "/api/connections":

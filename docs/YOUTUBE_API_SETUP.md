@@ -2,6 +2,8 @@
 
 To let KenauShorts upload rendered videos directly to your YouTube channel as Shorts, you will need to create a free OAuth 2.0 client in Google Cloud Console.
 
+> **Not the same as your Gemini API key.** The AI provider keys (Gemini/Claude/OpenAI) in the Connections tab are simple pasted keys from [Google AI Studio](https://aistudio.google.com/app/apikey) and similar. YouTube uploading is different: Google requires your explicit, one-time consent for anything that can post to your channel, so there is no pasteable-key option for it at all — only the OAuth flow below, which ends with a real Google sign-in window opening in your browser. That's expected, not an error.
+
 ---
 
 ## Step 1: Create a Google Cloud Project
