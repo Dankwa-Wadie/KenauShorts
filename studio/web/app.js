@@ -61,10 +61,10 @@ function renderPage(page) {
       eyebrow.textContent = 'MEDIA';
       loadLibrary(view);
       break;
-    case 'subreddits':
-      title.textContent = 'Subreddit Scraper Manager';
+    case 'sources':
+      title.textContent = 'Content Sources';
       eyebrow.textContent = 'DISCOVERY';
-      loadSubreddits(view);
+      loadSources(view);
       break;
     case 'style':
       title.textContent = 'Channel Identity & Card Style';
@@ -124,12 +124,18 @@ async function pollStatus() {
     }
 
     // Refresh live logs if on logs page
+    // Refresh live logs if on logs page
     if (currentPage === 'logs') {
       const term = document.getElementById('terminal-view');
       if (term && activeJobData) {
         term.textContent = activeJobData.log || 'Waiting for log output...';
         term.scrollTop = term.scrollHeight;
       }
+    }
+
+    // Refresh the library grid so the "in progress" placeholder updates/clears live
+    if (currentPage === 'library' && document.getElementById('library-grid')) {
+      renderLibraryGrid();
     }
   } catch (e) {
     console.error('Status poll error:', e);
@@ -180,9 +186,10 @@ function setupQuickActions() {
 async function loadOverview(container) {
   container.innerHTML = '<p>Loading statistics...</p>';
   try {
-    const [statusRes, videosRes] = await Promise.all([
+    const [statusRes, videosRes, failuresRes] = await Promise.all([
       fetch('/api/status').then(r => r.json()),
-      fetch('/api/videos').then(r => r.json())
+      fetch('/api/videos').then(r => r.json()),
+      fetch('/api/failures').then(r => r.json())
     ]);
 
     const total = videosRes.length;
@@ -208,7 +215,33 @@ async function loadOverview(container) {
           <div class="value">${statusRes.free_space_mb} MB</div>
         </div>
       </div>
+        <div class="stat-card">
+          <div class="label">Free Disk Space</div>
+          <div class="value">${statusRes.free_space_mb} MB</div>
+        </div>
+      </div>
 
+      ${failuresRes.length > 0 ? `
+      <div style="background: var(--bg-card); border: 1px solid var(--danger); border-radius: var(--radius-md); padding: 24px; margin-bottom: 24px;">
+        <h3 style="font-size: 18px; margin-bottom: 12px; color: var(--danger);">Recent Failures (${failuresRes.length})</h3>
+        <table class="sub-table">
+          <thead><tr><th>Candidate</th><th>Attempts</th><th>Last Reason</th><th>When</th></tr></thead>
+          <tbody>
+            ${failuresRes.slice(0, 10).map(f => `
+              <tr>
+                <td style="font-family: monospace; font-size: 12px;">${escapeHtml(f.key)}</td>
+                <td>${f.attempts}</td>
+                <td>${escapeHtml(f.last_reason)}</td>
+                <td>${f.last_time ? new Date(f.last_time * 1000).toLocaleString() : 'â€”'}</td>
+              </tr>
+            `).join('')}
+          </tbody>
+        </table>
+      </div>
+      ` : ''}
+
+      <div class="panel" style="margin-bottom: 24px;">
+        <h3 class="panel-title" style="font-size: 18px;">Active Pipeline Engine</h3>
       <div style="background: var(--bg-card); border: 1px solid var(--border); border-radius: var(--radius-md); padding: 24px; margin-bottom: 24px;">
         <h3 style="font-size: 18px; margin-bottom: 12px;">Active Pipeline Engine</h3>
         <p style="color: var(--text-muted); font-size: 14px; margin-bottom: 20px;">
@@ -216,7 +249,7 @@ async function loadOverview(container) {
         </p>
         <div style="display: flex; gap: 12px;">
           <button class="btn btn-secondary" onclick="document.querySelector('[data-page=library]').click()">Browse Drafts (${ready})</button>
-          <button class="btn btn-secondary" onclick="document.querySelector('[data-page=subreddits]').click()">Manage Subreddits</button>
+          <button class="btn btn-secondary" onclick="document.querySelector('[data-page=sources]').click()">Manage Sources</button>         
           <button class="btn btn-secondary" onclick="document.querySelector('[data-page=logs]').click()">View Terminal</button>
         </div>
       </div>
@@ -230,13 +263,17 @@ async function loadOverview(container) {
 // Page: Drafts & Library
 // --------------------------------------------------------------------------
 
+let libraryVideos = [];
+let libraryFilter = 'all';
+let librarySort = 'newest';
+
 async function loadLibrary(container) {
   container.innerHTML = '<p>Loading drafts & video library...</p>';
   try {
     const res = await fetch('/api/videos');
-    const videos = await res.json();
+    libraryVideos = await res.json();
 
-    if (!videos || videos.length === 0) {
+    if (!libraryVideos || libraryVideos.length === 0) {
       container.innerHTML = `
         <div style="text-align: center; padding: 60px 20px; background: var(--bg-card); border-radius: var(--radius-md); border: 1px dashed var(--border);">
           <h3 style="font-size: 18px; margin-bottom: 8px;">No Videos Generated Yet</h3>
@@ -247,33 +284,141 @@ async function loadLibrary(container) {
       return;
     }
 
-    container.innerHTML = `
-      <div class="video-grid">
-        ${videos.map(v => {
-          const posterUrl = v.poster ? `/media/${v.poster.replace(/\\/g, '/')}` : '';
-          return `
-            <div class="video-card" onclick="openVideoModal('${v.id}')">
-              <div class="video-thumb">
-                ${posterUrl ? `<img src="${posterUrl}" alt="Preview" onerror="this.style.display='none'">` : ''}
-                <span class="status-pill ${v.status}">${v.status}</span>
-              </div>
-              <div class="video-info">
-                <h4>${escapeHtml(v.title || v.headline || 'Untitled Short')}</h4>
-                <div class="video-meta">
-                  <span>${v.candidate ? v.candidate.channel : 'Local'}</span> • 
-                  <span>${new Date(v.created_at).toLocaleDateString()}</span>
-                </div>
-              </div>
-            </div>
-          `;
-        }).join('')}
+        container.innerHTML = `
+      <div style="display: flex; gap: 12px; margin-bottom: 20px; align-items: center;">
+        <select class="form-input" id="library-filter" style="max-width: 180px;">
+          <option value="all">All Statuses</option>
+          <option value="ready">Ready</option>
+          <option value="uploaded">Uploaded</option>
+          <option value="failed">Failed</option>
+        </select>
+        <select class="form-input" id="library-sort" style="max-width: 180px;">
+          <option value="newest">Newest First</option>
+          <option value="oldest">Oldest First</option>
+        </select>
+        <span style="color: var(--text-muted); font-size: 13px;" id="library-count"></span>
       </div>
+      <div id="library-bulk-bar" style="display: none; gap: 12px; margin-bottom: 16px; align-items: center; background: var(--bg-card); border: 1px solid var(--danger); border-radius: var(--radius-sm); padding: 12px 16px;">
+        <span id="library-bulk-count" style="font-size: 13px;"></span>
+        <button class="btn btn-danger" style="padding: 6px 14px; font-size: 13px;" onclick="deleteSelectedVideos()">Delete Selected</button>
+        <button class="btn btn-secondary" style="padding: 6px 14px; font-size: 13px;" onclick="librarySelected.clear(); renderLibraryGrid();">Clear Selection</button>
+      </div>
+      <div class="video-grid" id="library-grid"></div>
     `;
+
+    document.getElementById('library-filter').value = libraryFilter;
+    document.getElementById('library-sort').value = librarySort;
+    document.getElementById('library-filter').addEventListener('change', (e) => {
+      libraryFilter = e.target.value;
+      renderLibraryGrid();
+    });
+    document.getElementById('library-sort').addEventListener('change', (e) => {
+      librarySort = e.target.value;
+      renderLibraryGrid();
+    });
+
+    renderLibraryGrid();
   } catch (e) {
     container.innerHTML = `<p style="color: var(--danger)">Failed to load library: ${e.message}</p>`;
   }
 }
 
+let librarySelected = new Set();
+
+function renderLibraryGrid() {
+  const grid = document.getElementById('library-grid');
+  const countEl = document.getElementById('library-count');
+  if (!grid) return;
+
+  let filtered = libraryFilter === 'all'
+    ? libraryVideos
+    : libraryVideos.filter(v => v.status === libraryFilter);
+
+  filtered = [...filtered].sort((a, b) => {
+    const diff = new Date(a.created_at) - new Date(b.created_at);
+    return librarySort === 'newest' ? -diff : diff;
+  });
+
+  const activeCard = (activeJobData && libraryFilter === 'all') ? `
+    <div class="video-card" style="cursor: default;">
+      <div class="video-thumb" style="display: flex; align-items: center; justify-content: center; background: #11141b;">
+        <span style="color: var(--accent); font-size: 13px; text-align: center; padding: 12px;">âš™ ${escapeHtml(activeJobData.stage || 'Rendering...')}</span>
+      </div>
+      <div class="video-info">
+        <h4>In Progress</h4>
+        <div class="video-meta"><span>Job running now</span></div>
+      </div>
+    </div>
+  ` : '';
+
+  countEl.textContent = `${filtered.length} of ${libraryVideos.length} videos`;
+
+  const bulkBar = document.getElementById('library-bulk-bar');
+  if (bulkBar) {
+    bulkBar.style.display = librarySelected.size > 0 ? 'flex' : 'none';
+    const label = document.getElementById('library-bulk-count');
+    if (label) label.textContent = `${librarySelected.size} selected`;
+  }
+
+  if (filtered.length === 0) {
+    grid.innerHTML = `<p style="color: var(--text-muted); grid-column: 1 / -1;">No videos match this filter.</p>`;
+    return;
+  }
+
+  grid.innerHTML = activeCard + filtered.map(v => {
+    const posterUrl = v.poster ? `/media/${v.poster.replace(/\\/g, '/')}` : '';
+    const checked = librarySelected.has(v.id) ? 'checked' : '';
+    return `
+      <div class="video-card">
+        <input type="checkbox" class="video-select-checkbox" ${checked} onclick="event.stopPropagation(); toggleLibrarySelect('${v.id}')"
+               style="position: absolute; top: 10px; left: 10px; z-index: 2;">
+        <div onclick="openVideoModal('${v.id}')">
+          <div class="video-thumb">
+            ${posterUrl ? `<img src="${posterUrl}" alt="Preview" onerror="this.style.display='none'">` : ''}
+            <span class="status-pill ${v.status}">${v.status}</span>
+          </div>
+          <div class="video-info">
+            <h4>${escapeHtml(v.title || v.headline || 'Untitled Short')}</h4>
+            <div class="video-meta">
+              <span>${v.candidate ? v.candidate.channel : 'Local'}</span> â€¢ 
+              <span>${new Date(v.created_at).toLocaleDateString()}</span>
+            </div>
+          </div>
+        </div>
+      </div>
+    `;
+  }).join('');
+}
+
+function toggleLibrarySelect(id) {
+  if (librarySelected.has(id)) {
+    librarySelected.delete(id);
+  } else {
+    librarySelected.add(id);
+  }
+  renderLibraryGrid();
+}
+
+async function deleteSelectedVideos() {
+  if (librarySelected.size === 0) return;
+  if (!confirm(`Permanently delete ${librarySelected.size} video(s) and their files? This cannot be undone.`)) return;
+
+  const ids = [...librarySelected];
+  let failures = 0;
+  for (const id of ids) {
+    try {
+      const res = await postJSON('/api/video', { id, action: 'delete' });
+      const data = await res.json();
+      if (data.error) failures++;
+    } catch (e) {
+      failures++;
+    }
+  }
+
+  librarySelected.clear();
+  showNotification(failures > 0 ? `Deleted with ${failures} failure(s).` : 'Selected videos deleted.', failures > 0 ? 'error' : 'success');
+  loadLibrary(document.getElementById('content-view'));
+}
 async function openVideoModal(id) {
   try {
     const res = await fetch(`/api/video?id=${id}`);
@@ -307,9 +452,10 @@ async function openVideoModal(id) {
           </div>
 
           <div style="display: flex; gap: 12px; margin-top: 24px;">
-            <button class="btn btn-secondary" onclick="saveVideoEdits('${v.id}')">💾 Save Details</button>
-            <button class="btn btn-secondary" onclick="reRenderDraft('${v.id}')">🔄 Re-render Card</button>
-            ${v.status !== 'uploaded' ? `<button class="btn btn-primary" onclick="uploadDraft('${v.id}')">🚀 Upload to YouTube</button>` : `<span class="badge" style="color: var(--success); padding: 10px 16px;">✓ Uploaded to YouTube</span>`}
+            <button class="btn btn-secondary" onclick="saveVideoEdits('${v.id}')"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="vertical-align:-2px;margin-right:4px;"><path d="M19 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11l5 5v11a2 2 0 0 1-2 2Z"></path><polyline points="17 21 17 13 7 13 7 21"></polyline><polyline points="7 3 7 8 15 8"></polyline></svg>Save Details</button>
+            <button class="btn btn-secondary" onclick="reRenderDraft('${v.id}')"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="vertical-align:-2px;margin-right:4px;"><polyline points="23 4 23 10 17 10"></polyline><polyline points="1 20 1 14 7 14"></polyline><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"></path></svg>Re-render Card</button>
+            ${v.status !== 'uploaded' ? `<button class="btn btn-primary" onclick="uploadDraft('${v.id}')"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="vertical-align:-2px;margin-right:4px;"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path><polyline points="17 8 12 3 7 8"></polyline><line x1="12" y1="3" x2="12" y2="15"></line></svg>Upload to YouTube</button>` : `<span class="badge" style="color: var(--success); padding: 10px 16px;">âœ“ Uploaded to YouTube</span>`}
+            <button class="btn btn-danger" onclick="deleteVideo('${v.id}')"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="vertical-align:-2px;margin-right:4px;"><polyline points="3 6 5 6 21 6"></polyline><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"></path><line x1="10" y1="11" x2="10" y2="17"></line><line x1="14" y1="11" x2="14" y2="17"></line></svg>Delete</button>
           </div>
         </div>
       </div>
@@ -322,6 +468,19 @@ async function openVideoModal(id) {
   }
 }
 
+async function deleteVideo(id) {
+  if (!confirm('Permanently delete this video and its files? This cannot be undone.')) return;
+  try {
+    const res = await postJSON('/api/video', { id, action: 'delete' });
+    const data = await res.json();
+    if (data.error) throw new Error(data.error);
+    showNotification('Video deleted.');
+    document.getElementById('video-modal').close();
+    loadLibrary(document.getElementById('content-view'));
+  } catch (e) {
+    showNotification(e.message, 'error');
+  }
+}
 async function saveVideoEdits(id) {
   const title = document.getElementById('edit-title').value;
   const headline = document.getElementById('edit-headline').value;
@@ -365,17 +524,47 @@ async function uploadDraft(id) {
   }
 }
 
+
 // --------------------------------------------------------------------------
-// Page: Subreddit Scraper Manager (User-Configured Subreddits)
+// Page: Sources (Subreddits, YouTube Channels, Search Queries)
 // --------------------------------------------------------------------------
 
-async function loadSubreddits(container) {
-  container.innerHTML = '<p>Loading subreddits...</p>';
+let sourcesTab = 'subreddits';
+
+async function loadSources(container) {
+  container.innerHTML = '<p>Loading sources...</p>';
   try {
-    const res = await fetch('/api/subreddits');
-    const subreddits = await res.json();
+    const [subreddits, channels, queries] = await Promise.all([
+      fetch('/api/subreddits').then(r => r.json()),
+      fetch('/api/youtube_channels').then(r => r.json()),
+      fetch('/api/youtube_queries').then(r => r.json()),
+    ]);
 
     container.innerHTML = `
+      <div class="sources-tabs" style="display: flex; gap: 8px; margin-bottom: 20px;">
+        <button class="btn ${sourcesTab === 'subreddits' ? 'btn-primary' : 'btn-secondary'}" onclick="switchSourcesTab('subreddits')">Subreddits (${subreddits.length})</button>
+        <button class="btn ${sourcesTab === 'channels' ? 'btn-primary' : 'btn-secondary'}" onclick="switchSourcesTab('channels')">YouTube Channels (${channels.length})</button>
+        <button class="btn ${sourcesTab === 'queries' ? 'btn-primary' : 'btn-secondary'}" onclick="switchSourcesTab('queries')">Search Queries (${queries.length})</button>
+      </div>
+      <div id="sources-tab-body"></div>
+    `;
+
+    renderSourcesTab(subreddits, channels, queries);
+  } catch (e) {
+    container.innerHTML = `<p style="color: var(--danger)">Failed to load sources: ${e.message}</p>`;
+  }
+}
+
+function switchSourcesTab(tab) {
+  sourcesTab = tab;
+  loadSources(document.getElementById('content-view'));
+}
+
+function renderSourcesTab(subreddits, channels, queries) {
+  const body = document.getElementById('sources-tab-body');
+
+  if (sourcesTab === 'subreddits') {
+    body.innerHTML = `
       <div class="subreddits-header">
         <div>
           <h3 style="font-size: 18px; margin-bottom: 4px;">Target Subreddits</h3>
@@ -394,21 +583,14 @@ async function loadSubreddits(container) {
           <option value="General">General</option>
         </select>
         <input type="number" class="form-input" id="new-sub-score" value="200" style="max-width: 130px;" placeholder="Min upvotes">
-        <button class="btn btn-secondary" onclick="testNewSubreddit()">🔍 Test Scrape</button>
+        <button class="btn btn-secondary" onclick="testNewSubreddit()"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="vertical-align:-2px;margin-right:4px;"><circle cx="11" cy="11" r="8"></circle><line x1="21" y1="21" x2="16.65" y2="16.65"></line></svg>Test Scrape</button>
         <button class="btn btn-primary" onclick="addNewSubreddit()">+ Add Subreddit</button>
       </div>
 
       <div id="sub-test-results" style="margin-bottom: 20px;"></div>
 
       <table class="sub-table">
-        <thead>
-          <tr>
-            <th>Subreddit</th>
-            <th>Category</th>
-            <th>Min Upvotes</th>
-            <th>Actions</th>
-          </tr>
-        </thead>
+        <thead><tr><th>Subreddit</th><th>Category</th><th>Min Upvotes</th><th>Actions</th></tr></thead>
         <tbody>
           ${subreddits.map(s => {
             const name = typeof s === 'object' ? s.name : s;
@@ -419,39 +601,90 @@ async function loadSubreddits(container) {
                 <td><strong>r/${escapeHtml(name)}</strong></td>
                 <td><span class="category-tag">${escapeHtml(cat)}</span></td>
                 <td>${score} upvotes</td>
-                <td>
-                  <button class="btn btn-danger" style="padding: 4px 10px; font-size: 12px;" onclick="deleteSubreddit('${escapeHtml(name)}')">Remove</button>
-                </td>
+                <td><button class="btn btn-danger" style="padding: 4px 10px; font-size: 12px;" onclick="deleteSubreddit('${escapeHtml(name)}')">Remove</button></td>
               </tr>
             `;
           }).join('')}
         </tbody>
       </table>
     `;
-  } catch (e) {
-    container.innerHTML = `<p style="color: var(--danger)">Failed to load subreddits: ${e.message}</p>`;
+  } else if (sourcesTab === 'channels') {
+    body.innerHTML = `
+      <div class="subreddits-header">
+        <div>
+          <h3 style="font-size: 18px; margin-bottom: 4px;">YouTube Channels</h3>
+          <p style="color: var(--text-muted); font-size: 13px;">Channels whose recent uploads are pulled in as video candidates via RSS.</p>
+        </div>
+      </div>
+
+      <div class="add-sub-bar">
+        <input type="text" class="form-input" id="new-ch-name" placeholder="Display name (e.g. NASA)">
+        <input type="text" class="form-input" id="new-ch-id" placeholder="Channel ID (e.g. UCLA_DiR1FfKNvjuUpBHmylQ)">
+        <select class="form-input" id="new-ch-licence" style="max-width: 180px;">
+          <option value="public-domain">Public Domain</option>
+          <option value="cc">Creative Commons</option>
+          <option value="unknown">Unknown</option>
+        </select>
+        <button class="btn btn-primary" onclick="addNewChannel()">+ Add Channel</button>
+      </div>
+
+      <table class="sub-table">
+        <thead><tr><th>Name</th><th>Channel ID</th><th>Licence</th><th>Actions</th></tr></thead>
+        <tbody>
+          ${channels.map(c => `
+            <tr>
+              <td><strong>${escapeHtml(c.name || c.channel)}</strong></td>
+              <td style="font-family: monospace; font-size: 12px;">${escapeHtml(c.channel)}</td>
+              <td><span class="category-tag">${escapeHtml(c.licence || 'unknown')}</span></td>
+              <td><button class="btn btn-danger" style="padding: 4px 10px; font-size: 12px;" onclick="deleteChannel('${escapeHtml(c.channel)}')">Remove</button></td>
+            </tr>
+          `).join('')}
+        </tbody>
+      </table>
+    `;
+  } else if (sourcesTab === 'queries') {
+    body.innerHTML = `
+      <div class="subreddits-header">
+        <div>
+          <h3 style="font-size: 18px; margin-bottom: 4px;">YouTube Search Queries</h3>
+          <p style="color: var(--text-muted); font-size: 13px;">Search terms used to discover video candidates across all of YouTube, not just configured channels.</p>
+        </div>
+      </div>
+
+      <div class="add-sub-bar">
+        <input type="text" class="form-input" id="new-query-text" placeholder="Search query (e.g. tech news shorts)">
+        <button class="btn btn-primary" onclick="addNewQuery()">+ Add Query</button>
+      </div>
+
+      <table class="sub-table">
+        <thead><tr><th>Query</th><th>Actions</th></tr></thead>
+        <tbody>
+          ${queries.map(q => `
+            <tr>
+              <td><strong>${escapeHtml(q)}</strong></td>
+              <td><button class="btn btn-danger" style="padding: 4px 10px; font-size: 12px;" onclick="deleteQuery('${escapeHtml(q)}')">Remove</button></td>
+            </tr>
+          `).join('')}
+        </tbody>
+      </table>
+    `;
   }
 }
 
 async function testNewSubreddit() {
   const name = document.getElementById('new-sub-name').value.trim();
   const box = document.getElementById('sub-test-results');
-  if (!name) {
-    alert('Please enter a subreddit name to test.');
-    return;
-  }
+  if (!name) { alert('Please enter a subreddit name to test.'); return; }
   box.innerHTML = `<p style="color: var(--accent); font-size: 13px;">Testing scraper on r/${name}...</p>`;
-
   try {
     const res = await postJSON('/api/subreddits/test', { name });
     const data = await res.json();
     if (data.error) throw new Error(data.error);
-
     box.innerHTML = `
       <div style="background: #11141b; border: 1px solid var(--border); border-radius: var(--radius-sm); padding: 16px;">
-        <h4 style="font-size: 14px; color: var(--success); margin-bottom: 8px;">✓ Scrape successful! Found ${data.count} posts from r/${data.subreddit}</h4>
+        <h4 style="font-size: 14px; color: var(--success); margin-bottom: 8px;">âœ“ Scrape successful! Found ${data.count} posts from r/${data.subreddit}</h4>
         <ul style="font-size: 13px; color: var(--text-muted); list-style: none;">
-          ${data.sample.map(p => `<li style="margin-bottom: 4px;">• <strong>[${p.score} pts]</strong> ${escapeHtml(p.title)}</li>`).join('')}
+          ${data.sample.map(p => `<li style="margin-bottom: 4px;">â€¢ <strong>[${p.score} pts]</strong> ${escapeHtml(p.title)}</li>`).join('')}
         </ul>
       </div>
     `;
@@ -464,18 +697,13 @@ async function addNewSubreddit() {
   const name = document.getElementById('new-sub-name').value.trim();
   const category = document.getElementById('new-sub-cat').value;
   const min_score = parseInt(document.getElementById('new-sub-score').value, 10) || 200;
-
-  if (!name) {
-    alert('Please enter a subreddit name.');
-    return;
-  }
-
+  if (!name) { alert('Please enter a subreddit name.'); return; }
   try {
     const res = await postJSON('/api/subreddits', { action: 'add', name, category, min_score });
     const data = await res.json();
     if (data.error) throw new Error(data.error);
     showNotification(`Added r/${name} to scraping list.`);
-    loadSubreddits(document.getElementById('content-view'));
+    loadSources(document.getElementById('content-view'));
   } catch (e) {
     showNotification(e.message, 'error');
   }
@@ -488,7 +716,63 @@ async function deleteSubreddit(name) {
     const data = await res.json();
     if (data.error) throw new Error(data.error);
     showNotification(`Removed r/${name}.`);
-    loadSubreddits(document.getElementById('content-view'));
+    loadSources(document.getElementById('content-view'));
+  } catch (e) {
+    showNotification(e.message, 'error');
+  }
+}
+
+async function addNewChannel() {
+  const name = document.getElementById('new-ch-name').value.trim();
+  const channel = document.getElementById('new-ch-id').value.trim();
+  const licence = document.getElementById('new-ch-licence').value;
+  if (!name || !channel) { alert('Please enter both a name and a channel ID.'); return; }
+  try {
+    const res = await postJSON('/api/youtube_channels', { action: 'add', name, channel, licence });
+    const data = await res.json();
+    if (data.error) throw new Error(data.error);
+    showNotification(`Added channel "${name}".`);
+    loadSources(document.getElementById('content-view'));
+  } catch (e) {
+    showNotification(e.message, 'error');
+  }
+}
+
+async function deleteChannel(channel) {
+  if (!confirm('Remove this channel from discovery?')) return;
+  try {
+    const res = await postJSON('/api/youtube_channels', { action: 'delete', channel });
+    const data = await res.json();
+    if (data.error) throw new Error(data.error);
+    showNotification('Removed channel.');
+    loadSources(document.getElementById('content-view'));
+  } catch (e) {
+    showNotification(e.message, 'error');
+  }
+}
+
+async function addNewQuery() {
+  const query = document.getElementById('new-query-text').value.trim();
+  if (!query) { alert('Please enter a search query.'); return; }
+  try {
+    const res = await postJSON('/api/youtube_queries', { action: 'add', query });
+    const data = await res.json();
+    if (data.error) throw new Error(data.error);
+    showNotification(`Added query "${query}".`);
+    loadSources(document.getElementById('content-view'));
+  } catch (e) {
+    showNotification(e.message, 'error');
+  }
+}
+
+async function deleteQuery(query) {
+  if (!confirm('Remove this search query?')) return;
+  try {
+    const res = await postJSON('/api/youtube_queries', { action: 'delete', query });
+    const data = await res.json();
+    if (data.error) throw new Error(data.error);
+    showNotification('Removed query.');
+    loadSources(document.getElementById('content-view'));
   } catch (e) {
     showNotification(e.message, 'error');
   }
@@ -506,34 +790,43 @@ async function loadConnections(container) {
     container.innerHTML = `
       <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 24px;">
         <!-- AI Keys -->
-        <div style="background: var(--bg-card); border: 1px solid var(--border); border-radius: var(--radius-md); padding: 24px;">
-          <h3 style="font-size: 16px; margin-bottom: 16px;">AI Editorial Keys</h3>
+        <div class="panel">
+          <h3 class="panel-title">AI Editorial Keys</h3>
           <p style="color: var(--text-muted); font-size: 13px; margin-bottom: 20px;">
             At least one key is needed for Claude, Gemini, or OpenAI to evaluate viral candidates and generate punchy headlines.
           </p>
 
           <div class="form-group">
-            <label>Google Gemini API Key ${conn.gemini ? '<span style="color:var(--success); font-size:12px;">(✓ Configured)</span>' : ''}</label>
-            <input type="password" class="form-input" id="key-gemini" placeholder="${conn.gemini_preview || 'AIzaSy...'}">
+            <label>Google Gemini API Key ${conn.gemini ? '<span style="color:var(--success); font-size:12px;">(âœ“ Configured)</span>' : ''}</label>
+            <div style="display: flex; gap: 8px;">
+              <input type="password" class="form-input" id="key-gemini" placeholder="${conn.gemini_preview || 'AIzaSy...'}">
+              ${conn.gemini ? `<button class="btn btn-danger" style="white-space: nowrap;" onclick="removeApiKey('GEMINI_API_KEY')">Remove</button>` : ''}
+            </div>
             <p class="form-help">Free tier available at <a href="https://aistudio.google.com/app/apikey" target="_blank" style="color:var(--accent);">aistudio.google.com</a>.</p>
           </div>
 
           <div class="form-group">
-            <label>Anthropic (Claude) API Key ${conn.anthropic ? '<span style="color:var(--success); font-size:12px;">(✓ Configured)</span>' : ''}</label>
-            <input type="password" class="form-input" id="key-anthropic" placeholder="sk-ant-...">
+            <label>Anthropic (Claude) API Key ${conn.anthropic ? '<span style="color:var(--success); font-size:12px;">(âœ“ Configured)</span>' : ''}</label>
+            <div style="display: flex; gap: 8px;">
+              <input type="password" class="form-input" id="key-anthropic" placeholder="sk-ant-...">
+              ${conn.anthropic ? `<button class="btn btn-danger" style="white-space: nowrap;" onclick="removeApiKey('ANTHROPIC_API_KEY')">Remove</button>` : ''}
+            </div>
           </div>
 
           <div class="form-group">
-            <label>OpenAI API Key ${conn.openai ? '<span style="color:var(--success); font-size:12px;">(✓ Configured)</span>' : ''}</label>
-            <input type="password" class="form-input" id="key-openai" placeholder="sk-...">
+            <label>OpenAI API Key ${conn.openai ? '<span style="color:var(--success); font-size:12px;">(âœ“ Configured)</span>' : ''}</label>
+            <div style="display: flex; gap: 8px;">
+              <input type="password" class="form-input" id="key-openai" placeholder="sk-...">
+              ${conn.openai ? `<button class="btn btn-danger" style="white-space: nowrap;" onclick="removeApiKey('OPENAI_API_KEY')">Remove</button>` : ''}
+            </div>
           </div>
 
           <button class="btn btn-primary" onclick="saveApiKeys()">Save API Keys</button>
         </div>
 
         <!-- YouTube OAuth -->
-        <div style="background: var(--bg-card); border: 1px solid var(--border); border-radius: var(--radius-md); padding: 24px;">
-          <h3 style="font-size: 16px; margin-bottom: 16px;">YouTube Publishing OAuth</h3>
+        <div class="panel">
+          <h3 class="panel-title">YouTube Publishing OAuth</h3>
           <p style="color: var(--text-muted); font-size: 13px; margin-bottom: 12px;">
             Uploading a video needs your explicit consent, so this can't be a pasted API key like the ones on the
             left — Google only allows it through a one-time OAuth sign-in. It's also a different Google product:
@@ -582,6 +875,18 @@ async function saveApiKeys() {
     const res = await postJSON('/api/connections', payload);
     if (!res.ok) throw new Error('Failed to save keys');
     showNotification('API keys securely saved.');
+    loadConnections(document.getElementById('content-view'));
+  } catch (e) {
+    showNotification(e.message, 'error');
+  }
+}
+
+async function removeApiKey(keyName) {
+  if (!confirm('Remove this API key? You can add a new one anytime.')) return;
+  try {
+    const res = await postJSON('/api/connections', { [keyName]: '' });
+    if (!res.ok) throw new Error('Failed to remove key');
+    showNotification('API key removed.');
     loadConnections(document.getElementById('content-view'));
   } catch (e) {
     showNotification(e.message, 'error');
@@ -641,10 +946,20 @@ async function loadAutomation(container) {
   try {
     const data = await fetch('/api/settings').then(r => r.json());
     const auto = data.automation;
+    const editorial = data.config.editorial || {};
+
+    const nextRunText = auto.enabled && auto.next_run
+      ? new Date(auto.next_run * 1000).toLocaleString()
+      : 'Not scheduled (automation is paused)';
 
     container.innerHTML = `
-      <div style="max-width: 600px; background: var(--bg-card); border: 1px solid var(--border); border-radius: var(--radius-md); padding: 24px;">
-        <h3 style="font-size: 16px; margin-bottom: 20px;">Always-On Background Automation</h3>
+      <div class="panel" style="max-width: 600px; margin-bottom: 24px;">
+        <h3 class="panel-title" style="margin-bottom: 20px;">Always-On Background Automation</h3>
+
+        <div style="background: #11141b; border: 1px solid var(--border); border-radius: var(--radius-sm); padding: 14px 16px; margin-bottom: 20px;">
+          <div style="font-size: 12px; color: var(--text-muted); margin-bottom: 4px;">NEXT SCHEDULED RUN</div>
+          <div style="font-size: 15px; font-weight: 600;">${nextRunText}</div>
+        </div>
 
         <div class="form-group">
           <label>Automation Status</label>
@@ -676,9 +991,35 @@ async function loadAutomation(container) {
 
         <button class="btn btn-primary" onclick="saveAutomationSettings()">Save Automation Settings</button>
       </div>
+
+      <div class="panel" style="max-width: 600px;">
+        <h3 class="panel-title" style="margin-bottom: 8px;">AI Editorial Instructions</h3>
+        <p style="color: var(--text-muted); font-size: 13px; margin-bottom: 16px;">This prompt tells the AI how to pick and write up the best candidate each run.</p>
+        <div class="form-group">
+          <textarea class="form-input" id="editorial-prompt" rows="14" style="font-family: 'JetBrains Mono', monospace; font-size: 13px; line-height: 1.5;">${escapeHtml(editorial.system_prompt || '')}</textarea>
+        </div>
+        <button class="btn btn-primary" onclick="saveEditorialPrompt()">Save Editorial Prompt</button>
+      </div>
     `;
   } catch (e) {
     container.innerHTML = `<p style="color: var(--danger)">Failed to load automation: ${e.message}</p>`;
+  }
+}
+
+async function saveEditorialPrompt() {
+  const system_prompt = document.getElementById('editorial-prompt').value;
+  try {
+    const data = await fetch('/api/settings').then(r => r.json());
+    const cfg = data.config;
+    cfg.editorial = { ...cfg.editorial, system_prompt };
+    const res = await postJSON('/api/settings', { config: cfg });
+    if (!res.ok) {
+      const errData = await res.json();
+      throw new Error(errData.error || 'Save failed');
+    }
+    showNotification('Editorial prompt saved.');
+  } catch (e) {
+    showNotification(e.message, 'error');
   }
 }
 
@@ -708,8 +1049,8 @@ async function loadStyle(container) {
 
     container.innerHTML = `
       <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 24px;">
-        <div style="background: var(--bg-card); border: 1px solid var(--border); border-radius: var(--radius-md); padding: 24px;">
-          <h3 style="font-size: 16px; margin-bottom: 16px;">Channel Identity</h3>
+        <div class="panel">
+          <h3 class="panel-title">Channel Identity</h3>
           <div class="form-group">
             <label>Channel Name</label>
             <input type="text" class="form-input" id="style-name" value="${escapeHtml(acct.name || '')}">
@@ -728,8 +1069,8 @@ async function loadStyle(container) {
           <button class="btn btn-primary" onclick="saveStyleSettings()">Save Branding</button>
         </div>
 
-        <div style="background: var(--bg-card); border: 1px solid var(--border); border-radius: var(--radius-md); padding: 24px;">
-          <h3 style="font-size: 16px; margin-bottom: 16px;">Card Styling</h3>
+        <div class="panel">
+          <h3 class="panel-title">Card Styling</h3>
           <div class="form-group">
             <label>Border Color</label>
             <input type="color" class="form-input" id="style-border-color" value="${layout.border_color || '#1D9BF0'}" style="height: 44px; padding: 4px;">
@@ -742,12 +1083,55 @@ async function loadStyle(container) {
             <label>Headline Size (px)</label>
             <input type="number" class="form-input" id="style-headline-size" value="${layout.headline_size || 76}">
           </div>
+
+          <h3 style="font-size: 14px; margin: 20px 0 12px; color: var(--text-muted);">Live Preview</h3>
+          <div style="background: #000; border-radius: 12px; padding: 20px; display: flex; justify-content: center;">
+            <div id="style-preview-card" style="width: 260px; background: #15181f; overflow: hidden;">
+              <div style="padding: 16px;">
+                <div id="style-preview-headline" style="color: #fff; font-family: 'JetBrains Mono', monospace; font-weight: 700; line-height: 1.15;">
+                  SAMPLE HEADLINE TEXT GOES HERE
+                </div>
+              </div>
+            </div>
+          </div>
         </div>
       </div>
     `;
+
+    setupStylePreview();
   } catch (e) {
     container.innerHTML = `<p style="color: var(--danger)">Failed to load style: ${e.message}</p>`;
   }
+}
+
+function setupStylePreview() {
+  const colorInput = document.getElementById('style-border-color');
+  const radiusInput = document.getElementById('style-radius');
+  const headlineInput = document.getElementById('style-headline-size');
+
+  function updatePreview() {
+    const card = document.getElementById('style-preview-card');
+    const headline = document.getElementById('style-preview-headline');
+    if (!card || !headline) return;
+
+    const borderColor = colorInput.value || '#1D9BF0';
+    const radius = parseInt(radiusInput.value, 10) || 40;
+    // Preview card is a fixed 260px wide mock, while real cards render at
+    // 1080px â€” scale the px values down proportionally so the preview
+    // actually looks like what will render, not just uses the raw numbers.
+    const scale = 260 / 1080;
+    const scaledRadius = Math.round(radius * scale);
+    const scaledHeadline = Math.round((parseInt(headlineInput.value, 10) || 76) * scale);
+
+    card.style.border = `3px solid ${borderColor}`;
+    card.style.borderRadius = `${scaledRadius}px`;
+    headline.style.fontSize = `${scaledHeadline}px`;
+  }
+
+  [colorInput, radiusInput, headlineInput].forEach(el => {
+    el.addEventListener('input', updatePreview);
+  });
+  updatePreview();
 }
 
 async function saveStyleSettings() {
@@ -775,7 +1159,7 @@ async function saveStyleSettings() {
 // Page: Logs
 // --------------------------------------------------------------------------
 
-function loadLogs(container) {
+async function loadLogs(container) {
   const logText = (activeJobData && activeJobData.log) ? activeJobData.log : 'No active job running. Logs appear live as jobs execute.';
   container.innerHTML = `
     <div style="margin-bottom: 12px; display: flex; justify-content: space-between; align-items: center;">
@@ -783,7 +1167,42 @@ function loadLogs(container) {
       <button class="btn btn-secondary" onclick="pollStatus()">Refresh</button>
     </div>
     <div class="terminal-box" id="terminal-view">${escapeHtml(logText)}</div>
+
+    <h3 style="font-size: 15px; margin: 24px 0 12px;">Past Job Logs</h3>
+    <div id="past-logs-list"><p style="color: var(--text-muted); font-size: 13px;">Loading...</p></div>
   `;
+
+  try {
+    const res = await fetch('/api/logs');
+    const ids = await res.json();
+    const listEl = document.getElementById('past-logs-list');
+    if (!ids.length) {
+      listEl.innerHTML = '<p style="color: var(--text-muted); font-size: 13px;">No past job logs yet.</p>';
+      return;
+    }
+    listEl.innerHTML = `
+      <div style="display: flex; flex-direction: column; gap: 6px;">
+        ${ids.map(id => `
+          <button class="btn btn-secondary" style="text-align: left; font-family: monospace; font-size: 12px;" onclick="viewPastLog('${id}')">${escapeHtml(id)}</button>
+        `).join('')}
+      </div>
+    `;
+  } catch (e) {
+    document.getElementById('past-logs-list').innerHTML = `<p style="color: var(--danger); font-size: 13px;">Failed to load past logs: ${e.message}</p>`;
+  }
+}
+
+async function viewPastLog(id) {
+  try {
+    const res = await fetch(`/api/logs/file?id=${encodeURIComponent(id)}`);
+    const data = await res.json();
+    if (data.error) throw new Error(data.error);
+    const term = document.getElementById('terminal-view');
+    term.textContent = data.log;
+    term.scrollTop = 0;
+  } catch (e) {
+    showNotification(e.message, 'error');
+  }
 }
 
 // --------------------------------------------------------------------------
