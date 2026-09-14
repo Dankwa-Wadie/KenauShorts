@@ -125,23 +125,38 @@ def discover_youtube_rss(channels: list[dict[str, Any]], per_channel: int = 6) -
 
     return candidates
 
-def discover_reddit(subreddits_config: list[dict[str, Any]], limit_per_sub: int = 10, min_score: int = 150) -> list[Candidate]:
-    """Fetch stories and video clips from user-configured subreddits."""
+def discover_reddit(
+    subreddits_config: list[dict[str, Any]],
+    limit_per_sub: int = 10,
+    min_score: int = 150,
+) -> list[Candidate]:
+    """Fetch video clips from user-configured subreddits."""
     candidates = []
     token = get_reddit_token()
 
     for item in subreddits_config:
         sub_name = item.get("name", "") if isinstance(item, dict) else str(item)
-        score_thresh = item.get("min_score", min_score) if isinstance(item, dict) else min_score
+        score_thresh = (
+            item.get("min_score", min_score)
+            if isinstance(item, dict)
+            else min_score
+        )
+
         if not sub_name:
             continue
 
-        posts = fetch_subreddit_posts(sub_name, sort="hot", limit=limit_per_sub, token=token)
+        posts = fetch_subreddit_posts(
+            sub_name,
+            sort="hot",
+            limit=limit_per_sub,
+            token=token,
+        )
+
         for p in posts:
             if p["score"] < score_thresh or p["over_18"]:
                 continue
 
-            # Determine kind: video clip if Reddit video exists, else story
+            # Only accept posts containing an actual Reddit video.
             if p["is_video"] and p["video_url"]:
                 candidates.append(Candidate(
                     kind="clip",
@@ -151,20 +166,7 @@ def discover_reddit(subreddits_config: list[dict[str, Any]], limit_per_sub: int 
                     source="reddit",
                     channel=f"r/{p['subreddit']}",
                     licence="standard",
-                    text=p["selftext"][:400],
-                    published_at=p["created_utc"],
-                ))
-            elif p["images"] or len(p["selftext"]) > 40:
-                candidates.append(Candidate(
-                    kind="story",
-                    key=f"reddit_{p['id']}",
-                    title=p["title"],
-                    url=p["permalink"],
-                    source="reddit",
-                    channel=f"r/{p['subreddit']}",
-                    licence="standard",
-                    text=p["selftext"][:500],
-                    images=p["images"][:2],
+                    text=_clean(p["selftext"])[:400],
                     published_at=p["created_utc"],
                 ))
 
@@ -564,21 +566,15 @@ def discover_all_candidates(config: dict[str, Any], state: State) -> list[Candid
     yt_candidates = discover_youtube_rss(channels, per_channel=int(discovery.get("per_channel", 6)))
     reddit_candidates = discover_reddit(subreddits)
 
-    # These sources are opt-in — an empty list in config (the default) keeps
-    # discovery exactly as it was, so existing setups are unaffected.
+    # Text/story-only sources (RSS, Wikimedia, Wikipedia search) are disabled —
+    # this pipeline should only ever produce video candidates.
     yt_search_candidates = discover_youtube(
         discovery.get("youtube_queries", []), youtube_api_key,
         cc_only=bool(discovery.get("youtube_cc_only", True)),
     )
-    rss_candidates = discover_rss(discovery.get("news_rss", []))
-    wikimedia_candidates = discover_wikimedia(
-        discovery.get("wikimedia_sections", []),
-        days_back=int(discovery.get("wikimedia_days_back", 2)),
-    )
-    wikipedia_candidates = discover_wikipedia_search(
-        discovery.get("wikipedia_queries", []),
-        free_only=bool(discovery.get("free_images_only", True)),
-    )
+    rss_candidates = []
+    wikimedia_candidates = []
+    wikipedia_candidates = []
 
     # Only YouTube clips need a licence check — Reddit's own over_18/score
     # gate is separate, and the other sources are licensed at discovery time.
