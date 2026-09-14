@@ -40,6 +40,8 @@ from studio import store
 LOG = logging.getLogger("kenaushorts.server")
 ROOT = store.ROOT
 WEB_DIR = ROOT / "studio" / "web"
+LOGS_DIR = ROOT / "logs"
+LOGS_DIR.mkdir(parents=True, exist_ok=True)
 PORT = int(os.environ.get("KENAU_STUDIO_PORT", "8766"))
 CSRF = secrets.token_urlsafe(32)
 
@@ -109,6 +111,16 @@ def redact(text: str) -> str:
 def run_job_process(job: dict, command: list[str]) -> None:
     global ACTIVE_JOB
     log_lines = []
+    # job id is our own generated stem/timestamp string, not user input, so
+    # it's safe to use directly as a filename here.
+    log_path = LOGS_DIR / f"{job['id']}.log"
+
+    def write_full_log():
+        try:
+            log_path.write_text("\n".join(log_lines), encoding="utf-8")
+        except OSError:
+            pass  # A disk-full/permission hiccup here shouldn't crash the job.
+
     try:
         proc = subprocess.Popen(
             command,
@@ -134,7 +146,8 @@ def run_job_process(job: dict, command: list[str]) -> None:
                     pass
             else:
                 log_lines.append(redact(line_str))
-            job["log"] = "\n".join(log_lines[-40:])
+                write_full_log()
+            job["log"] = "\n".join(log_lines[-200:])
             store.put("jobs", job["id"], job)
 
         code = proc.wait()
@@ -145,9 +158,13 @@ def run_job_process(job: dict, command: list[str]) -> None:
     except Exception as e:
         job["status"] = "failed"
         job["stage"] = "Failed"
-        job["log"] += f"\nError: {redact(str(e))}"
+        error_line = f"Error: {redact(str(e))}"
+        log_lines.append(error_line)
+        write_full_log()
+        job["log"] = "\n".join(log_lines[-200:])
         job["finished_at"] = store.now()
     finally:
+        job["log_file"] = f"{job['id']}.log"
         store.put("jobs", job["id"], job)
         with GUARD:
             ACTIVE_JOB = None
@@ -423,6 +440,48 @@ class StudioHandler(BaseHTTPRequestHandler):
             self.send_json(records)
             return
 
+        if path == "/api/failures":
+            state_path = ROOT / "state.json"
+            data = read_json(state_path, {})
+            failed = data.get("failed", {})
+            # Sort by most recent failure first, and cap the reasons shown per
+            # entry so one badly-behaved candidate can't bloat the response.
+            out = []
+            for key, info in failed.items():
+                reasons = info.get("reasons", [])
+                last_time = reasons[-1]["time"] if reasons else 0
+                out.append({
+                    "key": key,
+                    "attempts": info.get("attempts", 0),
+                    "last_reason": reasons[-1]["reason"] if reasons else "Unknown",
+                    "last_time": last_time,
+                })
+            out.sort(key=lambda x: x["last_time"], reverse=True)
+            self.send_json(out[:50])
+            return
+
+        if path == "/api/logs":
+            files = sorted(LOGS_DIR.glob("*.log"), key=lambda p: p.stat().st_mtime, reverse=True)
+            self.send_json([f.stem for f in files[:100]])
+            return
+
+        if path == "/api/logs/file":
+            job_id = query.get("id", [""])[0]
+            # job_id came from a job we generated ourselves, but treat it as
+            # untrusted here too — same resolve()+is_relative_to() pattern
+            # used for /media/ below, so a crafted id can't read outside logs/.
+            try:
+                log_file = (LOGS_DIR / f"{job_id}.log").resolve()
+            except (OSError, ValueError):
+                self.send_error(404, "Log not found")
+                return
+            logs_dir_resolved = LOGS_DIR.resolve()
+            if log_file.is_file() and log_file.is_relative_to(logs_dir_resolved):
+                self.send_json({"id": job_id, "log": log_file.read_text(encoding="utf-8", errors="replace")})
+            else:
+                self.send_json({"error": "Log not found"}, 404)
+            return
+
         if path == "/api/video":
             vid_id = query.get("id", [""])[0]
             record = store.get("videos", vid_id)
@@ -465,6 +524,17 @@ class StudioHandler(BaseHTTPRequestHandler):
             cfg = get_config()
             subs = cfg.get("discovery", {}).get("subreddits", [])
             self.send_json(subs)
+            return
+        if path == "/api/youtube_channels":
+            cfg = get_config()
+            channels = cfg.get("discovery", {}).get("youtube_channels", [])
+            self.send_json(channels)
+            return
+
+        if path == "/api/youtube_queries":
+            cfg = get_config()
+            queries = cfg.get("discovery", {}).get("youtube_queries", [])
+            self.send_json(queries)
             return
 
         if path == "/api/settings":
@@ -551,6 +621,21 @@ class StudioHandler(BaseHTTPRequestHandler):
             record = store.get("videos", vid_id)
             if not record:
                 raise ValueError("Video not found")
+
+            if data.get("action") == "delete":
+                for field in ("video", "poster"):
+                    file_path = record.get(field)
+                    if file_path:
+                        p = (ROOT / file_path).resolve()
+                        out_dir = (ROOT / "out").resolve()
+                        if p.is_relative_to(out_dir) and p.is_file():
+                            try:
+                                p.unlink()
+                            except OSError:
+                                pass
+                store.delete("videos", vid_id)
+                return {"status": "deleted", "id": vid_id}
+
             if "title" in data:
                 record["title"] = data["title"]
             if "description" in data:
@@ -569,7 +654,13 @@ class StudioHandler(BaseHTTPRequestHandler):
                 if k in allowed_keys:
                     if not isinstance(v, str) or len(v) > 4096:
                         raise ValueError("Invalid API key")
-                    existing[k] = v.strip()
+                    cleaned = v.strip()
+                    if cleaned:
+                        existing[k] = cleaned
+                    else:
+                        # An explicit empty value means "remove this key",
+                        # not "save a blank string".
+                        existing.pop(k, None)
             write_json(secrets_path, existing, private=True)
             store.load_secrets()
             return {"status": "saved"}
@@ -605,6 +696,58 @@ class StudioHandler(BaseHTTPRequestHandler):
                 return {"status": "deleted", "subreddits": discovery["subreddits"]}
             else:
                 raise ValueError("Unknown subreddit action")
+
+        if path == "/api/youtube_channels":
+            cfg = get_config()
+            discovery = cfg.setdefault("discovery", {})
+            channels = discovery.setdefault("youtube_channels", [])
+
+            action = data.get("action", "add")
+            if action == "add":
+                name = str(data.get("name", "")).strip()[:100]
+                channel_id = str(data.get("channel", "")).strip()
+                if not name or not channel_id or len(channel_id) > 60:
+                    raise ValueError("Channel name and ID are required")
+                licence = str(data.get("licence", "unknown"))[:30]
+                channels = [c for c in channels if c.get("channel") != channel_id]
+                if len(channels) >= 60:
+                    raise ValueError("Use up to 60 channels")
+                channels.append({"name": name, "channel": channel_id, "licence": licence})
+                discovery["youtube_channels"] = channels
+                save_config(cfg)
+                return {"status": "added", "youtube_channels": channels}
+            elif action == "delete":
+                channel_id = str(data.get("channel", "")).strip()
+                discovery["youtube_channels"] = [c for c in channels if c.get("channel") != channel_id]
+                save_config(cfg)
+                return {"status": "deleted", "youtube_channels": discovery["youtube_channels"]}
+            else:
+                raise ValueError("Unknown channel action")
+
+        if path == "/api/youtube_queries":
+            cfg = get_config()
+            discovery = cfg.setdefault("discovery", {})
+            queries = discovery.setdefault("youtube_queries", [])
+
+            action = data.get("action", "add")
+            if action == "add":
+                q = str(data.get("query", "")).strip()
+                if not q or len(q) > 200:
+                    raise ValueError("Invalid search query")
+                if q not in queries:
+                    if len(queries) >= 40:
+                        raise ValueError("Use up to 40 search queries")
+                    queries.append(q)
+                discovery["youtube_queries"] = queries
+                save_config(cfg)
+                return {"status": "added", "youtube_queries": queries}
+            elif action == "delete":
+                q = str(data.get("query", "")).strip()
+                discovery["youtube_queries"] = [x for x in queries if x != q]
+                save_config(cfg)
+                return {"status": "deleted", "youtube_queries": discovery["youtube_queries"]}
+            else:
+                raise ValueError("Unknown query action")
 
         if path == "/api/subreddits/test":
             from core.scrape_reddit import fetch_subreddit_posts

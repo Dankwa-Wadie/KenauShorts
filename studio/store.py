@@ -58,6 +58,13 @@ def records(table: str) -> list[dict[str, Any]]:
         rows = db.execute(f"SELECT data FROM {table} ORDER BY rowid DESC").fetchall()
     return [json.loads(r["data"]) for r in rows]
 
+def delete(table: str, key: str) -> None:
+    assert table in ("videos", "jobs")
+    if not DB.exists():
+        return
+    with connect() as db:
+        db.execute(f"DELETE FROM {table} WHERE id=?", (key,))
+
 # Cross-platform single instance locking
 @contextlib.contextmanager
 def pipeline_lock():
