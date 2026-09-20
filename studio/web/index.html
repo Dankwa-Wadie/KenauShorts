@@ -87,6 +87,33 @@
     </section>
   </main>
 
+    <!-- Manual URL Modal -->
+  <dialog id="manual-url-modal">
+    <div class="modal-box" style="max-width: 500px;">
+      <div class="modal-header">
+        <h3>Add Video by Link</h3>
+        <button class="modal-close" id="btn-close-manual-modal">✕</button>
+      </div>
+      <div class="modal-body">
+        <div class="form-group">
+          <label>Video URL</label>
+          <input type="text" class="form-input" id="manual-url" placeholder="https://www.youtube.com/watch?v=...">
+          <p class="form-help">A direct YouTube video link. This skips normal discovery and licence checks.</p>
+        </div>
+        <div class="form-group">
+          <label>Headline (optional)</label>
+          <input type="text" class="form-input" id="manual-headline" placeholder="Leave blank to let AI write one">
+        </div>
+        <div class="form-group">
+          <label>Description (optional)</label>
+          <textarea class="form-input" id="manual-description" rows="3" placeholder="Leave blank to let AI write one"></textarea>
+        </div>
+        <button class="btn btn-primary" onclick="submitManualUrl()">Render Preview</button>
+      </div>
+    </div>
+  </dialog>
+
+
   <!-- Video Player & Editor Modal -->
   <dialog id="video-modal">
     <div class="modal-box">

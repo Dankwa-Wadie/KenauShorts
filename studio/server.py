@@ -169,7 +169,7 @@ def run_job_process(job: dict, command: list[str]) -> None:
         with GUARD:
             ACTIVE_JOB = None
 
-def start_job(action: str, key: str = "", automatic: bool = False) -> dict:
+def start_job(action: str, key: str = "", automatic: bool = False, extra: dict | None = None) -> dict:
     global ACTIVE_JOB
     with GUARD:
         if ACTIVE_JOB or store.busy():
@@ -187,6 +187,17 @@ def start_job(action: str, key: str = "", automatic: bool = False) -> dict:
             command = [python, "-u", "-m", "studio.worker", action, key]
         elif action == "youtube_connect":
             command = [python, "-u", "-m", "core.youtube_auth"]  # port 0 = any free port
+        elif action == "manual":
+            url = extra.get("url", "") if extra else ""
+            if not url:
+                raise ValueError("A video URL is required.")
+            command = [python, "-u", "-m", "core.agent", "--dry-run", "--url", url]
+            headline = (extra or {}).get("headline", "")
+            description = (extra or {}).get("description", "")
+            if headline:
+                command += ["--headline", headline]
+            if description:
+                command += ["--description", description]
         else:
             raise ValueError(f"Unknown job action: {action}")
 
@@ -614,8 +625,8 @@ class StudioHandler(BaseHTTPRequestHandler):
 
     def mutate(self, path: str, data: dict) -> dict | None:
         if path == "/api/job":
-            return start_job(data.get("action", ""), data.get("key", ""))
-
+            return start_job(data.get("action", ""), data.get("key", ""), extra=data)
+            
         if path == "/api/video":
             vid_id = data.get("id", "")
             record = store.get("videos", vid_id)

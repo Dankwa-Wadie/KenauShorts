@@ -17,6 +17,7 @@ import subprocess
 import sys
 import time
 import urllib.parse
+import uuid
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -408,6 +409,11 @@ def discover_youtube(queries: list[str], api_key: str, per_query: int = 8,
             "part": "snippet", "q": q, "type": "video", "order": "viewCount",
             "maxResults": per_query,
             "videoDuration": "short", "videoEmbeddable": "true", "key": api_key,
+            # Bias results toward English-language content. This isn't a hard
+            # guarantee (relevanceLanguage nudges ranking, it doesn't strictly
+            # filter), so a stray non-English result can still slip through —
+            # the editorial prompt's English-only headline rule is the backstop.
+            "relevanceLanguage": "en",
         }
         if cc_only:
             params["videoLicense"] = "creativeCommon"
@@ -640,7 +646,7 @@ def _fallback_picks(candidates: list[Candidate], n: int) -> list[Pick]:
         ))
     return picks
 
-def pick_stories(candidates: list[Candidate], config: dict[str, Any], n: int = 1) -> list[Pick]:
+def pick_stories(candidates: list[Candidate], config: dict[str, Any], n: int = 1, recent_posted: list[str] | None = None) -> list[Pick]:    
     """
     Ask an LLM for the best N candidates, best first.
 
@@ -660,12 +666,21 @@ def pick_stories(candidates: list[Candidate], config: dict[str, Any], n: int = 1
     for idx, c in enumerate(candidates[:20]):
         listings.append(f"[{idx}] Source: {c.channel} ({c.source})\nTitle: {c.title}\nDetails: {c.text}\n")
 
+    recent_block = ""
+    if recent_posted:
+        recent_list = "\n".join(f"- {h}" for h in recent_posted[:15])
+        recent_block = (
+            "\nThe following headlines were posted recently. Do NOT pick a candidate covering the "
+            "same story or a near-duplicate topic to any of these, even if the wording differs:\n"
+            f"{recent_list}\n"
+        )
+
     user_prompt = (
         f"Analyze the following candidates and pick up to {n} of the best, best first, for a "
         "30-second YouTube Short. Only the first will normally be used — the rest are spares in "
         "case its download fails, so order matters. Return fewer if the rest aren't good enough.\n"
-        "Output valid JSON ONLY matching this schema:\n"
-        "{\n"
+        f"{recent_block}"
+        "Output valid JSON ONLY matching this schema:\n"        "{\n"
         '  "picks": [\n'
         "    {\n"
         '      "pick_index": 0,\n'
@@ -689,7 +704,7 @@ def pick_stories(candidates: list[Candidate], config: dict[str, Any], n: int = 1
         try:
             LOG.info("Calling editorial provider: %s", prov)
             if prov == "gemini":
-                raw_json = _call_gemini(user_prompt, system, key, editorial.get("gemini_model", "gemini-1.5-flash"))
+                                raw_json = _call_gemini(user_prompt, system, key, editorial.get("gemini_model", "gemini-3.6-flash"))
             elif prov == "anthropic":
                 raw_json = _call_claude(user_prompt, system, key, editorial.get("anthropic_model", "claude-3-5-sonnet-20241022"))
             elif prov == "openai":
@@ -739,6 +754,30 @@ def pick_stories(candidates: list[Candidate], config: dict[str, Any], n: int = 1
 # --------------------------------------------------------------------------
 # Downloader
 # --------------------------------------------------------------------------
+
+def fetch_video_metadata(url: str) -> tuple[str, str]:
+    """Fetch a video's real title and description via yt-dlp, without downloading it.
+
+    Used for manually-supplied URLs so the editorial step has real content
+    to work from instead of a placeholder title and no details at all.
+    Returns ("", "") on any failure — the caller should treat that as
+    "no metadata available" rather than crash the whole render.
+    """
+    try:
+        result = subprocess.run(
+            ["yt-dlp", "--no-playlist", "--skip-download", "--print", "%(title)s\n%(description).500s", url],
+            capture_output=True, text=True, timeout=30,
+        )
+        if result.returncode != 0:
+            LOG.warning("Could not fetch metadata for %s: %s", url, result.stderr.strip()[:200])
+            return "", ""
+        parts = result.stdout.split("\n", 1)
+        title = parts[0].strip() if parts else ""
+        description = parts[1].strip() if len(parts) > 1 else ""
+        return title, description
+    except Exception as e:
+        LOG.warning("Could not fetch metadata for %s: %s", url, e)
+        return "", ""
 
 def download_clip(url: str, out_path: Path, max_seconds: int = 35) -> bool:
     """Download source video clip using yt-dlp."""
@@ -857,6 +896,11 @@ def _render_pick(pick: Pick, config: dict[str, Any], work_dir: Path, out_dir: Pa
             return None
 
         emit_progress("Rendering video card")
+        music_path_str = config.get("audio", {}).get("track", "")
+        music_path = Path(music_path_str) if music_path_str else None
+        if music_path and not music_path.is_file():
+            LOG.warning("Configured music track %s not found — rendering without music", music_path)
+            music_path = None
         render(
             video=raw_clip,
             headline=pick.headline,
@@ -864,6 +908,7 @@ def _render_pick(pick: Pick, config: dict[str, Any], work_dir: Path, out_dir: Pa
             config=config,
             max_seconds=float(max_clip_seconds),
             poster=poster_png,
+            music=music_path,
         )
     else:
         emit_progress("Rendering story card")
@@ -881,6 +926,91 @@ def _render_pick(pick: Pick, config: dict[str, Any], work_dir: Path, out_dir: Pa
 
     return final_mp4
 
+def run_manual(config_path: Path, url: str, headline: str = "", description: str = "", dry_run: bool = False) -> None:
+    """Render a single, manually-supplied video URL, bypassing discovery entirely.
+
+    If headline/description are left blank, falls back to Gemini (via the
+    normal pick_stories() editorial step) to generate them, same as a
+    regular discovered candidate would get.
+    """
+    with keep_awake():
+        config = json.loads(config_path.read_text(encoding="utf-8"))
+        state = State(ROOT / "state.json")
+
+        emit_progress("Fetching video info")
+        real_title, real_description = fetch_video_metadata(url)
+
+        candidate = Candidate(
+            kind="clip",
+            key=f"manual_{uuid.uuid4().hex[:10]}",
+            title=headline or real_title or "Manually added video",
+            url=url,
+            source="manual",
+            channel="Manual",
+            licence="manual",
+            text=real_description,
+        )
+
+        if headline.strip() and description.strip():
+            pick = Pick(
+                candidate=candidate,
+                headline=headline.strip(),
+                caption=description.strip(),
+                title=f"{headline.strip()} #Shorts",
+                description=description.strip(),
+                hashtags=["KaydenAmp"],
+            )
+        else:
+            emit_progress("AI Editorial Selection")
+            picks = pick_stories([candidate], config, n=1)
+            if not picks:
+                LOG.warning("Editorial could not generate a headline for the manual URL.")
+                emit_summary({"status": "failed", "message": "Editorial could not process this video"})
+                return
+            pick = picks[0]
+            # Respect whichever field the person actually typed, even if
+            # the other was left blank for Gemini to fill in.
+            if headline.strip():
+                pick.headline = headline.strip()
+            if description.strip():
+                pick.description = description.strip()
+                pick.caption = description.strip()
+
+        work_dir = ROOT / "work"
+        out_dir = ROOT / "out"
+        work_dir.mkdir(parents=True, exist_ok=True)
+        out_dir.mkdir(parents=True, exist_ok=True)
+
+        stem = f"short_{int(time.time())}_{candidate.key[:10]}"
+        try:
+            final_mp4 = _render_pick(pick, config, work_dir, out_dir, stem)
+        except Exception as e:
+            LOG.error("Render error for manual URL %s: %s", url, e)
+            final_mp4 = None
+
+        if final_mp4 is None:
+            emit_summary({"status": "failed", "message": "Download or render failed"})
+            return
+
+        poster_png = out_dir / f"{stem}.png"
+        video_record = store.draft(
+            video_stem=stem,
+            video_path=final_mp4,
+            poster_path=poster_png,
+            headline=pick.headline,
+            title=pick.title,
+            description=pick.description,
+            config=config,
+            candidate_data=dataclasses.asdict(pick.candidate),
+        )
+
+        if not dry_run:
+            state.mark_seen(candidate.key)
+            state.save()
+
+        emit_summary({"status": "ok", "message": "Manual video rendered", "video_id": video_record.get("id", "")}
+        )
+
 def run_pipeline(config_path: Path, dry_run: bool = False) -> None:
     with keep_awake():
         config = json.loads(config_path.read_text(encoding="utf-8"))
@@ -893,7 +1023,10 @@ def run_pipeline(config_path: Path, dry_run: bool = False) -> None:
             return
 
         max_candidates = int(config.get("editorial", {}).get("max_candidates", 3))
-        picks = pick_stories(candidates, config, n=max_candidates)
+        # Most recent first, so a short list (the prompt caps at 15) favors
+        # what was posted most recently over older history.
+        recent_posted = [p.get("headline", p.get("title", "")) for p in reversed(state.posted[-20:])]
+        picks = pick_stories(candidates, config, n=max_candidates, recent_posted=recent_posted)
         if not picks:
             LOG.warning("Editorial could not make a pick.")
             emit_summary({"status": "failed", "message": "No pick generated"})
@@ -986,10 +1119,16 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="KenauShorts Pipeline")
     parser.add_argument("--config", default=str(ROOT / "config.json"))
     parser.add_argument("--dry-run", action="store_true", help="Render draft without uploading")
+    parser.add_argument("--url", default="", help="Render a single manually-supplied video URL instead of running discovery")
+    parser.add_argument("--headline", default="", help="Optional headline for --url mode; left blank, AI generates one")
+    parser.add_argument("--description", default="", help="Optional description for --url mode; left blank, AI generates one")
     args = parser.parse_args()
 
     cfg_file = Path(args.config)
     if not cfg_file.exists():
         cfg_file = ROOT / "config.example.json"
 
-    run_pipeline(cfg_file, dry_run=args.dry_run)
+    if args.url:
+        run_manual(cfg_file, args.url, headline=args.headline, description=args.description, dry_run=args.dry_run)
+    else:
+        run_pipeline(cfg_file, dry_run=args.dry_run)

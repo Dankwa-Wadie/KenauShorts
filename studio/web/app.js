@@ -179,6 +179,36 @@ function setupQuickActions() {
   });
 }
 
+function openManualUrlModal() {
+  document.getElementById('manual-url').value = '';
+  document.getElementById('manual-headline').value = '';
+  document.getElementById('manual-description').value = '';
+  const modal = document.getElementById('manual-url-modal');
+  document.getElementById('btn-close-manual-modal').onclick = () => modal.close();
+  modal.showModal();
+}
+
+async function submitManualUrl() {
+  const url = document.getElementById('manual-url').value.trim();
+  const headline = document.getElementById('manual-headline').value.trim();
+  const description = document.getElementById('manual-description').value.trim();
+
+  if (!url) {
+    alert('Please paste a video URL.');
+    return;
+  }
+
+  try {
+    const res = await postJSON('/api/job', { action: 'manual', url, headline, description });
+    const data = await res.json();
+    if (data.error) throw new Error(data.error);
+    showNotification('Rendering started — check the Library or Logs tab.');
+    document.getElementById('manual-url-modal').close();
+    pollStatus();
+  } catch (e) {
+    showNotification(e.message, 'error');
+  }
+}
 // --------------------------------------------------------------------------
 // Page: Overview
 // --------------------------------------------------------------------------
@@ -251,6 +281,7 @@ async function loadOverview(container) {
           <button class="btn btn-secondary" onclick="document.querySelector('[data-page=library]').click()">Browse Drafts (${ready})</button>
           <button class="btn btn-secondary" onclick="document.querySelector('[data-page=sources]').click()">Manage Sources</button>         
           <button class="btn btn-secondary" onclick="document.querySelector('[data-page=logs]').click()">View Terminal</button>
+          <button class="btn btn-secondary" onclick="openManualUrlModal()">+ Add Video by Link</button>
         </div>
       </div>
     `;
@@ -463,6 +494,16 @@ async function openVideoModal(id) {
 
     document.getElementById('btn-close-modal').onclick = () => modal.close();
     modal.showModal();
+
+    // The video keeps playing in the background otherwise — dialog.close()
+    // only hides the element, it doesn't stop media playback on its own.
+    modal.addEventListener('close', () => {
+      const vid = body.querySelector('video');
+      if (vid) {
+        vid.pause();
+        vid.currentTime = 0;
+      }
+    }, { once: true });
   } catch (e) {
     showNotification(`Could not open draft: ${e.message}`, 'error');
   }
