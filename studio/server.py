@@ -7,6 +7,7 @@ Serves the local Studio Web UI and manages background automation on PC.
 
 from __future__ import annotations
 
+import contextlib
 import copy
 import json
 import logging
@@ -156,7 +157,49 @@ def is_python_process(pid: int) -> bool:
             return False
     return True
 
-def terminate_process_tree(pid: int) -> bool:
+def get_process_creation_time(pid: int) -> int | None:
+    """Return process creation time as integer (100ns intervals since 1601 on Windows), or None if unavailable."""
+    if not isinstance(pid, int) or pid <= 0:
+        return None
+    if sys.platform == "win32":
+        import ctypes
+        from ctypes import wintypes
+        kernel32 = ctypes.windll.kernel32
+        PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+        PROCESS_QUERY_INFORMATION = 0x0400
+        h_proc = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+        if not h_proc:
+            h_proc = kernel32.OpenProcess(PROCESS_QUERY_INFORMATION, False, pid)
+            if not h_proc:
+                return None
+        try:
+            creation = wintypes.FILETIME()
+            exit_time = wintypes.FILETIME()
+            kernel_time = wintypes.FILETIME()
+            user_time = wintypes.FILETIME()
+            if kernel32.GetProcessTimes(
+                h_proc,
+                ctypes.byref(creation),
+                ctypes.byref(exit_time),
+                ctypes.byref(kernel_time),
+                ctypes.byref(user_time),
+            ):
+                return (creation.dwHighDateTime << 32) | creation.dwLowDateTime
+        finally:
+            kernel32.CloseHandle(h_proc)
+        return None
+    else:
+        try:
+            stat_path = Path(f"/proc/{pid}/stat")
+            if stat_path.exists():
+                fields = stat_path.read_text().split()
+                if len(fields) > 21:
+                    return int(fields[21])
+        except Exception:
+            pass
+        return None
+
+def terminate_process_tree(pid: int, expected_created_at: int | None = None) -> bool:
     """Safely terminate a process and its full child process tree."""
     if not isinstance(pid, int) or pid <= 0 or pid == os.getpid():
         LOG.warning("Refusing to terminate PID %s", pid)
@@ -164,6 +207,17 @@ def terminate_process_tree(pid: int) -> bool:
 
     if not is_process_alive(pid):
         return True
+
+    if expected_created_at is not None:
+        current_created_at = get_process_creation_time(pid)
+        if current_created_at is not None and current_created_at != expected_created_at:
+            LOG.warning(
+                "PID %d creation time %s does not match expected %s (PID recycled) — refusing to terminate",
+                pid, current_created_at, expected_created_at,
+            )
+            return False
+        if current_created_at is None and not is_process_alive(pid):
+            return True
 
     if not is_python_process(pid):
         LOG.warning("PID %s is alive but not recognized as a python/ffmpeg process", pid)
@@ -224,6 +278,7 @@ def run_job_process(job: dict, command: list[str]) -> None:
         except OSError:
             pass  # A disk-full/permission hiccup here shouldn't crash the job.
 
+    proc = None
     try:
         proc = subprocess.Popen(
             command,
@@ -237,6 +292,7 @@ def run_job_process(job: dict, command: list[str]) -> None:
         with GUARD:
             ACTIVE_PROC = proc
             job["pid"] = proc.pid
+            job["pid_created_at"] = get_process_creation_time(proc.pid)
             store.put("jobs", job["id"], job)
 
         for line in proc.stdout:
@@ -262,41 +318,69 @@ def run_job_process(job: dict, command: list[str]) -> None:
             store.put("jobs", job["id"], job)
 
         code = proc.wait()
-        current = store.get("jobs", job["id"]) or job
-        if current.get("status") == "cancelled":
-            job["status"] = "cancelled"
-            job["stage"] = current.get("stage", "Cancelled")
-            cleanup_job_artifacts(job)
-        else:
-            job["status"] = "completed" if code == 0 else "failed"
-            job["stage"] = "Completed" if code == 0 else "Failed"
-        job["finished_at"] = store.now()
+
+        with GUARD:
+            current = store.get("jobs", job["id"]) or job
+            if current.get("status") == "cancelled":
+                job["status"] = "cancelled"
+                job["stage"] = current.get("stage", "Cancelled")
+                cleanup_job_artifacts(job)
+            else:
+                summary = job.get("summary") or {}
+                summary_status = summary.get("status")
+                summary_msg = summary.get("message")
+
+                if summary_status == "failed":
+                    job["status"] = "failed"
+                    job["stage"] = f"Failed: {summary_msg}" if summary_msg else "Failed"
+                elif summary_status == "idle":
+                    job["status"] = "idle"
+                    job["stage"] = f"Idle: {summary_msg}" if summary_msg else "Idle: No new candidates"
+                elif summary_status in ("completed", "ok"):
+                    job["status"] = "completed"
+                    job["stage"] = "Completed"
+                elif code == 0:
+                    job["status"] = "completed"
+                    job["stage"] = "Completed"
+                else:
+                    job["status"] = "failed"
+                    job["stage"] = "Failed"
+
+            job["finished_at"] = store.now()
+            job["log_file"] = f"{job['id']}.log"
+            store.put("jobs", job["id"], job)
+            ACTIVE_JOB = None
+            ACTIVE_PROC = None
 
     except Exception as e:
-        current = store.get("jobs", job["id"]) or job
-        if current.get("status") == "cancelled":
-            job["status"] = "cancelled"
-            job["stage"] = current.get("stage", "Cancelled")
-            cleanup_job_artifacts(job)
-        else:
-            job["status"] = "failed"
-            job["stage"] = "Failed"
-            error_line = f"Error: {redact(str(e))}"
-            log_lines.append(error_line)
-            write_full_log()
-            job["log"] = "\n".join(log_lines[-200:])
-        job["finished_at"] = store.now()
+        with GUARD:
+            current = store.get("jobs", job["id"]) or job
+            if current.get("status") == "cancelled":
+                job["status"] = "cancelled"
+                job["stage"] = current.get("stage", "Cancelled")
+                cleanup_job_artifacts(job)
+            else:
+                job["status"] = "failed"
+                job["stage"] = "Failed"
+                error_line = f"Error: {redact(str(e))}"
+                log_lines.append(error_line)
+                write_full_log()
+                job["log"] = "\n".join(log_lines[-200:])
+            job["finished_at"] = store.now()
+            job["log_file"] = f"{job['id']}.log"
+            store.put("jobs", job["id"], job)
+            ACTIVE_JOB = None
+            ACTIVE_PROC = None
     finally:
         if proc and proc.stdout:
             try:
                 proc.stdout.close()
             except Exception:
                 pass
-        job["log_file"] = f"{job['id']}.log"
-        store.put("jobs", job["id"], job)
         with GUARD:
-            ACTIVE_JOB = None
-            ACTIVE_PROC = None
+            if ACTIVE_JOB and ACTIVE_JOB.get("id") == job.get("id"):
+                ACTIVE_JOB = None
+                ACTIVE_PROC = None
         QUEUE_EVENT.set()
 
 def get_next_pending_job() -> dict | None:
@@ -382,13 +466,14 @@ def cancel_job(job_id: str | None = None) -> dict:
         # Case 1: Active running job
         if ACTIVE_JOB and ACTIVE_JOB.get("id") == job_id:
             pid = ACTIVE_JOB.get("pid")
+            pid_created_at = ACTIVE_JOB.get("pid_created_at")
             ACTIVE_JOB["status"] = "cancelled"
             ACTIVE_JOB["stage"] = "Cancelled by user"
             ACTIVE_JOB["finished_at"] = store.now()
             store.put("jobs", job_id, ACTIVE_JOB)
 
             if pid:
-                terminate_process_tree(pid)
+                terminate_process_tree(pid, expected_created_at=pid_created_at)
             if ACTIVE_PROC and ACTIVE_PROC.poll() is None:
                 try:
                     ACTIVE_PROC.kill()
@@ -412,12 +497,13 @@ def cancel_job(job_id: str | None = None) -> dict:
 
         if status == "running":
             pid = job.get("pid")
+            pid_created_at = job.get("pid_created_at")
             job["status"] = "cancelled"
             job["stage"] = "Cancelled by user"
             job["finished_at"] = store.now()
             store.put("jobs", job_id, job)
             if pid:
-                terminate_process_tree(pid)
+                terminate_process_tree(pid, expected_created_at=pid_created_at)
             cleanup_job_artifacts(job)
             return {"status": "cancelled", "id": job_id, "message": "Job cancelled"}
 
@@ -1163,10 +1249,11 @@ def recover_interrupted_jobs() -> None:
     for job in store.records("jobs"):
         if job.get("status") == "running":
             pid = job.get("pid")
+            pid_created_at = job.get("pid_created_at")
             if pid and is_process_alive(pid):
                 if is_python_process(pid):
                     LOG.info("Terminating orphan process tree for PID %d from interrupted job %s", pid, job["id"])
-                    terminate_process_tree(pid)
+                    terminate_process_tree(pid, expected_created_at=pid_created_at)
             job.update(
                 status="interrupted",
                 stage="Interrupted by server restart",
@@ -1183,27 +1270,97 @@ def recover_interrupted_jobs() -> None:
                 )
                 store.put("videos", r["id"], r)
 
+@contextlib.contextmanager
+def server_lock():
+    """Acquire a non-blocking lock on .server.lock to ensure only one server instance runs."""
+    lock_file = ROOT / ".server.lock"
+    fd = None
+    if sys.platform == "win32":
+        import msvcrt
+        try:
+            fd = os.open(lock_file, os.O_RDWR | os.O_CREAT)
+            os.lseek(fd, 0, os.SEEK_SET)
+            msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+        except (OSError, IOError) as e:
+            if fd is not None:
+                try:
+                    os.close(fd)
+                except Exception:
+                    pass
+            raise RuntimeError(f"Another KenauShorts server instance is already running (locked {lock_file}): {e}") from e
+        try:
+            yield
+        finally:
+            if fd is not None:
+                try:
+                    os.lseek(fd, 0, os.SEEK_SET)
+                    msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
+                except Exception:
+                    pass
+                try:
+                    os.close(fd)
+                except Exception:
+                    pass
+    else:
+        import fcntl
+        try:
+            fd = os.open(lock_file, os.O_RDWR | os.O_CREAT)
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except (OSError, IOError) as e:
+            if fd is not None:
+                try:
+                    os.close(fd)
+                except Exception:
+                    pass
+            raise RuntimeError(f"Another KenauShorts server instance is already running (locked {lock_file}): {e}") from e
+        try:
+            yield
+        finally:
+            if fd is not None:
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_UN)
+                except Exception:
+                    pass
+                try:
+                    os.close(fd)
+                except Exception:
+                    pass
+
+class StudioServer(ThreadingHTTPServer):
+    allow_reuse_address = False
+
 def run_server(port: int = PORT) -> None:
-    store.load_secrets()
-    store.import_legacy()
-    recover_interrupted_jobs()
-    ensure_queue_worker()
-
-    server_address = ("127.0.0.1", port)
-    httpd = ThreadingHTTPServer(server_address, StudioHandler)
-    LOG.info("KenauShorts Studio running at http://127.0.0.1:%d/", port)
-
-    # Start background automation thread
-    t = threading.Thread(target=automation_loop, daemon=True)
-    t.start()
-
     try:
-        httpd.serve_forever()
-    except KeyboardInterrupt:
-        LOG.info("Stopping KenauShorts Studio...")
-    finally:
-        STOP_EVENT.set()
-        httpd.shutdown()
+        with server_lock():
+            server_address = ("127.0.0.1", port)
+            try:
+                httpd = StudioServer(server_address, StudioHandler)
+            except OSError as e:
+                LOG.error("Failed to bind KenauShorts Studio on port %d: %s", port, e)
+                return
+
+            store.load_secrets()
+            store.import_legacy()
+            recover_interrupted_jobs()
+            ensure_queue_worker()
+
+            LOG.info("KenauShorts Studio running at http://127.0.0.1:%d/", port)
+
+            # Start background automation thread
+            t = threading.Thread(target=automation_loop, daemon=True)
+            t.start()
+
+            try:
+                httpd.serve_forever()
+            except KeyboardInterrupt:
+                LOG.info("Stopping KenauShorts Studio...")
+            finally:
+                STOP_EVENT.set()
+                httpd.shutdown()
+                httpd.server_close()
+    except RuntimeError as e:
+        LOG.error("Cannot start KenauShorts Studio: %s", e)
+        return
 
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")

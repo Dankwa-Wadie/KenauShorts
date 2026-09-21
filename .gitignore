@@ -16,6 +16,7 @@ state.json
 studio-settings.json
 .pipeline.lock
 .studio.lock
+.server.lock
 
 # Media & Temporary Output
 work/
