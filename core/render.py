@@ -32,6 +32,13 @@ try:
 except ImportError:
     sys.exit("Pillow is required: pip install Pillow")
 
+from core.style_presets import (
+    STYLE_PRESETS,
+    apply_style_preset,
+    choose_style_preset,
+    get_style_preset,
+)
+
 LOG = logging.getLogger("kenaushorts.render")
 
 DEFAULT_LAYOUT: dict[str, Any] = {

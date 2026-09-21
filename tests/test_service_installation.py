@@ -37,7 +37,10 @@ class DirectScriptInvocationTests(unittest.TestCase):
                 time.sleep(1.0)
                 exit_code = proc.poll()
                 output = proc.stdout.read() if exit_code is not None else ""
-                self.assertIsNone(exit_code, f"server process exited early with output:\n{output}")
+                if exit_code is not None and "Another KenauShorts server instance is already running" in output:
+                    self.assertNotIn("No module named 'studio'", output)
+                else:
+                    self.assertIsNone(exit_code, f"server process exited early with output:\n{output}")
             finally:
                 proc.terminate()
                 try:

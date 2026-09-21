@@ -238,8 +238,13 @@ class Stage3ReliabilityTests(unittest.TestCase):
         t = threading.Thread(target=server.run_job_process, args=(job, command))
         t.start()
 
-        # Wait briefly for process to spawn
-        time.sleep(0.15)
+        # Wait until process has spawned and registered pid
+        for _ in range(50):
+            with server.GUARD:
+                if server.ACTIVE_PROC and job.get("pid"):
+                    break
+            time.sleep(0.05)
+
         cancel_res = server.cancel_job(job["id"])
         self.assertEqual(cancel_res["status"], "cancelled")
 

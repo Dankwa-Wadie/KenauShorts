@@ -30,6 +30,7 @@ from core.render import Account, RenderResult, render
 from core.render_story import render_story
 from core.scrape_reddit import fetch_subreddit_posts, get_reddit_token
 from core.state import State
+from core.style_presets import apply_style_preset, choose_style_preset, get_style_preset
 from studio import store
 
 LOG = logging.getLogger("kenaushorts.agent")
@@ -58,6 +59,7 @@ class Pick:
     description: str
     hashtags: list[str] = field(default_factory=list)
     mood: str = "neutral"
+    style_preset: str = ""
 
 def emit_progress(stage: str, **extras) -> None:
     payload = {"stage": stage, **extras}
@@ -895,8 +897,14 @@ def _render_pick(pick: Pick, config: dict[str, Any], work_dir: Path, out_dir: Pa
         if not download_clip(pick.candidate.url, raw_clip, max_seconds=max_clip_seconds):
             return None
 
+        # Select a style preset (reuse existing pick.style_preset if provided, otherwise random choice)
+        preset_name = getattr(pick, "style_preset", "")
+        preset = get_style_preset(preset_name) if preset_name else choose_style_preset()
+        pick.style_preset = preset["name"]
+        render_config = apply_style_preset(config, preset)
+
         emit_progress("Rendering video card")
-        music_path_str = config.get("audio", {}).get("track", "")
+        music_path_str = render_config.get("audio", {}).get("track", "")
         music_path = Path(music_path_str) if music_path_str else None
         if music_path and not music_path.is_file():
             LOG.warning("Configured music track %s not found — rendering without music", music_path)
@@ -905,7 +913,7 @@ def _render_pick(pick: Pick, config: dict[str, Any], work_dir: Path, out_dir: Pa
             video=raw_clip,
             headline=pick.headline,
             out=final_mp4,
-            config=config,
+            config=render_config,
             max_seconds=float(max_clip_seconds),
             poster=poster_png,
             music=music_path,
@@ -1002,6 +1010,7 @@ def run_manual(config_path: Path, url: str, headline: str = "", description: str
             description=pick.description,
             config=config,
             candidate_data=dataclasses.asdict(pick.candidate),
+            style_preset=getattr(pick, "style_preset", ""),
         )
 
         if not dry_run:
@@ -1077,6 +1086,7 @@ def run_pipeline(config_path: Path, dry_run: bool = False) -> None:
             description=pick.description,
             config=config,
             candidate_data=dataclasses.asdict(pick.candidate),
+            style_preset=getattr(pick, "style_preset", ""),
         )
 
         video_id = ""

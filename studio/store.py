@@ -120,7 +120,17 @@ def load_secrets() -> None:
         except Exception:
             pass
 
-def draft(video_stem: str, video_path: Path, poster_path: Path, headline: str, title: str, description: str, config: dict[str, Any], candidate_data: dict[str, Any] | None = None) -> dict[str, Any]:
+def draft(
+    video_stem: str,
+    video_path: Path,
+    poster_path: Path,
+    headline: str,
+    title: str,
+    description: str,
+    config: dict[str, Any],
+    candidate_data: dict[str, Any] | None = None,
+    style_preset: str = "",
+) -> dict[str, Any]:
     record = {
         "id": video_stem,
         "created_at": now(),
@@ -132,6 +142,7 @@ def draft(video_stem: str, video_path: Path, poster_path: Path, headline: str, t
         "description": description,
         "config": config,
         "candidate": candidate_data or {},
+        "style_preset": style_preset,
         "youtube_id": "",
         "error": "",
     }
