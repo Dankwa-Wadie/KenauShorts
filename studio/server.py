@@ -47,7 +47,10 @@ CSRF = secrets.token_urlsafe(32)
 
 GUARD = threading.RLock()
 ACTIVE_JOB: dict | None = None
+ACTIVE_PROC: subprocess.Popen | None = None
+QUEUE_EVENT = threading.Event()
 STOP_EVENT = threading.Event()
+QUEUE_WORKER_THREAD: threading.Thread | None = None
 
 DEFAULT_AUTOMATION = {
     "enabled": False,
@@ -108,11 +111,111 @@ def redact(text: str) -> str:
     text = re.sub(r"(?i)(key|token|secret|authorization)([=: ]+)[^\s,]+", r"\1\2[hidden]", text)
     return text[-8000:]
 
+def is_process_alive(pid: int) -> bool:
+    """Check if process with PID is currently running."""
+    if not isinstance(pid, int) or pid <= 0:
+        return False
+    if sys.platform == "win32":
+        import ctypes
+        kernel32 = ctypes.windll.kernel32
+        SYNCHRONIZE = 0x00100000
+        PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+        h_proc = kernel32.OpenProcess(SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+        if not h_proc:
+            PROCESS_QUERY_INFORMATION = 0x0400
+            h_proc = kernel32.OpenProcess(SYNCHRONIZE | PROCESS_QUERY_INFORMATION, False, pid)
+            if not h_proc:
+                return False
+        try:
+            WAIT_TIMEOUT = 258
+            return kernel32.WaitForSingleObject(h_proc, 0) == WAIT_TIMEOUT
+        finally:
+            kernel32.CloseHandle(h_proc)
+    else:
+        try:
+            os.kill(pid, 0)
+            return True
+        except (ProcessLookupError, PermissionError):
+            return False
+
+def is_python_process(pid: int) -> bool:
+    """Validate that the process is python or ffmpeg before terminating."""
+    if not is_process_alive(pid):
+        return False
+    if sys.platform == "win32":
+        try:
+            res = subprocess.run(
+                ["tasklist", "/FI", f"PID eq {pid}", "/FO", "CSV", "/NH"],
+                capture_output=True,
+                text=True,
+                timeout=3,
+            )
+            out = res.stdout.lower()
+            return "python" in out or "ffmpeg" in out
+        except Exception:
+            return False
+    return True
+
+def terminate_process_tree(pid: int) -> bool:
+    """Safely terminate a process and its full child process tree."""
+    if not isinstance(pid, int) or pid <= 0 or pid == os.getpid():
+        LOG.warning("Refusing to terminate PID %s", pid)
+        return False
+
+    if not is_process_alive(pid):
+        return True
+
+    if not is_python_process(pid):
+        LOG.warning("PID %s is alive but not recognized as a python/ffmpeg process", pid)
+        return False
+
+    if sys.platform == "win32":
+        try:
+            res = subprocess.run(
+                ["taskkill", "/F", "/T", "/PID", str(pid)],
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )
+            LOG.info("taskkill PID %d returned %d: %s", pid, res.returncode, res.stdout.strip())
+        except Exception as e:
+            LOG.warning("Failed to taskkill PID %d: %s", pid, e)
+    else:
+        import signal
+        try:
+            pgid = os.getpgid(pid)
+            os.killpg(pgid, signal.SIGKILL)
+        except Exception:
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except Exception as e:
+                LOG.warning("Failed to kill PID %d: %s", pid, e)
+
+    # Wait up to 3 seconds for the process to exit
+    for _ in range(30):
+        if not is_process_alive(pid):
+            return True
+        time.sleep(0.1)
+
+    return not is_process_alive(pid)
+
+def cleanup_job_artifacts(job: dict) -> None:
+    """Remove any partial render files if a job was cancelled."""
+    for key in ("target_file", "raw_file"):
+        path_str = job.get(key)
+        if path_str:
+            try:
+                p = Path(path_str).resolve()
+                out_dir = (ROOT / "out").resolve()
+                if p.is_file() and p.is_relative_to(out_dir):
+                    p.unlink(missing_ok=True)
+                    LOG.info("Removed cancelled artifact: %s", p)
+            except Exception as e:
+                LOG.warning("Failed to clean up artifact %s: %s", path_str, e)
+
 def run_job_process(job: dict, command: list[str]) -> None:
-    global ACTIVE_JOB
+    global ACTIVE_JOB, ACTIVE_PROC
     log_lines = []
-    # job id is our own generated stem/timestamp string, not user input, so
-    # it's safe to use directly as a filename here.
     log_path = LOGS_DIR / f"{job['id']}.log"
 
     def write_full_log():
@@ -131,6 +234,11 @@ def run_job_process(job: dict, command: list[str]) -> None:
             bufsize=1,
         )
 
+        with GUARD:
+            ACTIVE_PROC = proc
+            job["pid"] = proc.pid
+            store.put("jobs", job["id"], job)
+
         for line in proc.stdout:
             line_str = line.strip()
             if line_str.startswith("KENAU_PROGRESS "):
@@ -141,7 +249,10 @@ def run_job_process(job: dict, command: list[str]) -> None:
                     pass
             elif line_str.startswith("KENAU_SUMMARY "):
                 try:
-                    job["summary"] = json.loads(line_str[14:])
+                    summary = json.loads(line_str[14:])
+                    job["summary"] = summary
+                    if "video" in summary:
+                        job["target_file"] = summary["video"]
                 except Exception:
                     pass
             else:
@@ -151,69 +262,221 @@ def run_job_process(job: dict, command: list[str]) -> None:
             store.put("jobs", job["id"], job)
 
         code = proc.wait()
-        job["status"] = "completed" if code == 0 else "failed"
-        job["stage"] = "Completed" if code == 0 else "Failed"
+        current = store.get("jobs", job["id"]) or job
+        if current.get("status") == "cancelled":
+            job["status"] = "cancelled"
+            job["stage"] = current.get("stage", "Cancelled")
+            cleanup_job_artifacts(job)
+        else:
+            job["status"] = "completed" if code == 0 else "failed"
+            job["stage"] = "Completed" if code == 0 else "Failed"
         job["finished_at"] = store.now()
 
     except Exception as e:
-        job["status"] = "failed"
-        job["stage"] = "Failed"
-        error_line = f"Error: {redact(str(e))}"
-        log_lines.append(error_line)
-        write_full_log()
-        job["log"] = "\n".join(log_lines[-200:])
+        current = store.get("jobs", job["id"]) or job
+        if current.get("status") == "cancelled":
+            job["status"] = "cancelled"
+            job["stage"] = current.get("stage", "Cancelled")
+            cleanup_job_artifacts(job)
+        else:
+            job["status"] = "failed"
+            job["stage"] = "Failed"
+            error_line = f"Error: {redact(str(e))}"
+            log_lines.append(error_line)
+            write_full_log()
+            job["log"] = "\n".join(log_lines[-200:])
         job["finished_at"] = store.now()
     finally:
+        if proc and proc.stdout:
+            try:
+                proc.stdout.close()
+            except Exception:
+                pass
         job["log_file"] = f"{job['id']}.log"
         store.put("jobs", job["id"], job)
         with GUARD:
             ACTIVE_JOB = None
+            ACTIVE_PROC = None
+        QUEUE_EVENT.set()
+
+def get_next_pending_job() -> dict | None:
+    try:
+        records = store.records("jobs")
+    except Exception:
+        return None
+    pending = [j for j in records if j.get("status") == "pending"]
+    if not pending:
+        return None
+    pending.sort(key=lambda j: j.get("created_at", ""))
+    return pending[0]
+
+def queue_worker_loop() -> None:
+    global ACTIVE_JOB, ACTIVE_PROC
+    LOG.info("Queue worker loop started.")
+    while not STOP_EVENT.is_set():
+        try:
+            job_to_run = None
+            command_to_run = None
+            with GUARD:
+                if ACTIVE_JOB is None and not store.busy():
+                    candidate = get_next_pending_job()
+                    if candidate:
+                        fresh = store.get("jobs", candidate["id"])
+                        if fresh and fresh.get("status") == "pending":
+                            fresh["status"] = "running"
+                            fresh["stage"] = "Starting"
+                            store.put("jobs", fresh["id"], fresh)
+                            ACTIVE_JOB = fresh
+                            job_to_run = fresh
+                            command_to_run = fresh.get("command")
+
+            if job_to_run:
+                if not command_to_run:
+                    python = sys.executable
+                    action = job_to_run.get("action", "")
+                    if action in ("preview", "run"):
+                        command_to_run = [python, "-u", "-m", "core.agent"]
+                        if action == "preview":
+                            command_to_run.append("--dry-run")
+                    elif action in ("upload", "render"):
+                        command_to_run = [python, "-u", "-m", "studio.worker", action, job_to_run.get("key", "")]
+                    elif action == "youtube_connect":
+                        command_to_run = [python, "-u", "-m", "core.youtube_auth"]
+                    elif action == "manual":
+                        url = job_to_run.get("extra", {}).get("url", "")
+                        command_to_run = [python, "-u", "-m", "core.agent", "--dry-run", "--url", url]
+
+                if command_to_run:
+                    run_job_process(job_to_run, command_to_run)
+                else:
+                    with GUARD:
+                        job_to_run["status"] = "failed"
+                        job_to_run["stage"] = "Failed (Missing command)"
+                        job_to_run["finished_at"] = store.now()
+                        store.put("jobs", job_to_run["id"], job_to_run)
+                        ACTIVE_JOB = None
+                continue
+
+            QUEUE_EVENT.wait(timeout=2.0)
+            QUEUE_EVENT.clear()
+        except Exception as e:
+            LOG.error("Queue worker error: %s", e)
+            time.sleep(0.5)
+
+def ensure_queue_worker() -> None:
+    global QUEUE_WORKER_THREAD
+    with GUARD:
+        if QUEUE_WORKER_THREAD is None or not QUEUE_WORKER_THREAD.is_alive():
+            QUEUE_WORKER_THREAD = threading.Thread(target=queue_worker_loop, daemon=True)
+            QUEUE_WORKER_THREAD.start()
+
+def cancel_job(job_id: str | None = None) -> dict:
+    global ACTIVE_JOB, ACTIVE_PROC
+    with GUARD:
+        if not job_id:
+            if ACTIVE_JOB:
+                job_id = ACTIVE_JOB["id"]
+            else:
+                return {"status": "idle", "message": "No active job to cancel"}
+
+        # Case 1: Active running job
+        if ACTIVE_JOB and ACTIVE_JOB.get("id") == job_id:
+            pid = ACTIVE_JOB.get("pid")
+            ACTIVE_JOB["status"] = "cancelled"
+            ACTIVE_JOB["stage"] = "Cancelled by user"
+            ACTIVE_JOB["finished_at"] = store.now()
+            store.put("jobs", job_id, ACTIVE_JOB)
+
+            if pid:
+                terminate_process_tree(pid)
+            if ACTIVE_PROC and ACTIVE_PROC.poll() is None:
+                try:
+                    ACTIVE_PROC.kill()
+                except Exception:
+                    pass
+            cleanup_job_artifacts(ACTIVE_JOB)
+            return {"status": "cancelled", "id": job_id, "message": "Active job cancelled"}
+
+        # Case 2: Job in store (pending or other)
+        job = store.get("jobs", job_id)
+        if not job:
+            raise ValueError(f"Job not found: {job_id}")
+
+        status = job.get("status")
+        if status == "pending":
+            job["status"] = "cancelled"
+            job["stage"] = "Cancelled from queue"
+            job["finished_at"] = store.now()
+            store.put("jobs", job_id, job)
+            return {"status": "cancelled", "id": job_id, "message": "Pending job removed from queue"}
+
+        if status == "running":
+            pid = job.get("pid")
+            job["status"] = "cancelled"
+            job["stage"] = "Cancelled by user"
+            job["finished_at"] = store.now()
+            store.put("jobs", job_id, job)
+            if pid:
+                terminate_process_tree(pid)
+            cleanup_job_artifacts(job)
+            return {"status": "cancelled", "id": job_id, "message": "Job cancelled"}
+
+        return {"status": status, "id": job_id, "message": f"Job is already {status}"}
 
 def start_job(action: str, key: str = "", automatic: bool = False, extra: dict | None = None) -> dict:
-    global ACTIVE_JOB
+    if shutil.disk_usage(ROOT).free < 512 * 1024 * 1024:
+        raise ValueError("Free at least 512 MB of disk space before starting video generation.")
+
+    python = sys.executable
+    if action in ("preview", "run"):
+        command = [python, "-u", "-m", "core.agent"]
+        if action == "preview":
+            command.append("--dry-run")
+    elif action in ("upload", "render"):
+        command = [python, "-u", "-m", "studio.worker", action, key]
+    elif action == "youtube_connect":
+        command = [python, "-u", "-m", "core.youtube_auth"]  # port 0 = any free port
+    elif action == "manual":
+        url = extra.get("url", "") if extra else ""
+        if not url:
+            raise ValueError("A video URL is required.")
+        command = [python, "-u", "-m", "core.agent", "--dry-run", "--url", url]
+        headline = (extra or {}).get("headline", "")
+        description = (extra or {}).get("description", "")
+        if headline:
+            command += ["--headline", headline]
+        if description:
+            command += ["--description", description]
+    else:
+        raise ValueError(f"Unknown job action: {action}")
+
     with GUARD:
-        if ACTIVE_JOB or store.busy():
-            raise ValueError("A job is currently running on this PC. Please wait for it to finish.")
-
-        if shutil.disk_usage(ROOT).free < 512 * 1024 * 1024:
-            raise ValueError("Free at least 512 MB of disk space before starting video generation.")
-
-        python = sys.executable
-        if action in ("preview", "run"):
-            command = [python, "-u", "-m", "core.agent"]
-            if action == "preview":
-                command.append("--dry-run")
-        elif action in ("upload", "render"):
-            command = [python, "-u", "-m", "studio.worker", action, key]
-        elif action == "youtube_connect":
-            command = [python, "-u", "-m", "core.youtube_auth"]  # port 0 = any free port
-        elif action == "manual":
-            url = extra.get("url", "") if extra else ""
-            if not url:
-                raise ValueError("A video URL is required.")
-            command = [python, "-u", "-m", "core.agent", "--dry-run", "--url", url]
-            headline = (extra or {}).get("headline", "")
-            description = (extra or {}).get("description", "")
-            if headline:
-                command += ["--headline", headline]
-            if description:
-                command += ["--description", description]
-        else:
-            raise ValueError(f"Unknown job action: {action}")
-
+        job_id = uuid.uuid4().hex
         job = {
-            "id": uuid.uuid4().hex,
+            "id": job_id,
             "action": action,
-            "status": "running",
-            "stage": "Starting",
+            "command": command,
+            "key": key,
+            "extra": extra or {},
+            "status": "pending",
+            "stage": "Queued",
             "created_at": store.now(),
             "automatic": automatic,
             "log": "",
         }
-        ACTIVE_JOB = job
-        store.put("jobs", job["id"], job)
-        threading.Thread(target=run_job_process, args=(job, command), daemon=True).start()
-        return job
+        store.put("jobs", job_id, job)
+        ensure_queue_worker()
+        QUEUE_EVENT.set()
+
+        records = store.records("jobs")
+        pending = [j for j in records if j.get("status") == "pending"]
+        pending.sort(key=lambda j: j.get("created_at", ""))
+        pos = next((i + 1 for i, j in enumerate(pending) if j.get("id") == job_id), 1)
+
+        is_immediate = (ACTIVE_JOB is None and not store.busy() and pos == 1)
+        res = dict(job)
+        res["queue_position"] = 0 if is_immediate else pos
+        return res
 
 def automation_loop() -> None:
     while not STOP_EVENT.is_set():
@@ -226,8 +489,9 @@ def automation_loop() -> None:
 
                 now_ts = time.time()
                 next_ts = float(settings.get("next_run", 0))
+                has_pending = bool(get_next_pending_job())
 
-                if now_ts >= next_ts and not ACTIVE_JOB and not store.busy() and is_online():
+                if now_ts >= next_ts and not ACTIVE_JOB and not store.busy() and not has_pending and is_online():
                     # Set next slot before starting
                     interval = float(settings.get("interval_hours", 5))
                     settings["next_run"] = now_ts + interval * 3600
@@ -435,6 +699,9 @@ class StudioHandler(BaseHTTPRequestHandler):
         if path == "/api/status":
             with GUARD:
                 cfg = get_automation_settings()
+                records = store.records("jobs")
+                pending = [j for j in records if j.get("status") == "pending"]
+                pending.sort(key=lambda j: j.get("created_at", ""))
                 self.send_json({
                     "csrf": CSRF,
                     "online": is_online(),
@@ -443,6 +710,20 @@ class StudioHandler(BaseHTTPRequestHandler):
                     "free_space_mb": int(shutil.disk_usage(ROOT).free / (1024 * 1024)),
                     "automation": cfg,
                     "platform": platform.system(),
+                    "queue_count": len(pending),
+                    "queued_jobs": [j["id"] for j in pending],
+                })
+            return
+
+        if path == "/api/queue":
+            with GUARD:
+                records = store.records("jobs")
+                pending = [j for j in records if j.get("status") == "pending"]
+                pending.sort(key=lambda j: j.get("created_at", ""))
+                self.send_json({
+                    "active_job": ACTIVE_JOB,
+                    "pending": pending,
+                    "count": len(pending),
                 })
             return
 
@@ -624,7 +905,12 @@ class StudioHandler(BaseHTTPRequestHandler):
             self.send_json({"error": "The action could not be completed. Check the local service log."}, 500)
 
     def mutate(self, path: str, data: dict) -> dict | None:
+        if path == "/api/job/cancel":
+            return cancel_job(data.get("id"))
+
         if path == "/api/job":
+            if data.get("action") == "cancel":
+                return cancel_job(data.get("id"))
             return start_job(data.get("action", ""), data.get("key", ""), extra=data)
             
         if path == "/api/video":
@@ -872,19 +1158,22 @@ class StudioHandler(BaseHTTPRequestHandler):
         except Exception as e:
             LOG.error("Error serving file %s: %s", file_path, e)
 
-def run_server(port: int = PORT) -> None:
-    store.load_secrets()
-    store.import_legacy()
-
-    # Restart recovery: a job or upload that was mid-flight when the process
-    # died last time should never look "running" forever, and an upload in
-    # particular must not be silently retried — it may have already reached
-    # YouTube before the crash.
+def recover_interrupted_jobs() -> None:
+    """Check for jobs that were running when the server stopped/died, and terminate any orphan process trees."""
     for job in store.records("jobs"):
         if job.get("status") == "running":
-            job.update(status="interrupted", stage="Interrupted — inspect before retrying",
-                       finished_at=store.now())
+            pid = job.get("pid")
+            if pid and is_process_alive(pid):
+                if is_python_process(pid):
+                    LOG.info("Terminating orphan process tree for PID %d from interrupted job %s", pid, job["id"])
+                    terminate_process_tree(pid)
+            job.update(
+                status="interrupted",
+                stage="Interrupted by server restart",
+                finished_at=store.now(),
+            )
             store.put("jobs", job["id"], job)
+
     if not store.busy():
         for r in store.records("videos"):
             if r.get("status") in ("uploading", "rendering"):
@@ -893,6 +1182,12 @@ def run_server(port: int = PORT) -> None:
                     error="The previous job was interrupted. Review before retrying.",
                 )
                 store.put("videos", r["id"], r)
+
+def run_server(port: int = PORT) -> None:
+    store.load_secrets()
+    store.import_legacy()
+    recover_interrupted_jobs()
+    ensure_queue_worker()
 
     server_address = ("127.0.0.1", port)
     httpd = ThreadingHTTPServer(server_address, StudioHandler)

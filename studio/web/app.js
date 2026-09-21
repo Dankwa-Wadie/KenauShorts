@@ -115,15 +115,23 @@ async function pollStatus() {
     }
 
     activeJobData = data.active_job;
+    const cancelBtn = document.getElementById('btn-cancel-job');
+    if (cancelBtn) {
+      cancelBtn.style.display = activeJobData ? 'inline-flex' : 'none';
+    }
+
     if (activeJobData) {
       badgeMode.className = 'badge running';
-      badgeMode.textContent = `Running: ${activeJobData.stage || 'In progress'}`;
+      const queueSuffix = data.queue_count > 0 ? ` (${data.queue_count} queued)` : '';
+      badgeMode.textContent = `Running: ${activeJobData.stage || 'In progress'}${queueSuffix}`;
+    } else if (data.queue_count > 0) {
+      badgeMode.className = 'badge running';
+      badgeMode.textContent = `Queued (${data.queue_count})`;
     } else {
       badgeMode.className = 'badge';
       badgeMode.textContent = data.busy ? 'Busy' : 'Idle';
     }
 
-    // Refresh live logs if on logs page
     // Refresh live logs if on logs page
     if (currentPage === 'logs') {
       const term = document.getElementById('terminal-view');
@@ -149,8 +157,21 @@ function showNotification(msg, type = 'success') {
 }
 
 // --------------------------------------------------------------------------
-// Quick Actions
+// Quick Actions & Cancellation
 // --------------------------------------------------------------------------
+
+async function cancelCurrentJob() {
+  if (!confirm('Are you sure you want to cancel the active job?')) return;
+  try {
+    const res = await postJSON('/api/job/cancel', {});
+    const data = await res.json();
+    if (data.error) throw new Error(data.error);
+    showNotification('Job cancelled successfully.');
+    pollStatus();
+  } catch (e) {
+    showNotification(e.message, 'error');
+  }
+}
 
 function setupQuickActions() {
   document.getElementById('btn-quick-preview').addEventListener('click', async () => {
@@ -158,7 +179,11 @@ function setupQuickActions() {
       const res = await postJSON('/api/job', { action: 'preview' });
       const data = await res.json();
       if (data.error) throw new Error(data.error);
-      showNotification('Preview draft job started! Check the Library or Logs tab.');
+      if (data.status === 'pending' && data.queue_position > 0) {
+        showNotification(`Preview job enqueued! (Position in queue: ${data.queue_position})`);
+      } else {
+        showNotification('Preview draft job started! Check the Library or Logs tab.');
+      }
       pollStatus();
     } catch (e) {
       showNotification(e.message, 'error');
@@ -171,7 +196,11 @@ function setupQuickActions() {
       const res = await postJSON('/api/job', { action: 'run' });
       const data = await res.json();
       if (data.error) throw new Error(data.error);
-      showNotification('Run & publish job launched! Monitoring progress in Logs.');
+      if (data.status === 'pending' && data.queue_position > 0) {
+        showNotification(`Run & publish job enqueued! (Position in queue: ${data.queue_position})`);
+      } else {
+        showNotification('Run & publish job launched! Monitoring progress in Logs.');
+      }
       pollStatus();
     } catch (e) {
       showNotification(e.message, 'error');
