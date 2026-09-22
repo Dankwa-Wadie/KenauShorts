@@ -12,15 +12,25 @@ what's actually on `origin/main`.
 
 ## Current state (update this section each handoff)
 
+- **Aspect-Ratio Matched Style Presets for Rendered Cards (Completed)**:
+  - Replaced random style preset selection in `_render_pick()` (`core/agent.py`) with intelligent aspect-ratio matching based on the source video's actual dimensions:
+    - `get_source_aspect_ratio(video_path)` uses `ffprobe` to determine width/height and returns $w/h$ as a float. Handled gracefully with fallback on ffprobe failure or missing file.
+    - `match_style_preset_to_aspect(aspect_ratio)` selects the preset whose `video_aspect` is numerically closest:
+      - Wide / landscape (>= 1.55, e.g. 16:9) -> `classic_blue` (16:9)
+      - Medium landscape (1.17 to 1.55, e.g. 4:3, 3:2) -> `warm_amber` (4:3)
+      - Square (0.90 to 1.17, e.g. 1:1) -> `emerald_compact` (1:1)
+      - Tall / portrait (< 0.90, e.g. 4:5, 9:16) -> `cyber_violet` (4:5)
+    - Fallback: if ffprobe fails or aspect ratio cannot be determined, logs a warning and falls back to random selection (`choose_style_preset()`) as a safety net.
+    - Overrides: honors pre-set `pick.style_preset` if already specified.
+  - Tests: `tests/test_style_presets.py` expanded to 11 tests (all 11 passed). Full test suite: 103 tests total, 96 passed, 0 failures, 7 known environment errors.
+  - Real verification: Rendered real source clips for landscape (1920x1080 -> `classic_blue`), portrait (1080x1920 -> `cyber_violet`), and square (1080x1080 -> `emerald_compact`).
 - **Style Variety Presets for Rendered Cards (Completed)**:
   - Defined 4 pre-defined visual style presets in `core/style_presets.py` (exported via `core/render.py`):
     - `classic_blue`: 16:9 aspect, border `#1D9BF0`, corner radius 40
     - `warm_amber`: 4:3 aspect, border `#F59E0B`, corner radius 28, background_anchor_y 0.45
     - `emerald_compact`: 1:1 aspect, border `#10B981`, corner radius 48
     - `cyber_violet`: 4:5 aspect, border `#8B5CF6`, corner radius 32, background_zoom 1.05
-  - Automatic selection: Random selection occurs in `_render_pick()` in `core/agent.py` for "clip" candidates via `choose_style_preset()` (respects `pick.style_preset` if already specified). Merges layout overrides cleanly over base config without mutating base settings.
   - Record persistence: `store.draft()` records `"style_preset": "<name>"` on the video document in the `videos` table.
-  - Tests: `tests/test_style_presets.py` (5/5 passed). Full discovery test suite: 97 tests total, 90 passed, 0 failures, 7 environment errors.
 - **Stage 3 Completed (Reliability Hardening)**:
   - Addressed all 4 audit findings from the Stage 2 Post-Implementation Audit:
     1. **Multi-Instance Server Collision Prevention**: Subclassed `ThreadingHTTPServer` as `StudioServer(allow_reuse_address=False)` and introduced non-blocking directory file locking (`.server.lock` via `msvcrt.locking` on Windows / `fcntl.flock` on POSIX). In `run_server()`, socket binding and server locking occur *before* running `recover_interrupted_jobs()`, so duplicate server launches fail immediately without killing running jobs or mutating records. Added `.server.lock` to `.gitignore`.

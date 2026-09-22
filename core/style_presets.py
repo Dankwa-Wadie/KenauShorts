@@ -8,8 +8,13 @@ background crop anchors) that add automatic visual variety across rendered short
 from __future__ import annotations
 
 import copy
+import logging
 import random
+import subprocess
+from pathlib import Path
 from typing import Any
+
+LOG = logging.getLogger("kenaushorts.style_presets")
 
 STYLE_PRESETS: list[dict[str, Any]] = [
     {
@@ -108,3 +113,78 @@ def apply_style_preset(config: dict[str, Any], preset: dict[str, Any]) -> dict[s
         for k, v in preset["story_layout"].items():
             cfg_story[k] = v
     return cfg
+
+
+def parse_aspect(spec: str | float) -> float:
+    """Parse aspect ratio specification (e.g. '16:9' or 1.777) to float."""
+    if isinstance(spec, (int, float)):
+        return float(spec)
+    spec = str(spec).strip()
+    if ":" in spec:
+        w, h = spec.split(":", 1)
+        return float(w) / float(h)
+    return float(spec)
+
+
+def get_source_aspect_ratio(video: Path | str) -> float | None:
+    """
+    Read the source video's actual width and height via ffprobe,
+    returning width/height as a float. Returns None on failure or if file is missing.
+    """
+    try:
+        video_path = Path(video)
+        if not video_path.is_file():
+            return None
+
+        out = subprocess.run(
+            [
+                "ffprobe",
+                "-v",
+                "error",
+                "-select_streams",
+                "v:0",
+                "-show_entries",
+                "stream=width,height",
+                "-of",
+                "csv=p=0",
+                str(video_path),
+            ],
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout.strip()
+
+        if not out:
+            return None
+
+        first_line = out.splitlines()[0].strip()
+        parts = first_line.split(",")
+        if len(parts) >= 2:
+            w = float(parts[0].strip())
+            h = float(parts[1].strip())
+            if w > 0 and h > 0:
+                return w / h
+    except Exception as err:
+        LOG.warning("ffprobe failed to determine aspect ratio for %s: %s", video, err)
+        return None
+    return None
+
+
+def match_style_preset_to_aspect(aspect_ratio: float) -> dict[str, Any]:
+    """
+    Return the style preset whose video_aspect is numerically closest
+    to the given source aspect ratio.
+    """
+    if not STYLE_PRESETS:
+        raise ValueError("STYLE_PRESETS cannot be empty")
+
+    def _diff(preset: dict[str, Any]) -> float:
+        spec = preset.get("layout", {}).get("video_aspect", "16:9")
+        try:
+            val = parse_aspect(spec)
+        except Exception:
+            val = 16.0 / 9.0
+        return abs(val - aspect_ratio)
+
+    return min(STYLE_PRESETS, key=_diff)
+

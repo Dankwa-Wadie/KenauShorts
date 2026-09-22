@@ -36,7 +36,9 @@ from core.style_presets import (
     STYLE_PRESETS,
     apply_style_preset,
     choose_style_preset,
+    get_source_aspect_ratio,
     get_style_preset,
+    match_style_preset_to_aspect,
 )
 
 LOG = logging.getLogger("kenaushorts.render")

@@ -30,7 +30,13 @@ from core.render import Account, RenderResult, render
 from core.render_story import render_story
 from core.scrape_reddit import fetch_subreddit_posts, get_reddit_token
 from core.state import State
-from core.style_presets import apply_style_preset, choose_style_preset, get_style_preset
+from core.style_presets import (
+    apply_style_preset,
+    choose_style_preset,
+    get_source_aspect_ratio,
+    get_style_preset,
+    match_style_preset_to_aspect,
+)
 from studio import store
 
 LOG = logging.getLogger("kenaushorts.agent")
@@ -897,9 +903,33 @@ def _render_pick(pick: Pick, config: dict[str, Any], work_dir: Path, out_dir: Pa
         if not download_clip(pick.candidate.url, raw_clip, max_seconds=max_clip_seconds):
             return None
 
-        # Select a style preset (reuse existing pick.style_preset if provided, otherwise random choice)
+        # Select a style preset:
+        # 1. Reuse existing pick.style_preset if already set.
+        # 2. Match to source video's actual aspect ratio if determined.
+        # 3. Fallback to choose_style_preset() (random choice) as safety net if aspect cannot be determined.
         preset_name = getattr(pick, "style_preset", "")
-        preset = get_style_preset(preset_name) if preset_name else choose_style_preset()
+        preset = None
+        if preset_name:
+            preset = get_style_preset(preset_name)
+
+        if not preset:
+            source_aspect = get_source_aspect_ratio(raw_clip)
+            if source_aspect is not None:
+                preset = match_style_preset_to_aspect(source_aspect)
+                LOG.info(
+                    "Matched style preset '%s' (%s) for source aspect ratio %.3f (%s)",
+                    preset["name"],
+                    preset.get("layout", {}).get("video_aspect"),
+                    source_aspect,
+                    raw_clip.name,
+                )
+            else:
+                LOG.warning(
+                    "Could not determine source aspect ratio for %s; falling back to random preset",
+                    raw_clip.name,
+                )
+                preset = choose_style_preset()
+
         pick.style_preset = preset["name"]
         render_config = apply_style_preset(config, preset)
 
