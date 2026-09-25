@@ -333,9 +333,19 @@ async function loadOverview(container) {
 // Page: Drafts & Library
 // --------------------------------------------------------------------------
 
+// --------------------------------------------------------------------------
+// Page: Drafts & Library (Stage 5 Enhanced)
+// --------------------------------------------------------------------------
+
 let libraryVideos = [];
-let libraryFilter = 'all';
+let librarySearch = '';
+let libraryFilterStatus = 'all';
+let libraryFilterReview = 'all';
+let libraryFilterSource = 'all';
+let libraryFilterPreset = 'all';
+let libraryFilterHealth = 'all';
 let librarySort = 'newest';
+let librarySelected = new Set();
 
 async function loadLibrary(container) {
   container.innerHTML = '<p>Loading drafts & video library...</p>';
@@ -354,35 +364,109 @@ async function loadLibrary(container) {
       return;
     }
 
-        container.innerHTML = `
-      <div style="display: flex; gap: 12px; margin-bottom: 20px; align-items: center;">
-        <select class="form-input" id="library-filter" style="max-width: 180px;">
-          <option value="all">All Statuses</option>
-          <option value="ready">Ready</option>
-          <option value="uploaded">Uploaded</option>
-          <option value="failed">Failed</option>
-        </select>
-        <select class="form-input" id="library-sort" style="max-width: 180px;">
-          <option value="newest">Newest First</option>
-          <option value="oldest">Oldest First</option>
-        </select>
-        <span style="color: var(--text-muted); font-size: 13px;" id="library-count"></span>
+    container.innerHTML = `
+      <div style="background: var(--bg-card); border: 1px solid var(--border); border-radius: var(--radius-md); padding: 16px; margin-bottom: 20px;">
+        <div style="display: flex; gap: 10px; margin-bottom: 12px; align-items: center; flex-wrap: wrap;">
+          <input type="text" class="form-input" id="library-search" placeholder="Search title, headline, channel, URL, ID..." style="flex: 1; min-width: 220px;" value="${escapeHtml(librarySearch)}">
+          <button class="btn btn-secondary" id="library-reset-filters" style="padding: 8px 14px; font-size: 13px;" onclick="resetLibraryFilters()">Reset Filters</button>
+        </div>
+        <div style="display: flex; gap: 10px; align-items: center; flex-wrap: wrap;">
+          <select class="form-input" id="library-filter-status" style="width: auto; min-width: 130px;">
+            <option value="all">All Statuses</option>
+            <option value="ready">Ready</option>
+            <option value="uploaded">Uploaded</option>
+            <option value="failed">Failed</option>
+            <option value="rendering">Rendering</option>
+          </select>
+          <select class="form-input" id="library-filter-review" style="width: auto; min-width: 140px;">
+            <option value="all">All Reviews</option>
+            <option value="unreviewed">⏳ Unreviewed</option>
+            <option value="approved">✓ Approved</option>
+            <option value="rejected">✕ Rejected</option>
+          </select>
+          <select class="form-input" id="library-filter-source" style="width: auto; min-width: 130px;">
+            <option value="all">All Sources</option>
+            <option value="youtube">YouTube</option>
+            <option value="reddit">Reddit</option>
+            <option value="manual">Manual Link</option>
+          </select>
+          <select class="form-input" id="library-filter-preset" style="width: auto; min-width: 140px;">
+            <option value="all">All Styles</option>
+            <option value="classic_blue">Classic Blue (16:9)</option>
+            <option value="warm_amber">Warm Amber (4:3)</option>
+            <option value="emerald_compact">Emerald Compact (1:1)</option>
+            <option value="cyber_violet">Cyber Violet (4:5)</option>
+            <option value="unset">Auto / Unset</option>
+          </select>
+          <select class="form-input" id="library-filter-health" style="width: auto; min-width: 130px;">
+            <option value="all">All Media</option>
+            <option value="intact">Files Intact</option>
+            <option value="missing">Missing Files</option>
+          </select>
+          <select class="form-input" id="library-sort" style="width: auto; min-width: 130px;">
+            <option value="newest">Newest First</option>
+            <option value="oldest">Oldest First</option>
+            <option value="title">Title (A-Z)</option>
+            <option value="status">Status</option>
+          </select>
+          <span style="color: var(--text-muted); font-size: 13px; margin-left: auto;" id="library-count"></span>
+        </div>
       </div>
+
       <div id="library-bulk-bar" style="display: none; gap: 12px; margin-bottom: 16px; align-items: center; background: var(--bg-card); border: 1px solid var(--danger); border-radius: var(--radius-sm); padding: 12px 16px;">
         <span id="library-bulk-count" style="font-size: 13px;"></span>
         <button class="btn btn-danger" style="padding: 6px 14px; font-size: 13px;" onclick="deleteSelectedVideos()">Delete Selected</button>
         <button class="btn btn-secondary" style="padding: 6px 14px; font-size: 13px;" onclick="librarySelected.clear(); renderLibraryGrid();">Clear Selection</button>
       </div>
+
       <div class="video-grid" id="library-grid"></div>
     `;
 
-    document.getElementById('library-filter').value = libraryFilter;
-    document.getElementById('library-sort').value = librarySort;
-    document.getElementById('library-filter').addEventListener('change', (e) => {
-      libraryFilter = e.target.value;
+    // Bind event listeners
+    const searchInput = document.getElementById('library-search');
+    searchInput.addEventListener('input', (e) => {
+      librarySearch = e.target.value;
       renderLibraryGrid();
     });
-    document.getElementById('library-sort').addEventListener('change', (e) => {
+
+    const statusSel = document.getElementById('library-filter-status');
+    statusSel.value = libraryFilterStatus;
+    statusSel.addEventListener('change', (e) => {
+      libraryFilterStatus = e.target.value;
+      renderLibraryGrid();
+    });
+
+    const reviewSel = document.getElementById('library-filter-review');
+    reviewSel.value = libraryFilterReview;
+    reviewSel.addEventListener('change', (e) => {
+      libraryFilterReview = e.target.value;
+      renderLibraryGrid();
+    });
+
+    const sourceSel = document.getElementById('library-filter-source');
+    sourceSel.value = libraryFilterSource;
+    sourceSel.addEventListener('change', (e) => {
+      libraryFilterSource = e.target.value;
+      renderLibraryGrid();
+    });
+
+    const presetSel = document.getElementById('library-filter-preset');
+    presetSel.value = libraryFilterPreset;
+    presetSel.addEventListener('change', (e) => {
+      libraryFilterPreset = e.target.value;
+      renderLibraryGrid();
+    });
+
+    const healthSel = document.getElementById('library-filter-health');
+    healthSel.value = libraryFilterHealth;
+    healthSel.addEventListener('change', (e) => {
+      libraryFilterHealth = e.target.value;
+      renderLibraryGrid();
+    });
+
+    const sortSel = document.getElementById('library-sort');
+    sortSel.value = librarySort;
+    sortSel.addEventListener('change', (e) => {
       librarySort = e.target.value;
       renderLibraryGrid();
     });
@@ -393,35 +477,122 @@ async function loadLibrary(container) {
   }
 }
 
-let librarySelected = new Set();
+function resetLibraryFilters() {
+  librarySearch = '';
+  libraryFilterStatus = 'all';
+  libraryFilterReview = 'all';
+  libraryFilterSource = 'all';
+  libraryFilterPreset = 'all';
+  libraryFilterHealth = 'all';
+  librarySort = 'newest';
+
+  const sInput = document.getElementById('library-search');
+  if (sInput) sInput.value = '';
+  const fs = document.getElementById('library-filter-status');
+  if (fs) fs.value = 'all';
+  const fr = document.getElementById('library-filter-review');
+  if (fr) fr.value = 'all';
+  const fsrc = document.getElementById('library-filter-source');
+  if (fsrc) fsrc.value = 'all';
+  const fp = document.getElementById('library-filter-preset');
+  if (fp) fp.value = 'all';
+  const fh = document.getElementById('library-filter-health');
+  if (fh) fh.value = 'all';
+  const st = document.getElementById('library-sort');
+  if (st) st.value = 'newest';
+
+  renderLibraryGrid();
+}
 
 function renderLibraryGrid() {
   const grid = document.getElementById('library-grid');
   const countEl = document.getElementById('library-count');
   if (!grid) return;
 
-  let filtered = libraryFilter === 'all'
-    ? libraryVideos
-    : libraryVideos.filter(v => v.status === libraryFilter);
+  const query = (librarySearch || '').toLowerCase().trim();
 
-  filtered = [...filtered].sort((a, b) => {
-    const diff = new Date(a.created_at) - new Date(b.created_at);
-    return librarySort === 'newest' ? -diff : diff;
+  let filtered = libraryVideos.filter(v => {
+    // 1. Text search across title, headline, channel, source, url, id
+    if (query) {
+      const title = (v.title || '').toLowerCase();
+      const headline = (v.headline || '').toLowerCase();
+      const channel = (v.candidate?.channel || '').toLowerCase();
+      const source = (v.candidate?.source || '').toLowerCase();
+      const url = (v.candidate?.url || '').toLowerCase();
+      const vidId = (v.id || '').toLowerCase();
+      if (!title.includes(query) && !headline.includes(query) && !channel.includes(query) &&
+          !source.includes(query) && !url.includes(query) && !vidId.includes(query)) {
+        return false;
+      }
+    }
+
+    // 2. Processing status filter
+    if (libraryFilterStatus !== 'all') {
+      if (libraryFilterStatus === 'failed') {
+        if (v.status !== 'failed' && v.status !== 'render_failed') return false;
+      } else if (libraryFilterStatus === 'rendering') {
+        if (v.status !== 'rendering' && v.status !== 'uploading') return false;
+      } else {
+        if (v.status !== libraryFilterStatus) return false;
+      }
+    }
+
+    // 3. Editorial review status filter
+    const rev = v.review_status || 'unreviewed';
+    if (libraryFilterReview !== 'all' && rev !== libraryFilterReview) {
+      return false;
+    }
+
+    // 4. Source platform filter
+    if (libraryFilterSource !== 'all') {
+      const s = (v.candidate?.source || '').toLowerCase();
+      if (libraryFilterSource === 'youtube') {
+        if (!s.includes('youtube')) return false;
+      } else if (libraryFilterSource === 'reddit') {
+        if (s !== 'reddit') return false;
+      } else if (libraryFilterSource === 'manual') {
+        if (s !== 'manual') return false;
+      }
+    }
+
+    // 5. Style preset filter
+    if (libraryFilterPreset !== 'all') {
+      const p = v.style_preset || '';
+      if (libraryFilterPreset === 'unset') {
+        if (p !== '') return false;
+      } else {
+        if (p !== libraryFilterPreset) return false;
+      }
+    }
+
+    // 6. Media health filter
+    if (libraryFilterHealth !== 'all') {
+      const intact = v.video_exists !== false;
+      if (libraryFilterHealth === 'intact' && !intact) return false;
+      if (libraryFilterHealth === 'missing' && intact) return false;
+    }
+
+    return true;
   });
 
-  const activeCard = (activeJobData && libraryFilter === 'all') ? `
-    <div class="video-card" style="cursor: default;">
-      <div class="video-thumb" style="display: flex; align-items: center; justify-content: center; background: #11141b;">
-        <span style="color: var(--accent); font-size: 13px; text-align: center; padding: 12px;">âš™ ${escapeHtml(activeJobData.stage || 'Rendering...')}</span>
-      </div>
-      <div class="video-info">
-        <h4>In Progress</h4>
-        <div class="video-meta"><span>Job running now</span></div>
-      </div>
-    </div>
-  ` : '';
+  // Sorting
+  filtered = [...filtered].sort((a, b) => {
+    if (librarySort === 'newest') {
+      return new Date(b.created_at) - new Date(a.created_at);
+    } else if (librarySort === 'oldest') {
+      return new Date(a.created_at) - new Date(b.created_at);
+    } else if (librarySort === 'title') {
+      const ta = (a.title || a.headline || a.id).toLowerCase();
+      const tb = (b.title || b.headline || b.id).toLowerCase();
+      return ta.localeCompare(tb);
+    } else if (librarySort === 'status') {
+      return (a.status || '').localeCompare(b.status || '');
+    }
+    return 0;
+  });
 
-  countEl.textContent = `${filtered.length} of ${libraryVideos.length} videos`;
+  const unreviewedCount = libraryVideos.filter(v => (v.review_status || 'unreviewed') === 'unreviewed').length;
+  countEl.textContent = `Showing ${filtered.length} of ${libraryVideos.length} videos (${unreviewedCount} unreviewed)`;
 
   const bulkBar = document.getElementById('library-bulk-bar');
   if (bulkBar) {
@@ -430,27 +601,50 @@ function renderLibraryGrid() {
     if (label) label.textContent = `${librarySelected.size} selected`;
   }
 
+  const activeCard = (activeJobData && libraryFilterStatus === 'all' && !query) ? `
+    <div class="video-card" style="cursor: default;">
+      <div class="video-thumb" style="display: flex; align-items: center; justify-content: center; background: #11141b;">
+        <span style="color: var(--accent); font-size: 13px; text-align: center; padding: 12px;">⚙ ${escapeHtml(activeJobData.stage || 'Rendering...')}</span>
+      </div>
+      <div class="video-info">
+        <h4>In Progress</h4>
+        <div class="video-meta"><span>Pipeline job active</span></div>
+      </div>
+    </div>
+  ` : '';
+
   if (filtered.length === 0) {
-    grid.innerHTML = `<p style="color: var(--text-muted); grid-column: 1 / -1;">No videos match this filter.</p>`;
+    grid.innerHTML = activeCard + `<p style="color: var(--text-muted); grid-column: 1 / -1; padding: 40px; text-align: center;">No videos match the selected filters or search query.</p>`;
     return;
   }
 
   grid.innerHTML = activeCard + filtered.map(v => {
     const posterUrl = v.poster ? `/media/${v.poster.replace(/\\/g, '/')}` : '';
     const checked = librarySelected.has(v.id) ? 'checked' : '';
+    const rev = v.review_status || 'unreviewed';
+    const revBadgeClass = `badge-review-${rev}`;
+    const revLabel = rev === 'approved' ? '✓ Approved' : rev === 'rejected' ? '✕ Rejected' : 'Unreviewed';
+    const missingBadge = (v.video_exists === false) ? `<span class="badge badge-missing" style="position: absolute; bottom: 8px; right: 8px; z-index: 2;">⚠ Missing File</span>` : '';
+    const presetLabel = v.style_preset ? `<span class="preset-tag" style="position: absolute; top: 10px; right: 10px; z-index: 2;">${escapeHtml(v.style_preset.replace('_', ' '))}</span>` : '';
+
     return `
       <div class="video-card">
         <input type="checkbox" class="video-select-checkbox" ${checked} onclick="event.stopPropagation(); toggleLibrarySelect('${v.id}')"
                style="position: absolute; top: 10px; left: 10px; z-index: 2;">
+        ${presetLabel}
         <div onclick="openVideoModal('${v.id}')">
-          <div class="video-thumb">
+          <div class="video-thumb" style="position: relative;">
             ${posterUrl ? `<img src="${posterUrl}" alt="Preview" onerror="this.style.display='none'">` : ''}
-            <span class="status-pill ${v.status}">${v.status}</span>
+            <span class="status-pill ${v.status}" style="position: absolute; bottom: 8px; left: 8px; z-index: 2;">${v.status}</span>
+            ${missingBadge}
           </div>
           <div class="video-info">
-            <h4>${escapeHtml(v.title || v.headline || 'Untitled Short')}</h4>
+            <div style="display: flex; justify-content: space-between; align-items: flex-start; gap: 8px; margin-bottom: 4px;">
+              <h4 style="margin: 0; flex: 1;">${escapeHtml(v.title || v.headline || 'Untitled Short')}</h4>
+              <span class="${revBadgeClass}">${revLabel}</span>
+            </div>
             <div class="video-meta">
-              <span>${v.candidate ? v.candidate.channel : 'Local'}</span> â€¢ 
+              <span>${escapeHtml(v.candidate?.channel || 'Local')}</span> •
               <span>${new Date(v.created_at).toLocaleDateString()}</span>
             </div>
           </div>
@@ -475,35 +669,154 @@ async function deleteSelectedVideos() {
 
   const ids = [...librarySelected];
   let failures = 0;
+  let failureReasons = [];
   for (const id of ids) {
     try {
       const res = await postJSON('/api/video', { id, action: 'delete' });
       const data = await res.json();
-      if (data.error) failures++;
+      if (!res.ok || data.error) {
+        failures++;
+        if (data.error) failureReasons.push(data.error);
+      }
     } catch (e) {
       failures++;
+      failureReasons.push(e.message);
     }
   }
 
   librarySelected.clear();
-  showNotification(failures > 0 ? `Deleted with ${failures} failure(s).` : 'Selected videos deleted.', failures > 0 ? 'error' : 'success');
+  if (failures > 0) {
+    showNotification(`Deleted with ${failures} failure(s): ${failureReasons.slice(0, 2).join('; ')}`, 'error');
+  } else {
+    showNotification('Selected videos deleted.', 'success');
+  }
   loadLibrary(document.getElementById('content-view'));
 }
+
 async function openVideoModal(id) {
   try {
     const res = await fetch(`/api/video?id=${id}`);
     const v = await res.json();
+    if (!res.ok || v.error) throw new Error(v.error || 'Video not found');
 
     const modal = document.getElementById('video-modal');
     const body = document.getElementById('modal-body');
     const videoUrl = `/media/${v.video.replace(/\\/g, '/')}`;
 
-    body.innerHTML = `
-      <div style="display: grid; grid-template-columns: 320px 1fr; gap: 24px;">
-        <div style="aspect-ratio: 9/16; background: #000; border-radius: var(--radius-md); overflow: hidden;">
+    const cand = v.candidate || {};
+    const rev = v.review_status || 'unreviewed';
+
+    // Build Licensing technical evidence badge
+    const lic = (cand.licence || cand.license || '').toLowerCase();
+    let licenseBadge = '';
+    if (lic === 'public-domain') {
+      licenseBadge = `<span class="badge-license public-domain">Source metadata: Public Domain (e.g. NASA / NOAA / LoC)</span>`;
+    } else if (lic === 'creative-commons' || cand.youtube_cc_only) {
+      licenseBadge = `<span class="badge-license creative-commons">Source metadata: Creative Commons detected</span>`;
+    } else if (lic === 'manual') {
+      licenseBadge = `<span class="badge-license manual">Source metadata: Manual ingestion (unverified license)</span>`;
+    } else if (lic === 'standard') {
+      licenseBadge = `<span class="badge-license standard">Source metadata: Standard platform license</span>`;
+    } else {
+      licenseBadge = `<span class="badge-license unknown">Source metadata: Unspecified / Unknown</span>`;
+    }
+
+    // Build Artifact Health badges
+    const videoHealthPill = v.video_exists !== false
+      ? `<span class="badge" style="color: var(--success);">✓ Video: Available (${v.file_size_mb || 0} MB)</span>`
+      : `<span class="badge" style="color: var(--danger);">✕ Video: Missing on disk</span>`;
+
+    const posterHealthPill = v.poster_exists !== false
+      ? `<span class="badge" style="color: var(--success);">✓ Poster: Available</span>`
+      : `<span class="badge" style="color: var(--danger);">✕ Poster: Missing</span>`;
+
+    const rawHealthPill = v.raw_exists
+      ? `<span class="badge" style="color: var(--success);">✓ Raw Source: Available</span>`
+      : `<span class="badge" style="color: var(--text-muted);">✕ Raw Source: Not available</span>`;
+
+    // Build Preview column (video player or graceful missing-artifact state)
+    let previewHtml = '';
+    if (v.video_exists !== false) {
+      previewHtml = `
+        <div style="aspect-ratio: 9/16; background: #000; border-radius: var(--radius-md); overflow: hidden; position: relative;">
           <video controls autoplay loop src="${videoUrl}" style="width: 100%; height: 100%; object-fit: contain;"></video>
         </div>
+      `;
+    } else {
+      previewHtml = `
+        <div class="video-missing-placeholder" style="aspect-ratio: 9/16;">
+          <span style="font-size: 36px; margin-bottom: 8px;">⚠</span>
+          <h4 style="color: var(--danger); font-size: 15px; margin-bottom: 6px;">Rendered Video File Missing</h4>
+          <p style="font-size: 12px; margin-bottom: 12px; word-break: break-all;"><code>${escapeHtml(v.video || '')}</code></p>
+          ${v.raw_exists ? '<p style="color: var(--success); font-size: 12px; margin: 0;">Raw source clip is available. You can re-render this card below.</p>' : '<p style="color: var(--text-muted); font-size: 12px; margin: 0;">No raw source clip found for re-rendering.</p>'}
+        </div>
+      `;
+    }
+
+    // Build Stage 4 Pipeline Activity card
+    let jobHtml = '';
+    if (v.latest_job) {
+      const j = v.latest_job;
+      const statusClass = `badge ${j.status}`;
+      const isRetryable = ['failed', 'cancelled', 'interrupted'].includes(j.status);
+      jobHtml = `
+        <div style="background: rgba(255,255,255,0.02); border: 1px solid var(--border); border-radius: var(--radius-sm); padding: 14px; margin-top: 16px;">
+          <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px;">
+            <span style="font-weight: 700; font-size: 13px;">Stage 4 Pipeline Activity</span>
+            <span class="${statusClass}">${j.status}</span>
+          </div>
+          <div style="font-size: 12px; color: var(--text-muted); line-height: 1.6;">
+            <div>Action: <strong>${escapeHtml(j.action || '')}</strong> • Stage: <em>${escapeHtml(j.stage || '')}</em></div>
+            ${j.duration_seconds != null ? `<div>Duration: <strong>${j.duration_seconds}s</strong></div>` : ''}
+            ${j.finished_at ? `<div>Finished: ${new Date(j.finished_at).toLocaleString()}</div>` : ''}
+          </div>
+          ${j.error ? `
+            <div style="background: rgba(239, 68, 68, 0.1); border: 1px solid rgba(239, 68, 68, 0.3); border-radius: 4px; padding: 8px 12px; margin-top: 8px; font-family: var(--font-mono); font-size: 12px; color: #fca5a5; word-break: break-all;">
+              <strong>Diagnostic:</strong> ${escapeHtml(j.error)}
+            </div>
+          ` : ''}
+          <div style="display: flex; gap: 8px; margin-top: 10px;">
+            ${isRetryable ? `<button class="btn btn-secondary btn-sm" onclick="retryFromVideoModal('${j.id}')">↻ Retry Job</button>` : ''}
+            <button class="btn btn-secondary btn-sm" onclick="document.getElementById('video-modal').close(); openJobModal('${j.id}')">View Full Job Log ↗</button>
+          </div>
+        </div>
+      `;
+    } else {
+      jobHtml = `
+        <div style="background: rgba(255,255,255,0.02); border: 1px solid var(--border); border-radius: var(--radius-sm); padding: 12px; margin-top: 16px; font-size: 12px; color: var(--text-muted);">
+          No recent pipeline execution jobs recorded for this video.
+        </div>
+      `;
+    }
+
+    body.innerHTML = `
+      <div style="display: grid; grid-template-columns: 320px 1fr; gap: 24px;">
+        <!-- Left Column: Media Preview & Artifact Health -->
         <div>
+          ${previewHtml}
+          <div style="margin-top: 14px; display: flex; flex-direction: column; gap: 6px;">
+            ${videoHealthPill}
+            ${posterHealthPill}
+            ${rawHealthPill}
+          </div>
+        </div>
+
+        <!-- Right Column: Editorial, Review, Source, Pipeline -->
+        <div>
+          <!-- Editorial Review Section -->
+          <div style="background: rgba(255,255,255,0.02); border: 1px solid var(--border); padding: 14px 16px; border-radius: var(--radius-sm); margin-bottom: 18px;">
+            <label style="font-weight: 700; font-size: 13px; display: block; margin-bottom: 8px;">Editorial Review Decision</label>
+            <div style="display: flex; gap: 12px; align-items: center;">
+              <select class="form-input" id="edit-review-status" style="max-width: 220px; font-weight: 600;" onchange="updateReviewPill(this.value)">
+                <option value="unreviewed" ${rev === 'unreviewed' ? 'selected' : ''}>⏳ Unreviewed</option>
+                <option value="approved" ${rev === 'approved' ? 'selected' : ''}>✓ Approved for Publishing</option>
+                <option value="rejected" ${rev === 'rejected' ? 'selected' : ''}>✕ Rejected</option>
+              </select>
+              <span id="review-pill-preview" class="badge-review-${rev}">${rev === 'approved' ? '✓ Approved' : rev === 'rejected' ? '✕ Rejected' : 'Unreviewed'}</span>
+            </div>
+          </div>
+
+          <!-- Metadata Form -->
           <div class="form-group">
             <label>Short Title</label>
             <input type="text" class="form-input" id="edit-title" value="${escapeHtml(v.title || '')}">
@@ -530,13 +843,29 @@ async function openVideoModal(id) {
 
           <div class="form-group">
             <label>YouTube Description</label>
-            <textarea class="form-input" id="edit-desc" rows="4">${escapeHtml(v.description || '')}</textarea>
+            <textarea class="form-input" id="edit-desc" rows="3">${escapeHtml(v.description || '')}</textarea>
           </div>
 
-          <div style="display: flex; gap: 12px; margin-top: 24px;">
+          <!-- Source & Licensing Evidence Panel -->
+          <div style="background: rgba(255,255,255,0.02); border: 1px solid var(--border); border-radius: var(--radius-sm); padding: 14px; margin-top: 16px;">
+            <div style="font-weight: 700; font-size: 13px; margin-bottom: 8px;">Technical Source & Licensing Evidence</div>
+            <div style="font-size: 12px; color: var(--text-muted); line-height: 1.7;">
+              <div>Platform: <strong>${escapeHtml(cand.source || 'Local')}</strong> • Channel: <strong>${escapeHtml(cand.channel || 'Unknown')}</strong></div>
+              ${cand.url ? `<div>Source URL: <a href="${escapeHtml(cand.url)}" target="_blank" rel="noopener noreferrer" class="source-link">${escapeHtml(cand.url)} ↗</a></div>` : ''}
+              <div>Candidate Key: <code style="font-size: 11px;">${escapeHtml(cand.key || 'N/A')}</code></div>
+              ${cand.published_at ? `<div>Published: ${new Date(cand.published_at * 1000).toLocaleString()}</div>` : ''}
+              <div style="margin-top: 6px;">${licenseBadge}</div>
+            </div>
+          </div>
+
+          <!-- Stage 4 Pipeline Activity -->
+          ${jobHtml}
+
+          <!-- Action Buttons -->
+          <div style="display: flex; gap: 12px; margin-top: 24px; flex-wrap: wrap;">
             <button class="btn btn-secondary" onclick="saveVideoEdits('${v.id}')"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="vertical-align:-2px;margin-right:4px;"><path d="M19 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11l5 5v11a2 2 0 0 1-2 2Z"></path><polyline points="17 21 17 13 7 13 7 21"></polyline><polyline points="7 3 7 8 15 8"></polyline></svg>Save Details</button>
             <button class="btn btn-secondary" onclick="reRenderDraft('${v.id}')"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="vertical-align:-2px;margin-right:4px;"><polyline points="23 4 23 10 17 10"></polyline><polyline points="1 20 1 14 7 14"></polyline><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"></path></svg>Re-render Card</button>
-            ${v.status !== 'uploaded' ? `<button class="btn btn-primary" onclick="uploadDraft('${v.id}')"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="vertical-align:-2px;margin-right:4px;"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path><polyline points="17 8 12 3 7 8"></polyline><line x1="12" y1="3" x2="12" y2="15"></line></svg>Upload to YouTube</button>` : `<span class="badge" style="color: var(--success); padding: 10px 16px;">âœ“ Uploaded to YouTube</span>`}
+            ${v.status !== 'uploaded' ? `<button class="btn btn-primary" onclick="uploadDraft('${v.id}')"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="vertical-align:-2px;margin-right:4px;"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path><polyline points="17 8 12 3 7 8"></polyline><line x1="12" y1="3" x2="12" y2="15"></line></svg>Upload to YouTube</button>` : `<span class="badge" style="color: var(--success); padding: 10px 16px;">✓ Uploaded to YouTube</span>`}
             <button class="btn btn-danger" onclick="deleteVideo('${v.id}')"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="vertical-align:-2px;margin-right:4px;"><polyline points="3 6 5 6 21 6"></polyline><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"></path><line x1="10" y1="11" x2="10" y2="17"></line><line x1="14" y1="11" x2="14" y2="17"></line></svg>Delete</button>
           </div>
         </div>
@@ -546,8 +875,6 @@ async function openVideoModal(id) {
     document.getElementById('btn-close-modal').onclick = () => modal.close();
     modal.showModal();
 
-    // The video keeps playing in the background otherwise — dialog.close()
-    // only hides the element, it doesn't stop media playback on its own.
     modal.addEventListener('close', () => {
       const vid = body.querySelector('video');
       if (vid) {
@@ -560,30 +887,65 @@ async function openVideoModal(id) {
   }
 }
 
+function updateReviewPill(val) {
+  const pill = document.getElementById('review-pill-preview');
+  if (!pill) return;
+  pill.className = `badge-review-${val}`;
+  pill.textContent = val === 'approved' ? '✓ Approved' : val === 'rejected' ? '✕ Rejected' : 'Unreviewed';
+}
+
+async function retryFromVideoModal(jobId) {
+  try {
+    const res = await postJSON('/api/job/retry', { id: jobId });
+    const data = await res.json();
+    if (!res.ok || data.error) throw new Error(data.error || 'Retry failed');
+    showNotification('Retry job enqueued successfully.', 'success');
+    document.getElementById('video-modal').close();
+    pollStatus();
+  } catch (e) {
+    showNotification(`Retry failed: ${e.message}`, 'error');
+  }
+}
+
 async function deleteVideo(id) {
   if (!confirm('Permanently delete this video and its files? This cannot be undone.')) return;
   try {
     const res = await postJSON('/api/video', { id, action: 'delete' });
     const data = await res.json();
-    if (data.error) throw new Error(data.error);
-    showNotification('Video deleted.');
+    if (!res.ok || data.error) throw new Error(data.error || 'Delete failed');
+    showNotification('Video deleted.', 'success');
     document.getElementById('video-modal').close();
     loadLibrary(document.getElementById('content-view'));
   } catch (e) {
     showNotification(e.message, 'error');
   }
 }
+
 async function saveVideoEdits(id) {
   const title = document.getElementById('edit-title').value;
   const headline = document.getElementById('edit-headline').value;
   const description = document.getElementById('edit-desc').value;
   const presetEl = document.getElementById('edit-style-preset');
   const style_preset = presetEl ? presetEl.value : '';
+  const reviewEl = document.getElementById('edit-review-status');
+  const review_status = reviewEl ? reviewEl.value : 'unreviewed';
 
   try {
-    const res = await postJSON('/api/video', { id, title, headline, description, style_preset });
-    if (!res.ok) throw new Error('Save failed');
-    showNotification('Draft details saved.');
+    const res = await postJSON('/api/video', { id, title, headline, description, style_preset, review_status });
+    const data = await res.json();
+    if (!res.ok || data.error) throw new Error(data.error || 'Save failed');
+    showNotification('Video details and review status saved.', 'success');
+
+    // Update in-memory cache
+    const item = libraryVideos.find(x => x.id === id);
+    if (item) {
+      item.title = title;
+      item.headline = headline;
+      item.description = description;
+      item.style_preset = style_preset;
+      item.review_status = review_status;
+      renderLibraryGrid();
+    }
   } catch (e) {
     showNotification(e.message, 'error');
   }
@@ -594,8 +956,8 @@ async function reRenderDraft(id) {
   try {
     const res = await postJSON('/api/job', { action: 'render', key: id });
     const data = await res.json();
-    if (data.error) throw new Error(data.error);
-    showNotification('Re-render job started! Check terminal for progress.');
+    if (!res.ok || data.error) throw new Error(data.error || 'Re-render failed');
+    showNotification('Re-render job started! Check Pipeline & Queue for progress.', 'success');
     document.getElementById('video-modal').close();
     pollStatus();
   } catch (e) {
@@ -609,8 +971,8 @@ async function uploadDraft(id) {
   try {
     const res = await postJSON('/api/job', { action: 'upload', key: id });
     const data = await res.json();
-    if (data.error) throw new Error(data.error);
-    showNotification('Upload job started! Monitoring progress.');
+    if (!res.ok || data.error) throw new Error(data.error || 'Upload failed');
+    showNotification('Upload job started! Monitoring progress in Pipeline & Queue.', 'success');
     document.getElementById('video-modal').close();
     pollStatus();
   } catch (e) {

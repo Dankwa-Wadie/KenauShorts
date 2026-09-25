@@ -170,6 +170,7 @@ def work(action: str, key: str) -> None:
                 agent.emit_progress("Finalizing render")
                 record.update(
                     status="ready",
+                    review_status="unreviewed",
                     video=str(new_mp4),
                     poster=str(new_poster),
                     raw_video=str(raw_clip) if cand.get("kind") != "story" else "",

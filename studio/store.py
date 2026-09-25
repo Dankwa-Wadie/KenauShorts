@@ -150,11 +150,13 @@ def draft(
     config: dict[str, Any],
     candidate_data: dict[str, Any] | None = None,
     style_preset: str = "",
+    review_status: str = "unreviewed",
 ) -> dict[str, Any]:
     record = {
         "id": video_stem,
         "created_at": now(),
         "status": "ready",
+        "review_status": review_status,
         "video": str(video_path),
         "poster": str(poster_path),
         "headline": headline,
@@ -168,6 +170,44 @@ def draft(
     }
     put("videos", record["id"], record)
     return record
+
+def enrich_video_record(record: dict[str, Any]) -> dict[str, Any]:
+    """
+    Enrich a video record dictionary with default review_status and
+    lightweight artifact existence flags (without mutating SQLite).
+    """
+    rec = dict(record)
+    rec.setdefault("review_status", "unreviewed")
+
+    video_path = rec.get("video")
+    poster_path = rec.get("poster")
+    raw_path = rec.get("raw_video")
+
+    v_file = (ROOT / video_path).resolve() if video_path else None
+    p_file = (ROOT / poster_path).resolve() if poster_path else None
+
+    # Check raw_video or fall back to work/{id}_raw.mp4
+    raw_file = (ROOT / raw_path).resolve() if raw_path else None
+    if not (raw_file and raw_file.is_file()):
+        key = rec.get("id", "")
+        cand_raw = (ROOT / "work" / f"{key}_raw.mp4").resolve()
+        if cand_raw.is_file():
+            raw_file = cand_raw
+        elif "_edit_" in key:
+            orig_key = key.split("_edit_")[0]
+            cand_orig = (ROOT / "work" / f"{orig_key}_raw.mp4").resolve()
+            if cand_orig.is_file():
+                raw_file = cand_orig
+
+    video_exists = bool(v_file and v_file.is_file())
+    poster_exists = bool(p_file and p_file.is_file())
+    raw_exists = bool(raw_file and raw_file.is_file())
+
+    rec["video_exists"] = video_exists
+    rec["poster_exists"] = poster_exists
+    rec["raw_exists"] = raw_exists
+    rec["file_size_mb"] = round(v_file.stat().st_size / (1024 * 1024), 2) if video_exists else 0.0
+    return rec
 
 def import_legacy() -> None:
     """
@@ -207,6 +247,7 @@ def import_legacy() -> None:
             "id": video.stem,
             "created_at": dt.datetime.fromtimestamp(video.stat().st_mtime, dt.timezone.utc).isoformat(),
             "status": "uploaded" if uploaded else "ready",
+            "review_status": "unreviewed",
             "video": str(video),
             "poster": str(poster) if poster.exists() else "",
             "headline": old.get("headline", video.stem),

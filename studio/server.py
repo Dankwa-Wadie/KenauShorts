@@ -996,6 +996,58 @@ CSP_HEADER = (
     "connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'"
 )
 
+class ConflictError(Exception):
+    """Raised when an operation conflicts with the current state (e.g. deleting an actively targeted video)."""
+    pass
+
+def job_matches_video(job: dict[str, Any], video_id: str) -> bool:
+    """
+    Deterministic resolution for whether a Stage 4 job is associated with video_id:
+    1. Exact video key match for worker actions ('render', 'upload') or any job where key == video_id.
+    2. Explicit target video metadata in job['summary']['video_id'].
+    3. Validated target artifact stem fallback: Path(job['target_file']).stem == video_id.
+    """
+    if not video_id:
+        return False
+
+    # 1. Exact key match for actions that explicitly track a video target
+    action = job.get("action", "")
+    key = job.get("key", "")
+    if action in ("render", "upload") and key == video_id:
+        return True
+    if key and key == video_id:
+        return True
+    if job.get("extra", {}).get("key") == video_id:
+        return True
+
+    # 2. Explicit target video metadata in summary payload
+    summary = job.get("summary") or {}
+    if summary.get("video_id") == video_id:
+        return True
+
+    # 3. Validated target artifact stem fallback
+    target_file = job.get("target_file")
+    if target_file:
+        try:
+            if Path(target_file).stem == video_id:
+                return True
+        except Exception:
+            pass
+
+    return False
+
+def get_latest_job_for_video(video_id: str, jobs: list[dict[str, Any]] | None = None) -> dict[str, Any] | None:
+    """Return the most recent job associated with video_id, or None."""
+    if jobs is None:
+        try:
+            jobs = store.records("jobs")
+        except Exception:
+            return None
+    for j in jobs:
+        if job_matches_video(j, video_id):
+            return j
+    return None
+
 class StudioHandler(BaseHTTPRequestHandler):
     def log_message(self, format, *args):
         pass  # Suppress default noisy console logs
@@ -1079,7 +1131,8 @@ class StudioHandler(BaseHTTPRequestHandler):
 
         if path == "/api/videos":
             records = store.records("videos")
-            self.send_json(records)
+            enriched = [store.enrich_video_record(r) for r in records]
+            self.send_json(enriched)
             return
 
         if path == "/api/failures":
@@ -1128,7 +1181,25 @@ class StudioHandler(BaseHTTPRequestHandler):
             vid_id = query.get("id", [""])[0]
             record = store.get("videos", vid_id)
             if record:
-                self.send_json(record)
+                enriched = store.enrich_video_record(record)
+                with GUARD:
+                    latest_job = get_latest_job_for_video(vid_id)
+                if latest_job:
+                    enriched["latest_job"] = {
+                        "id": latest_job.get("id"),
+                        "action": latest_job.get("action"),
+                        "status": latest_job.get("status"),
+                        "stage": latest_job.get("stage"),
+                        "duration_seconds": latest_job.get("duration_seconds"),
+                        "started_at": latest_job.get("started_at"),
+                        "finished_at": latest_job.get("finished_at"),
+                        "error": latest_job.get("error", ""),
+                        "retry_of": latest_job.get("retry_of"),
+                        "retried_by": latest_job.get("retried_by"),
+                    }
+                else:
+                    enriched["latest_job"] = None
+                self.send_json(enriched)
             else:
                 self.send_json({"error": "Video not found"}, 404)
             return
@@ -1248,6 +1319,8 @@ class StudioHandler(BaseHTTPRequestHandler):
             with GUARD:
                 result = self.mutate(path, data)
             self.send_json(result if result is not None else {"status": "ok"})
+        except ConflictError as e:
+            self.send_json({"error": str(e)}, 409)
         except (ValueError, KeyError, TypeError) as e:
             self.send_json({"error": str(e)}, 400)
         except Exception as e:
@@ -1281,6 +1354,14 @@ class StudioHandler(BaseHTTPRequestHandler):
                 raise ValueError("Video not found")
 
             if data.get("action") == "delete":
+                all_jobs = store.records("jobs")
+                for j in all_jobs:
+                    if j.get("status") in ("pending", "running"):
+                        if job_matches_video(j, vid_id):
+                            raise ConflictError(
+                                f"Cannot delete video '{vid_id}': a pipeline job ({j.get('action')}) is currently {j.get('status')}."
+                            )
+
                 for field in ("video", "poster"):
                     file_path = record.get(field)
                     if file_path:
@@ -1312,6 +1393,16 @@ class StudioHandler(BaseHTTPRequestHandler):
                 if preset_val and preset_val not in valid_names:
                     raise ValueError(f"Invalid style_preset: '{preset_val}'. Must be one of {sorted(valid_names)} or empty string")
                 record["style_preset"] = preset_val
+            if "review_status" in data:
+                val = data["review_status"]
+                if not isinstance(val, str):
+                    raise ValueError(f"Invalid review_status: expected string, got {type(val).__name__}")
+                val = val.strip().lower()
+                valid_reviews = {"unreviewed", "approved", "rejected"}
+                if val not in valid_reviews:
+                    raise ValueError(f"Invalid review_status: '{val}'. Must be one of {sorted(valid_reviews)}")
+                record["review_status"] = val
+            record.setdefault("review_status", "unreviewed")
             store.put("videos", vid_id, record)
             return record
 

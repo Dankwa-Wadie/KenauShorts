@@ -12,6 +12,29 @@ what's actually on `origin/main`.
 
 ## Current state (update this section each handoff)
 
+- **Stage 5 Completed (Video Library & Review)**:
+  - **Editorial Review Status & Separation of Concerns**: Added explicit review state (`unreviewed`, `approved`, `rejected`) strictly decoupled from processing status (`ready`, `rendering`, `uploaded`, `failed`). Existing records default to `unreviewed` (uploaded status does NOT imply approved). Persisted in SQLite `videos` table via `POST /api/video`. Strict validation returns HTTP 400 on invalid values.
+  - **Re-render Review State Semantics**: Genuinely re-rendering a card with new style/content resets `review_status` to `"unreviewed"` only upon successful completion. Failed renders preserve the previous review decision.
+  - **Library Toolbar with Multi-Faceted Filters & Instant Search**: Added responsive search across title, headline, channel, source, URL, and video ID. Added faceted filters for processing status (`ready`, `uploaded`, `failed`, `rendering`), review status (`unreviewed`, `approved`, `rejected`), source platform (`youtube`, `reddit`, `manual`), style presets (`classic_blue`, `warm_amber`, `emerald_compact`, `cyber_violet`, `unset`), and media health (`intact`, `missing`). Supports sorting by newest, oldest, title, status.
+  - **Artifact Health & Missing File Handling**: Dynamic health inspection returns `video_exists`, `poster_exists`, `raw_exists`, and `file_size_mb`. UI displays warning badges on cards and a dedicated missing-file placeholder in the modal instead of a broken/black player. Raw footage in `work/` is inspected to inform whether re-rendering is possible.
+  - **Comprehensive Video Review Modal**: Organizes Preview, Editable Metadata, Editorial Review Decision (`Unreviewed`, `Approved`, `Rejected`), Technical Source & Licensing Evidence (platform, channel, clickable source URL, candidate key, objective license indicator: Public Domain, Creative Commons detected, Standard, Manual), and Stage 4 Pipeline Activity (latest job status, duration, failure diagnostic box, 1-click retry, link to full job log).
+  - **Job-to-Video Matching & Lineage**: Implemented `job_matches_video()` with deterministic precedence (action key match -> summary metadata `video_id` -> target file stem fallback) and `get_latest_job_for_video()`. Excludes unrelated jobs and handles retries cleanly.
+  - **Deletion Concurrency & Safety**: `POST /api/video` with `action: "delete"` checks active jobs under `GUARD` and raises HTTP 409 Conflict if an active render/upload job targets the video. Enforces `out/` containment and preserves `work/*_raw.mp4`.
+  - **Test Suite**:
+    - `tests/test_stage5_library.py`: 15/15 passed (0.9s).
+    - `tests/test_stage4_pipeline.py`: 14/14 passed (0.8s).
+    - `tests/test_stage3_reliability.py`: 12/12 passed (4.7s).
+    - `tests/test_stage2_queue_cancel.py`: 11/11 passed (6.0s).
+    - `tests/test_style_presets.py`: 14/14 passed (0.9s).
+    - Full discovery suite: 135 tests total, 128 passed, 0 failures, 7 known environment-specific errors (6 NVENC, 1 macOS).
+  - **Runtime Verification**: Verified live against server at `http://127.0.0.1:8766/`:
+    1. Loaded all 79 videos with enriched health and review status.
+    2. Verified uploaded videos are unreviewed by default.
+    3. Mutated review status to approved, verified SQLite persistence, reset to unreviewed.
+    4. Verified invalid review status rejected with HTTP 400.
+    5. Verified active job deletion blocked with HTTP 409 Conflict.
+    6. Verified missing video file flagged with `video_exists: False`.
+  - **Next Stage**: Stage 6 (Publishing & Automation Management).
 - **Stage 4 Completed (Pipeline & Job Management)**:
   - **Persistent Job Execution Metadata**: SQLite `jobs` records now track `started_at` (populated at `pending -> running` transition), `finished_at` (populated on all terminal outcomes: completed, failed, cancelled, interrupted), and execution `duration_seconds` (`round(finished - started, 1)` strictly execution time, distinct from queue wait time).
   - **Pipeline Stage Timeline**: Capped at 50 events (`job["stages"]`) with consecutive stage deduplication. Every state transition, worker step, and agent step records timestamped progress.
