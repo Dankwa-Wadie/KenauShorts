@@ -4,6 +4,7 @@ and aspect-ratio matching.
 """
 
 import copy
+import json
 import re
 import subprocess
 import tempfile
@@ -21,7 +22,7 @@ from core.style_presets import (
     match_style_preset_to_aspect,
     parse_aspect,
 )
-from studio import store
+from studio import server, store, worker
 
 
 class StylePresetTests(unittest.TestCase):
@@ -321,6 +322,115 @@ class StylePresetTests(unittest.TestCase):
                 self.assertIsNotNone(saved)
                 self.assertEqual(saved.get("style_preset"), "emerald_compact")
 
+    def test_api_video_rejects_invalid_preset_and_accepts_valid_preset(self):
+        """Test /api/video validation rejects unknown preset names and accepts known ones or empty."""
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            db_path = Path(tmp_dir) / "test_store.sqlite3"
+            with patch.object(store, "DB", db_path), patch.object(store, "ROOT", Path(tmp_dir)):
+                store.put("videos", "test_vid_1", {
+                    "id": "test_vid_1",
+                    "title": "Title",
+                    "headline": "Headline",
+                    "style_preset": "classic_blue",
+                })
+                handler = server.StudioHandler.__new__(server.StudioHandler)
+
+                # Valid preset name update
+                res = handler.mutate("/api/video", {"id": "test_vid_1", "style_preset": "warm_amber"})
+                self.assertEqual(res["style_preset"], "warm_amber")
+                rec = store.get("videos", "test_vid_1")
+                self.assertEqual(rec["style_preset"], "warm_amber")
+
+                # Empty string (auto/unset)
+                res = handler.mutate("/api/video", {"id": "test_vid_1", "style_preset": ""})
+                self.assertEqual(res["style_preset"], "")
+                rec = store.get("videos", "test_vid_1")
+                self.assertEqual(rec["style_preset"], "")
+
+                # None (auto/unset)
+                res = handler.mutate("/api/video", {"id": "test_vid_1", "style_preset": None})
+                self.assertEqual(res["style_preset"], "")
+
+                # All known preset names accepted
+                for preset in STYLE_PRESETS:
+                    res = handler.mutate("/api/video", {"id": "test_vid_1", "style_preset": preset["name"]})
+                    self.assertEqual(res["style_preset"], preset["name"])
+
+                # Invalid preset name rejected
+                with self.assertRaises(ValueError) as ctx:
+                    handler.mutate("/api/video", {"id": "test_vid_1", "style_preset": "non_existent_preset"})
+                self.assertIn("Invalid style_preset", str(ctx.exception))
+
+                # Non-string rejected
+                with self.assertRaises(ValueError) as ctx:
+                    handler.mutate("/api/video", {"id": "test_vid_1", "style_preset": 12345})
+                self.assertIn("expected string", str(ctx.exception))
+
+    def test_worker_render_uses_record_style_preset(self):
+        """Test that worker.work('render') uses style_preset from record without re-deriving aspect."""
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            (root / "out").mkdir()
+            (root / "work").mkdir()
+            (root / "config.json").write_text(json.dumps({"layout": {"border_color": "#000000"}}))
+            raw_video = root / "work" / "test_render_vid_raw.mp4"
+            raw_video.write_bytes(b"dummy")
+            db_path = root / "test.sqlite3"
+
+            with patch.object(store, "DB", db_path), patch.object(store, "ROOT", root):
+                store.put("videos", "test_render_vid", {
+                    "id": "test_render_vid",
+                    "headline": "TEST RE-RENDER",
+                    "video": str(raw_video),
+                    "style_preset": "warm_amber",
+                    "status": "ready",
+                })
+                with patch("studio.worker.render.render") as mock_render, \
+                     patch("studio.worker.get_source_aspect_ratio") as mock_aspect:
+                    worker.work("render", "test_render_vid")
+
+                    # Crucial assertion: aspect probing is skipped when preset is already set on record
+                    mock_aspect.assert_not_called()
+                    mock_render.assert_called_once()
+
+                    called_config = mock_render.call_args.kwargs["config"]
+                    warm_preset = get_style_preset("warm_amber")
+                    self.assertEqual(called_config["layout"]["border_color"], warm_preset["layout"]["border_color"])
+                    self.assertEqual(called_config["layout"]["video_aspect"], warm_preset["layout"]["video_aspect"])
+
+    def test_worker_render_falls_back_to_aspect_matching_when_unset(self):
+        """Test that worker.work('render') uses aspect matching when style_preset is empty on record."""
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            (root / "out").mkdir()
+            (root / "work").mkdir()
+            (root / "config.json").write_text(json.dumps({"layout": {"border_color": "#000000"}}))
+            raw_video = root / "work" / "test_auto_vid_raw.mp4"
+            raw_video.write_bytes(b"dummy")
+            db_path = root / "test.sqlite3"
+
+            with patch.object(store, "DB", db_path), patch.object(store, "ROOT", root):
+                store.put("videos", "test_auto_vid", {
+                    "id": "test_auto_vid",
+                    "headline": "TEST AUTO MATCH",
+                    "video": str(raw_video),
+                    "style_preset": "",
+                    "status": "ready",
+                })
+                # Mock aspect ratio 1.7778 -> should match classic_blue
+                with patch("studio.worker.render.render") as mock_render, \
+                     patch("studio.worker.get_source_aspect_ratio", return_value=1.7778) as mock_aspect:
+                    worker.work("render", "test_auto_vid")
+
+                    mock_aspect.assert_called_once()
+                    mock_render.assert_called_once()
+
+                    called_config = mock_render.call_args.kwargs["config"]
+                    blue_preset = get_style_preset("classic_blue")
+                    self.assertEqual(called_config["layout"]["border_color"], blue_preset["layout"]["border_color"])
+                    self.assertEqual(called_config["layout"]["video_aspect"], blue_preset["layout"]["video_aspect"])
+
 
 if __name__ == "__main__":
     unittest.main()
+

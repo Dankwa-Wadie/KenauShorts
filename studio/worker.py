@@ -13,6 +13,13 @@ from pathlib import Path
 
 from core import agent, render, render_story
 from core.state import State
+from core.style_presets import (
+    apply_style_preset,
+    choose_style_preset,
+    get_source_aspect_ratio,
+    get_style_preset,
+    match_style_preset_to_aspect,
+)
 from studio import store
 
 LOG = logging.getLogger("kenaushorts.worker")
@@ -92,8 +99,12 @@ def work(action: str, key: str) -> None:
             new_poster = out_dir / f"{new_id}.png"
 
             try:
+                preset_name = record.get("style_preset", "")
+                preset = get_style_preset(preset_name) if preset_name else None
+
                 cand = record.get("candidate", {})
                 if cand.get("kind") == "story":
+                    render_config = apply_style_preset(config, preset) if preset else config
                     render_story.render_story(
                         headline=record["headline"],
                         commentary=record.get("caption", ""),
@@ -101,16 +112,46 @@ def work(action: str, key: str) -> None:
                         mascot=Path(config.get("story", {}).get("mascot", "assets/default_mascot.mp4")),
                         out=new_mp4,
                         poster=new_poster,
-                        config=config,
+                        config=render_config,
                     )
                 else:
                     # Look for raw clip in work dir
-                    raw_clip = Path(record.get("raw_video", record["video"]))
+                    raw_candidate = store.ROOT / "work" / f"{key}_raw.mp4"
+                    if raw_candidate.is_file():
+                        raw_clip = raw_candidate
+                    else:
+                        orig_key = key.split("_edit_")[0]
+                        orig_raw = store.ROOT / "work" / f"{orig_key}_raw.mp4"
+                        if orig_raw.is_file():
+                            raw_clip = orig_raw
+                        else:
+                            raw_clip = Path(record.get("raw_video", record["video"]))
+
+                    if not preset:
+                        source_aspect = get_source_aspect_ratio(raw_clip)
+                        if source_aspect is not None:
+                            preset = match_style_preset_to_aspect(source_aspect)
+                            LOG.info(
+                                "Matched style preset '%s' (%s) for source aspect ratio %.3f (%s)",
+                                preset["name"],
+                                preset.get("layout", {}).get("video_aspect"),
+                                source_aspect,
+                                raw_clip.name,
+                            )
+                        else:
+                            LOG.warning(
+                                "Could not determine source aspect ratio for %s; falling back to random preset",
+                                raw_clip.name,
+                            )
+                            preset = choose_style_preset()
+
+                    render_config = apply_style_preset(config, preset)
+
                     render.render(
                         video=raw_clip,
                         headline=record["headline"],
                         out=new_mp4,
-                        config=config,
+                        config=render_config,
                         poster=new_poster,
                     )
 
@@ -118,6 +159,8 @@ def work(action: str, key: str) -> None:
                     status="ready",
                     video=str(new_mp4),
                     poster=str(new_poster),
+                    raw_video=str(raw_clip) if cand.get("kind") != "story" else "",
+                    style_preset=record.get("style_preset", ""),
                     error="",
                 )
                 store.put("videos", key, record)

@@ -12,6 +12,12 @@ what's actually on `origin/main`.
 
 ## Current state (update this section each handoff)
 
+- **Manual Style Preset Override in Studio UI (Completed)**:
+  - Backend validation: Updated `/api/video` POST handler in `studio/server.py` to validate `style_preset` against known presets in `STYLE_PRESETS` or empty string (`""` / `None` for Auto), rejecting invalid preset names or non-string values with a clear error.
+  - Re-rendering with preset: Updated `studio/worker.py`'s `"render"` action to read `record.get("style_preset")`. When a preset is set on the record, it applies that preset directly (skipping aspect probing). If unset/empty (`""`), it performs aspect-ratio matching (or fallback) automatically. Also preserves the original `raw_video` reference for future re-renders.
+  - Frontend UI: Added a "Card Style" dropdown to `openVideoModal()` in `studio/web/app.js` populated with the 4 presets (`classic_blue`, `warm_amber`, `emerald_compact`, `cyber_violet`) plus an "Auto (match video shape)" option, defaulting to the video's current `style_preset`. Updated `saveVideoEdits()` to include `style_preset`, which is saved prior to re-rendering in `reRenderDraft()`.
+  - Tests: Added unit tests in `tests/test_style_presets.py` covering `/api/video` validation and `worker.py` preset handling (14/14 passed). Full suite: 106 tests total, 99 passed, 0 failures, 7 known environment errors.
+  - Manual verification: Verified against live server using `short_1790296060_yt_ctZOWjE`, changing preset from `cyber_violet` (4:5) to `warm_amber` (4:3), saving and re-rendering via persistent job queue, and verifying output video and poster adopted the amber border (`#F59E0B`) and 4:3 frame.
 - **Aspect-Ratio Matched Style Presets for Rendered Cards (Completed)**:
   - Replaced random style preset selection in `_render_pick()` (`core/agent.py`) with intelligent aspect-ratio matching based on the source video's actual dimensions:
     - `get_source_aspect_ratio(video_path)` uses `ffprobe` to determine width/height and returns $w/h$ as a float. Handled gracefully with fallback on ffprobe failure or missing file.

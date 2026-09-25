@@ -507,6 +507,18 @@ async function openVideoModal(id) {
           </div>
 
           <div class="form-group">
+            <label>Card Style</label>
+            <select class="form-input" id="edit-style-preset">
+              <option value="" ${!v.style_preset ? 'selected' : ''}>Auto (match video shape)</option>
+              <option value="classic_blue" ${v.style_preset === 'classic_blue' ? 'selected' : ''}>Classic Blue (16:9)</option>
+              <option value="warm_amber" ${v.style_preset === 'warm_amber' ? 'selected' : ''}>Warm Amber (4:3)</option>
+              <option value="emerald_compact" ${v.style_preset === 'emerald_compact' ? 'selected' : ''}>Emerald Compact (1:1)</option>
+              <option value="cyber_violet" ${v.style_preset === 'cyber_violet' ? 'selected' : ''}>Cyber Violet (4:5)</option>
+            </select>
+            <p class="form-help">Border color and aspect ratio preset. Auto matches the source video's shape.</p>
+          </div>
+
+          <div class="form-group">
             <label>YouTube Description</label>
             <textarea class="form-input" id="edit-desc" rows="4">${escapeHtml(v.description || '')}</textarea>
           </div>
@@ -555,9 +567,11 @@ async function saveVideoEdits(id) {
   const title = document.getElementById('edit-title').value;
   const headline = document.getElementById('edit-headline').value;
   const description = document.getElementById('edit-desc').value;
+  const presetEl = document.getElementById('edit-style-preset');
+  const style_preset = presetEl ? presetEl.value : '';
 
   try {
-    const res = await postJSON('/api/video', { id, title, headline, description });
+    const res = await postJSON('/api/video', { id, title, headline, description, style_preset });
     if (!res.ok) throw new Error('Save failed');
     showNotification('Draft details saved.');
   } catch (e) {

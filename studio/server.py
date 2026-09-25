@@ -36,6 +36,7 @@ if __name__ == "__main__" and __package__ is None:
     # the service tries to start.
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+from core.style_presets import STYLE_PRESETS
 from studio import store
 
 LOG = logging.getLogger("kenaushorts.server")
@@ -1025,6 +1026,18 @@ class StudioHandler(BaseHTTPRequestHandler):
                 record["description"] = data["description"]
             if "headline" in data:
                 record["headline"] = data["headline"]
+            if "style_preset" in data:
+                val = data["style_preset"]
+                if val is None:
+                    preset_val = ""
+                elif isinstance(val, str):
+                    preset_val = val.strip()
+                else:
+                    raise ValueError(f"Invalid style_preset: expected string, got {type(val).__name__}")
+                valid_names = {p["name"] for p in STYLE_PRESETS}
+                if preset_val and preset_val not in valid_names:
+                    raise ValueError(f"Invalid style_preset: '{preset_val}'. Must be one of {sorted(valid_names)} or empty string")
+                record["style_preset"] = preset_val
             store.put("videos", vid_id, record)
             return record
 
