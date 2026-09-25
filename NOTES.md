@@ -237,3 +237,56 @@ Stage 2 meets all single-instance operational requirements: process tracking, pr
 - **Stage 2 Test Suite** (`tests/test_stage2_queue_cancel.py`): 11/11 passed (6.1s).
 - **Total Dedicated Reliability Tests**: 23/23 passing.
 
+---
+
+## Manual Style Preset Override + Stage 3 Reliability Regression Audit
+
+### Audit Date
+2026-09-25
+
+### Audited Commit
+`f5c29ed` (`feat: add manual style preset override to video review modal`)
+
+### Working Tree Pre-Audit Condition (Critical Finding)
+- Prior to the start of this audit, `core/agent.py` was found modified on disk (uncommitted, timestamp `2026-09-25 08:43:26`).
+- **Diff Analysis**: Lines 207-224 inside `discover_rss` were corrupted with an incomplete, unindented YouTube snippet containing undefined variables (`vid`, `sn`, `q`).
+- **Status & Risk**: Per audit rules, this pre-existing change was NOT committed and NOT included in the audited commit `f5c29ed`. It represents an uncommitted regression risk in the working tree for RSS discovery if left uncorrected by subsequent maintenance.
+
+### Audit Scope
+1. **Manual Style Preset Override**: Modal review UI (`studio/web/app.js`), backend `/api/video` validation and persistence (`studio/server.py`), and worker re-rendering / aspect fallback (`studio/worker.py`).
+2. **Stage 3 Reliability Hardening Regression Check**: Multi-instance collision prevention (`.server.lock` and `StudioServer`), false-success prevention (inspecting `job["summary"]["status"]`), cancellation vs completion race prevention under `GUARD`, and PID recycling protection (`GetProcessTimes`).
+3. **Automated & Manual Verification**: Automated unit test suites, full test discovery, and live runtime testing against the active server.
+
+### Test Results
+
+- **Targeted Test Suites**:
+  - `tests/test_style_presets.py`: 14/14 passed (1.0s).
+  - `tests/test_stage3_reliability.py`: 12/12 passed (5.1s).
+  - `tests/test_stage2_queue_cancel.py`: 11/11 passed (6.7s).
+- **Full Discovery Test Suite** (`$env:PYTHONUTF8='1'; python -m unittest discover -s tests -p "test_*.py"`):
+  - 106 tests total: 99 passed, 0 failures, 7 errors, 0 skipped.
+  - 6 errors in `test_render.py`: Expected host limitation (missing NVIDIA CUDA/NVENC hardware encoder on local Windows environment: `[h264_nvenc] Cannot load nvcuda.dll`). Normal rendering correctly defaults to `libx264`.
+  - 1 error in `test_uninstall_service.py`: Expected platform limitation (macOS-specific test calling `os.getuid()` running on Windows).
+  - Flakiness Note: `test_stage2_queue_cancel.py`'s `test_api_queue_and_status_reporting` passes reliably in isolation, but can exhibit a race condition in full suite runs if the active background queue worker picks up a dummy test job before `GET /api/queue` completes.
+
+### Verification Results
+
+| Component | Status | Evidence / Verification Details |
+|---|---|---|
+| **Modal UI (`app.js`)** | **VERIFIED** | Dropdown `#edit-style-preset` populated with Auto option and all 4 presets. `saveVideoEdits()` captures and sends `style_preset`. `reRenderDraft()` saves edits before enqueuing render job. |
+| **Backend Validation (`server.py`)** | **VERIFIED** | `/api/video` POST handler runs under `GUARD`, rejects unknown preset names (e.g. `'neon_punk'`) and non-string types with HTTP 400. Accurately persists valid presets and empty string to SQLite `videos` table. |
+| **Worker Re-rendering (`worker.py`)** | **VERIFIED** | Worker `"render"` action respects `record.get("style_preset")`. When set, applies preset directly; when empty (`""`), automatically probes aspect ratio via `ffprobe` and matches preset. Preserves `raw_video` reference across repeated re-renders. |
+| **Multi-Instance Server Guard** | **VERIFIED** | Real-world manual launch of a second server instance `python -m studio.server` while instance 1 is running was rejected immediately with `[ERROR] Cannot start KenauShorts Studio: Another KenauShorts server instance is already running (locked .server.lock): [Errno 13] Permission denied`. First instance unaffected. |
+| **False-Success Prevention** | **VERIFIED** | `run_job_process()` evaluates `summary.get("status")` before evaluating process exit code. Unit tests verify `failed` and `idle` summaries set terminal statuses to `failed` and `idle`. |
+| **Cancel vs Completion Race** | **VERIFIED** | Terminal status inspection, artifact unlinking, and SQLite update are atomic under `with GUARD:`. Verified in `test_cancellation_during_job_run_preserves_cancelled`. |
+| **PID Recycling Protection** | **VERIFIED** | Process creation timestamp recorded at spawn with 100ns precision via Windows `kernel32.GetProcessTimes`. Process tree termination refuses termination if timestamp does not match. |
+
+### Manual Live Verification
+- **Test A (Inspection)**: Queried `short_1790296060_yt_ctZOWjE` via `GET /api/video`. Confirmed `style_preset: "cyber_violet"`.
+- **Test B (Validation Rejection)**: POSTed invalid preset `"neon_punk"` -> rejected HTTP 400. POSTed integer `12345` -> rejected HTTP 400.
+- **Test C (Mutation & Persistence)**: POSTed `"warm_amber"` -> returned HTTP 200, persisted in database.
+- **Test D (Real Re-render)**: Enqueued render job via `POST /api/job`. Monitored through `running` to `completed`. Verified new video file `short_1790296060_yt_ctZOWjE_edit_c1748b.mp4` generated (6,096,508 bytes) and `raw_video` path preserved.
+- **Test E (Auto Mode & Chain Re-render)**: POSTed `""` (Auto mode) and re-rendered. Job completed successfully, generating `short_1790296060_yt_ctZOWjE_edit_00d01e.mp4` (7,842,513 bytes) with `raw_video` maintained across multiple re-renders.
+- **Test F (Multi-instance Collision)**: Executed `python -m studio.server` in a secondary process. Exited immediately with `.server.lock` permission denied error. Primary server remained alive and responsive.
+
+
