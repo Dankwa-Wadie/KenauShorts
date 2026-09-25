@@ -65,6 +65,26 @@ def delete(table: str, key: str) -> None:
     with connect() as db:
         db.execute(f"DELETE FROM {table} WHERE id=?", (key,))
 
+def jobs_list(limit: int = 50, status: str | None = None) -> list[dict[str, Any]]:
+    assert limit > 0
+    if not DB.exists():
+        return []
+    with contextlib.closing(sqlite3.connect(f"file:{DB}?mode=ro", uri=True, timeout=15)) as db:
+        db.row_factory = sqlite3.Row
+        rows = db.execute("SELECT data FROM jobs ORDER BY rowid DESC").fetchall()
+    out = []
+    for r in rows:
+        try:
+            job = json.loads(r["data"])
+            if status and status != "all" and job.get("status") != status:
+                continue
+            out.append(job)
+            if len(out) >= limit:
+                break
+        except Exception:
+            continue
+    return out
+
 # Cross-platform single instance locking
 @contextlib.contextmanager
 def pipeline_lock():

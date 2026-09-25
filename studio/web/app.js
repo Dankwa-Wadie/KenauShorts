@@ -56,6 +56,11 @@ function renderPage(page) {
       eyebrow.textContent = 'DASHBOARD';
       loadOverview(view);
       break;
+    case 'queue':
+      title.textContent = 'Pipeline & Job Queue';
+      eyebrow.textContent = 'QUEUE';
+      loadQueue(view);
+      break;
     case 'library':
       title.textContent = 'Drafts & Video Library';
       eyebrow.textContent = 'MEDIA';
@@ -139,6 +144,11 @@ async function pollStatus() {
         term.textContent = activeJobData.log || 'Waiting for log output...';
         term.scrollTop = term.scrollHeight;
       }
+    }
+
+    // Refresh the queue view live if on queue page
+    if (currentPage === 'queue') {
+      refreshQueueView();
     }
 
     // Refresh the library grid so the "in progress" placeholder updates/clears live
@@ -1237,6 +1247,372 @@ async function saveStyleSettings() {
   } catch (e) {
     showNotification(e.message, 'error');
   }
+}
+
+// --------------------------------------------------------------------------
+// Page: Pipeline & Queue
+// --------------------------------------------------------------------------
+
+let currentQueueFilter = 'all';
+
+async function loadQueue(container) {
+  container.innerHTML = `
+    <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 24px;">
+      <div>
+        <p style="color: var(--text-muted); font-size: 14px;">Monitor running pipelines, inspect queued tasks, and trace execution history.</p>
+      </div>
+      <div style="display: flex; gap: 8px;">
+        <button class="btn btn-secondary" onclick="refreshQueueView()"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="vertical-align:-2px;margin-right:4px;"><polyline points="23 4 23 10 17 10"></polyline><polyline points="1 20 1 14 7 14"></polyline><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"></path></svg>Refresh</button>
+      </div>
+    </div>
+
+    <!-- Active Job Section -->
+    <div id="queue-active-section" style="margin-bottom: 28px;">
+      <h3 style="font-size: 16px; margin-bottom: 12px; display: flex; align-items: center; gap: 8px;">
+        Active Execution
+      </h3>
+      <div id="queue-active-container"><p style="color: var(--text-muted); font-size: 13px;">Checking active status...</p></div>
+    </div>
+
+    <!-- Pending Queue Section -->
+    <div id="queue-pending-section" style="margin-bottom: 28px;">
+      <h3 style="font-size: 16px; margin-bottom: 12px; display: flex; align-items: center; gap: 8px;">
+        Queued Tasks <span id="queue-count-badge" class="badge" style="font-size: 12px; display: inline-block;">0</span>
+      </h3>
+      <div id="queue-pending-container"><p style="color: var(--text-muted); font-size: 13px;">Checking queue...</p></div>
+    </div>
+
+    <!-- History Section -->
+    <div id="queue-history-section">
+      <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px;">
+        <h3 style="font-size: 16px;">Execution History</h3>
+        <div class="filter-group" style="display: flex; gap: 6px;">
+          <button class="btn btn-sm btn-filter ${currentQueueFilter === 'all' ? 'btn-primary' : 'btn-secondary'}" onclick="setQueueFilter('all')">All</button>
+          <button class="btn btn-sm btn-filter ${currentQueueFilter === 'completed' ? 'btn-primary' : 'btn-secondary'}" onclick="setQueueFilter('completed')">Completed</button>
+          <button class="btn btn-sm btn-filter ${currentQueueFilter === 'failed' ? 'btn-primary' : 'btn-secondary'}" onclick="setQueueFilter('failed')">Failed</button>
+          <button class="btn btn-sm btn-filter ${currentQueueFilter === 'cancelled' ? 'btn-primary' : 'btn-secondary'}" onclick="setQueueFilter('cancelled')">Cancelled</button>
+        </div>
+      </div>
+      <div id="queue-history-container"><p style="color: var(--text-muted); font-size: 13px;">Loading history...</p></div>
+    </div>
+  `;
+
+  await refreshQueueView();
+}
+
+function setQueueFilter(filter) {
+  currentQueueFilter = filter;
+  const buttons = document.querySelectorAll('.filter-group .btn-filter');
+  buttons.forEach(btn => {
+    const isCurrent = btn.textContent.toLowerCase() === filter;
+    btn.classList.toggle('btn-primary', isCurrent);
+    btn.classList.toggle('btn-secondary', !isCurrent);
+  });
+  refreshQueueView();
+}
+
+async function refreshQueueView() {
+  if (currentPage !== 'queue') return;
+
+  try {
+    const statusUrl = '/api/status';
+    const filterParam = currentQueueFilter !== 'all' ? `&status=${encodeURIComponent(currentQueueFilter)}` : '';
+    const jobsUrl = `/api/jobs?limit=50${filterParam}`;
+
+    const [statusRes, jobsRes] = await Promise.all([
+      fetch(statusUrl).then(r => r.json()).catch(() => null),
+      fetch(jobsUrl).then(r => r.json()).catch(() => [])
+    ]);
+
+    if (!statusRes) return;
+
+    // 1. Render Active Job Section
+    const activeCont = document.getElementById('queue-active-container');
+    if (activeCont) {
+      const active = statusRes.active_job;
+      if (active) {
+        activeCont.innerHTML = `
+          <div class="stat-card" style="display: flex; justify-content: space-between; align-items: center; border-left: 4px solid var(--accent); padding: 18px 20px;">
+            <div>
+              <div style="display: flex; align-items: center; gap: 10px; margin-bottom: 6px;">
+                <span class="status-pill running">RUNNING</span>
+                <strong style="font-size: 15px;">${escapeHtml((active.action || '').toUpperCase())}</strong>
+                <span style="font-family: monospace; font-size: 12px; color: var(--text-muted);">${escapeHtml((active.id || '').slice(0, 8))}</span>
+              </div>
+              <div style="font-size: 13px; color: var(--text); margin-bottom: 4px;">
+                Stage: <strong>${escapeHtml(active.stage || 'Executing...')}</strong>
+              </div>
+              <div style="font-size: 12px; color: var(--text-muted);">
+                Started: ${active.started_at ? active.started_at.replace('T', ' ').slice(0, 19) : 'Just now'}
+              </div>
+            </div>
+            <div style="display: flex; gap: 8px;">
+              <button class="btn btn-secondary btn-sm" onclick="openJobModal('${escapeHtml(active.id)}')">View Pipeline</button>
+              <button class="btn btn-danger btn-sm" onclick="cancelJobById('${escapeHtml(active.id)}')">Cancel</button>
+            </div>
+          </div>
+        `;
+      } else {
+        activeCont.innerHTML = `
+          <div style="background: var(--bg-card); border: 1px dashed var(--border); border-radius: var(--radius-md); padding: 20px; text-align: center; color: var(--text-muted); font-size: 13px;">
+            Engine Idle — No active job running.
+          </div>
+        `;
+      }
+    }
+
+    // 2. Render Queued Tasks Section
+    const pendingCont = document.getElementById('queue-pending-container');
+    const countBadge = document.getElementById('queue-count-badge');
+    const pendingList = statusRes.pending || [];
+    if (countBadge) countBadge.textContent = pendingList.length;
+
+    if (pendingCont) {
+      if (pendingList.length > 0) {
+        pendingCont.innerHTML = `
+          <table class="sub-table">
+            <thead>
+              <tr>
+                <th style="width: 50px;">Pos</th>
+                <th>Job ID</th>
+                <th>Action</th>
+                <th>Queued At</th>
+                <th style="text-align: right;">Actions</th>
+              </tr>
+            </thead>
+            <tbody>
+              ${pendingList.map((pj, idx) => `
+                <tr>
+                  <td><strong>#${idx + 1}</strong></td>
+                  <td style="font-family: monospace; font-size: 12px;">${escapeHtml(pj.id ? pj.id.slice(0, 8) : '')}</td>
+                  <td><span class="job-badge">${escapeHtml(pj.action || '')}</span></td>
+                  <td style="font-size: 12px; color: var(--text-muted);">${pj.created_at ? pj.created_at.replace('T', ' ').slice(0, 19) : '—'}</td>
+                  <td style="text-align: right;">
+                    <button class="btn btn-secondary btn-sm" onclick="openJobModal('${escapeHtml(pj.id)}')">Details</button>
+                    <button class="btn btn-danger btn-sm" style="margin-left: 4px;" onclick="cancelJobById('${escapeHtml(pj.id)}')">Cancel</button>
+                  </td>
+                </tr>
+              `).join('')}
+            </tbody>
+          </table>
+        `;
+      } else {
+        pendingCont.innerHTML = `
+          <div style="background: var(--bg-card); border: 1px dashed var(--border); border-radius: var(--radius-md); padding: 20px; text-align: center; color: var(--text-muted); font-size: 13px;">
+            No jobs waiting in queue.
+          </div>
+        `;
+      }
+    }
+
+    // 3. Render Execution History Section
+    const historyCont = document.getElementById('queue-history-container');
+    if (historyCont) {
+      const jobs = Array.isArray(jobsRes) ? jobsRes : [];
+      if (jobs.length > 0) {
+        historyCont.innerHTML = `
+          <table class="sub-table">
+            <thead>
+              <tr>
+                <th>Status</th>
+                <th>Action</th>
+                <th>Job ID</th>
+                <th>Started</th>
+                <th>Duration</th>
+                <th>Summary / Error</th>
+                <th style="text-align: right;">Actions</th>
+              </tr>
+            </thead>
+            <tbody>
+              ${jobs.map(j => {
+                const canRetry = ['failed', 'cancelled', 'interrupted'].includes(j.status);
+                const isRetried = !!j.retried_by;
+                const durationText = (j.duration_seconds !== null && j.duration_seconds !== undefined) ? `${j.duration_seconds}s` : '—';
+                const timeText = j.started_at ? j.started_at.replace('T', ' ').slice(0, 19) : (j.created_at ? j.created_at.replace('T', ' ').slice(0, 19) : '—');
+                let summaryHtml = '';
+                if (j.error) {
+                  summaryHtml = `<span style="color: var(--danger); font-family: monospace;" title="${escapeHtml(j.error)}">${escapeHtml(j.error.length > 45 ? j.error.slice(0, 45) + '...' : j.error)}</span>`;
+                } else {
+                  summaryHtml = `<span style="color: var(--text-muted);">${escapeHtml(j.stage || 'Completed')}</span>`;
+                }
+                return `
+                  <tr>
+                    <td><span class="status-pill ${escapeHtml(j.status)}">${escapeHtml(j.status)}</span></td>
+                    <td><span class="job-badge">${escapeHtml(j.action || '')}</span></td>
+                    <td style="font-family: monospace; font-size: 12px;">
+                      <a href="#" onclick="openJobModal('${escapeHtml(j.id)}'); return false;" style="color: var(--accent);">${escapeHtml((j.id || '').slice(0, 8))}</a>
+                    </td>
+                    <td style="font-size: 12px; color: var(--text-muted);">${timeText}</td>
+                    <td style="font-size: 12px; font-weight: 500;">${durationText}</td>
+                    <td style="font-size: 12px; max-width: 250px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;">${summaryHtml}</td>
+                    <td style="text-align: right; white-space: nowrap;">
+                      <button class="btn btn-secondary btn-sm" onclick="openJobModal('${escapeHtml(j.id)}')">Details</button>
+                      ${canRetry ? `<button class="btn btn-primary btn-sm" style="margin-left: 4px;" onclick="retryJob('${escapeHtml(j.id)}')">${isRetried ? 'Retry Again' : 'Retry'}</button>` : ''}
+                    </td>
+                  </tr>
+                `;
+              }).join('')}
+            </tbody>
+          </table>
+        `;
+      } else {
+        historyCont.innerHTML = `
+          <div style="background: var(--bg-card); border: 1px dashed var(--border); border-radius: var(--radius-md); padding: 30px; text-align: center; color: var(--text-muted); font-size: 13px;">
+            No job history matching current filter.
+          </div>
+        `;
+      }
+    }
+  } catch (e) {
+    console.error('Queue refresh error:', e);
+  }
+}
+
+async function cancelJobById(id) {
+  if (!id) return;
+  if (!confirm(`Cancel job ${id.slice(0, 8)}?`)) return;
+  try {
+    const res = await postJSON('/api/job/cancel', { id });
+    const data = await res.json();
+    if (data.error) throw new Error(data.error);
+    showNotification(`Job ${id.slice(0, 8)} cancelled.`);
+    pollStatus();
+    if (currentPage === 'queue') refreshQueueView();
+    const modal = document.getElementById('job-detail-modal');
+    if (modal && modal.open) modal.close();
+  } catch (e) {
+    showNotification(e.message, 'error');
+  }
+}
+
+async function retryJob(id) {
+  if (!id) return;
+  try {
+    const res = await postJSON('/api/job/retry', { id });
+    const data = await res.json();
+    if (data.error) throw new Error(data.error);
+    const posMsg = data.queue_position > 0 ? ` (Queue pos: ${data.queue_position})` : '';
+    showNotification(`Job retried! New job: ${data.id.slice(0, 8)}${posMsg}`);
+    pollStatus();
+    if (currentPage === 'queue') refreshQueueView();
+    const modal = document.getElementById('job-detail-modal');
+    if (modal && modal.open) modal.close();
+  } catch (e) {
+    showNotification(e.message, 'error');
+  }
+}
+
+async function openJobModal(id) {
+  try {
+    const res = await fetch(`/api/job?id=${encodeURIComponent(id)}`);
+    const job = await res.json();
+    if (job.error) throw new Error(job.error);
+
+    const modal = document.getElementById('job-detail-modal');
+    const title = document.getElementById('job-modal-title');
+    const body = document.getElementById('job-modal-body');
+    const closeBtn = document.getElementById('btn-close-job-modal');
+
+    title.textContent = `Job Details — ${(job.action || '').toUpperCase()} (${(job.id || '').slice(0, 8)})`;
+    closeBtn.onclick = () => modal.close();
+
+    const stages = Array.isArray(job.stages) ? job.stages : [];
+    const canRetry = ['failed', 'cancelled', 'interrupted'].includes(job.status);
+    const durationText = (job.duration_seconds !== null && job.duration_seconds !== undefined) ? `${job.duration_seconds}s` : '—';
+
+    let html = `
+      <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin-bottom: 20px; background: var(--bg-card); padding: 16px; border-radius: var(--radius-md); border: 1px solid var(--border);">
+        <div><strong style="color: var(--text-muted); font-size: 11px; text-transform: uppercase;">Job ID</strong><div style="font-family: monospace; font-size: 12px; margin-top: 2px;">${escapeHtml(job.id)}</div></div>
+        <div><strong style="color: var(--text-muted); font-size: 11px; text-transform: uppercase;">Status</strong><div style="margin-top: 2px;"><span class="status-pill ${escapeHtml(job.status)}">${escapeHtml(job.status)}</span></div></div>
+        <div><strong style="color: var(--text-muted); font-size: 11px; text-transform: uppercase;">Action</strong><div style="font-weight: 600; margin-top: 2px;">${escapeHtml(job.action)}</div></div>
+        <div><strong style="color: var(--text-muted); font-size: 11px; text-transform: uppercase;">Duration</strong><div style="margin-top: 2px;">${durationText}</div></div>
+        <div><strong style="color: var(--text-muted); font-size: 11px; text-transform: uppercase;">Created</strong><div style="font-size: 12px; color: var(--text-muted); margin-top: 2px;">${job.created_at ? job.created_at.replace('T', ' ').slice(0, 19) : '—'}</div></div>
+        <div><strong style="color: var(--text-muted); font-size: 11px; text-transform: uppercase;">Started</strong><div style="font-size: 12px; color: var(--text-muted); margin-top: 2px;">${job.started_at ? job.started_at.replace('T', ' ').slice(0, 19) : '—'}</div></div>
+        <div><strong style="color: var(--text-muted); font-size: 11px; text-transform: uppercase;">Finished</strong><div style="font-size: 12px; color: var(--text-muted); margin-top: 2px;">${job.finished_at ? job.finished_at.replace('T', ' ').slice(0, 19) : '—'}</div></div>
+        <div><strong style="color: var(--text-muted); font-size: 11px; text-transform: uppercase;">Trigger</strong><div style="font-size: 12px; color: var(--text-muted); margin-top: 2px;">${job.automatic ? 'Automatic (Scheduler)' : 'Manual (User)'}</div></div>
+      </div>
+    `;
+
+    if (job.retry_of || job.retried_by) {
+      html += `
+        <div style="background: var(--bg-hover); padding: 10px 14px; border-radius: var(--radius-sm); margin-bottom: 16px; font-size: 13px;">
+          ${job.retry_of ? `<div style="margin-bottom: 4px;">↳ <strong>Retry of:</strong> <a href="#" onclick="openJobModal('${escapeHtml(job.retry_of)}'); return false;" style="color: var(--accent); font-family: monospace;">${escapeHtml(job.retry_of.slice(0, 10))}...</a></div>` : ''}
+          ${job.retried_by ? `<div>↳ <strong>Retried by:</strong> <a href="#" onclick="openJobModal('${escapeHtml(job.retried_by)}'); return false;" style="color: var(--accent); font-family: monospace;">${escapeHtml(job.retried_by.slice(0, 10))}...</a></div>` : ''}
+        </div>
+      `;
+    }
+
+    if (job.error) {
+      html += `
+        <div style="background: rgba(244, 33, 46, 0.08); border: 1px solid var(--danger); border-radius: var(--radius-md); padding: 14px; margin-bottom: 20px;">
+          <div style="font-weight: 600; color: var(--danger); font-size: 13px; margin-bottom: 6px;">Failure Diagnostic</div>
+          <div style="font-family: monospace; font-size: 12px; color: var(--text); white-space: pre-wrap; word-break: break-all;">${escapeHtml(job.error)}</div>
+        </div>
+      `;
+    }
+
+    html += `
+      <div style="margin-bottom: 24px;">
+        <h4 style="font-size: 14px; font-weight: 600; margin-bottom: 12px;">Pipeline Stage Progression</h4>
+        ${stages.length > 0 ? `
+          <div class="timeline-stepper">
+            ${stages.map((st, idx) => {
+              const isLast = idx === stages.length - 1;
+              let dotClass = 'timeline-dot';
+              if (isLast && (job.status === 'failed' || job.status === 'cancelled')) {
+                dotClass += ' failed';
+              } else if (isLast && job.status === 'running') {
+                dotClass += ' active';
+              } else {
+                dotClass += ' completed';
+              }
+              const stageName = typeof st === 'string' ? st : (st.stage || 'Unknown');
+              const stageTime = typeof st === 'object' && st.at ? st.at.replace('T', ' ').slice(11, 19) : '';
+              return `
+                <div class="timeline-step">
+                  <div class="${dotClass}"></div>
+                  <div class="timeline-content">
+                    <div class="timeline-title">${escapeHtml(stageName)}</div>
+                    ${stageTime ? `<div class="timeline-time">${escapeHtml(stageTime)}</div>` : ''}
+                  </div>
+                </div>
+              `;
+            }).join('')}
+          </div>
+        ` : '<p style="color: var(--text-muted); font-size: 13px;">No stage events recorded.</p>'}
+      </div>
+    `;
+
+    html += `
+      <div style="display: flex; gap: 10px; justify-content: flex-end; align-items: center; border-top: 1px solid var(--border); padding-top: 16px;">
+        ${(job.status === 'pending' || job.status === 'running') ? `
+          <button class="btn btn-danger" onclick="cancelJobById('${escapeHtml(job.id)}')">Cancel Job</button>
+        ` : ''}
+        ${canRetry ? `
+          <button class="btn btn-primary" onclick="retryJob('${escapeHtml(job.id)}')">Retry Job</button>
+        ` : ''}
+        <button class="btn btn-secondary" onclick="viewJobLogDirect('${escapeHtml(job.id)}')">View Full Log</button>
+        <button class="btn btn-secondary" onclick="document.getElementById('job-detail-modal').close()">Close</button>
+      </div>
+    `;
+
+    body.innerHTML = html;
+    modal.showModal();
+  } catch (e) {
+    showNotification(`Could not load job details: ${e.message}`, 'error');
+  }
+}
+
+function viewJobLogDirect(id) {
+  const modal = document.getElementById('job-detail-modal');
+  if (modal && modal.open) modal.close();
+  const navBtns = document.querySelectorAll('.nav-btn');
+  navBtns.forEach(b => b.classList.remove('active'));
+  const logsBtn = document.querySelector('.nav-btn[data-page="logs"]');
+  if (logsBtn) logsBtn.classList.add('active');
+  currentPage = 'logs';
+  renderPage('logs');
+  setTimeout(() => viewPastLog(id), 100);
 }
 
 // --------------------------------------------------------------------------

@@ -66,6 +66,11 @@ def work(action: str, key: str) -> None:
                 )
                 store.put("videos", key, record)
                 LOG.info("Upload complete for %s -> %s", key, vid_id)
+                agent.emit_summary({
+                    "status": "completed",
+                    "video_id": vid_id,
+                    "message": "Uploaded to YouTube successfully",
+                })
 
                 # Without this, an upload triggered from the Studio (as
                 # opposed to a full core.agent run) never reaches state.json —
@@ -84,11 +89,13 @@ def work(action: str, key: str) -> None:
                     })
 
             except Exception as e:
+                agent.emit_summary({"status": "failed", "message": str(e)})
                 record.update(status="failed", error=str(e))
                 store.put("videos", key, record)
                 raise
 
         elif action == "render":
+            agent.emit_progress("Preparing render")
             record["status"] = "rendering"
             record["error"] = ""
             store.put("videos", key, record)
@@ -104,6 +111,7 @@ def work(action: str, key: str) -> None:
 
                 cand = record.get("candidate", {})
                 if cand.get("kind") == "story":
+                    agent.emit_progress("Compositing story card")
                     render_config = apply_style_preset(config, preset) if preset else config
                     render_story.render_story(
                         headline=record["headline"],
@@ -128,6 +136,7 @@ def work(action: str, key: str) -> None:
                             raw_clip = Path(record.get("raw_video", record["video"]))
 
                     if not preset:
+                        agent.emit_progress("Analyzing source aspect ratio")
                         source_aspect = get_source_aspect_ratio(raw_clip)
                         if source_aspect is not None:
                             preset = match_style_preset_to_aspect(source_aspect)
@@ -144,9 +153,12 @@ def work(action: str, key: str) -> None:
                                 raw_clip.name,
                             )
                             preset = choose_style_preset()
+                    else:
+                        agent.emit_progress(f"Applying style preset ({preset_name})")
 
                     render_config = apply_style_preset(config, preset)
 
+                    agent.emit_progress("Compositing video card")
                     render.render(
                         video=raw_clip,
                         headline=record["headline"],
@@ -155,6 +167,7 @@ def work(action: str, key: str) -> None:
                         poster=new_poster,
                     )
 
+                agent.emit_progress("Finalizing render")
                 record.update(
                     status="ready",
                     video=str(new_mp4),
@@ -165,13 +178,20 @@ def work(action: str, key: str) -> None:
                 )
                 store.put("videos", key, record)
                 LOG.info("Re-render complete for %s -> %s", key, new_mp4)
+                agent.emit_summary({
+                    "status": "completed",
+                    "video": str(new_mp4),
+                    "message": "Render completed successfully",
+                })
 
             except Exception as e:
+                agent.emit_summary({"status": "failed", "message": str(e)})
                 record.update(status="render_failed", error=str(e))
                 store.put("videos", key, record)
                 raise
         else:
             raise ValueError(f"Unknown worker action: {action}")
+
 
 if __name__ == "__main__":
     if len(sys.argv) < 3:

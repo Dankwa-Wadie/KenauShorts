@@ -605,3 +605,82 @@ dialog::backdrop {
   color: var(--text-muted);
   margin-top: 6px;
 }
+
+/* Job Badges & Status Pills */
+.status-pill.completed { color: var(--success); }
+.status-pill.running { color: var(--accent); }
+.status-pill.pending { color: var(--warning); }
+.status-pill.cancelled { color: var(--text-muted); }
+.status-pill.interrupted { color: var(--warning); }
+.status-pill.idle { color: var(--text-dim); }
+
+.job-badge {
+  display: inline-block;
+  padding: 3px 8px;
+  border-radius: 12px;
+  font-size: 11px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+}
+.job-badge.completed { background: rgba(0, 186, 124, 0.15); color: var(--success); border: 1px solid rgba(0, 186, 124, 0.3); }
+.job-badge.running { background: rgba(29, 155, 240, 0.15); color: var(--accent); border: 1px solid rgba(29, 155, 240, 0.3); }
+.job-badge.pending { background: rgba(245, 158, 11, 0.15); color: var(--warning); border: 1px solid rgba(245, 158, 11, 0.3); }
+.job-badge.failed { background: rgba(244, 33, 46, 0.15); color: var(--danger); border: 1px solid rgba(244, 33, 46, 0.3); }
+.job-badge.cancelled { background: rgba(139, 148, 158, 0.15); color: var(--text-muted); border: 1px solid rgba(139, 148, 158, 0.3); }
+.job-badge.interrupted { background: rgba(245, 158, 11, 0.15); color: var(--warning); border: 1px solid rgba(245, 158, 11, 0.3); }
+.job-badge.idle { background: rgba(87, 96, 106, 0.15); color: var(--text-dim); border: 1px solid rgba(87, 96, 106, 0.3); }
+
+/* Timeline Stepper */
+.timeline-stepper {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  position: relative;
+  padding-left: 20px;
+  margin: 16px 0;
+}
+.timeline-stepper::before {
+  content: '';
+  position: absolute;
+  top: 6px;
+  bottom: 6px;
+  left: 6px;
+  width: 2px;
+  background: var(--border);
+}
+.timeline-step {
+  position: relative;
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  font-size: 13px;
+}
+.timeline-dot {
+  position: absolute;
+  left: -20px;
+  top: 4px;
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  background: var(--accent);
+  box-shadow: 0 0 6px var(--accent-glow);
+}
+.timeline-dot.final {
+  background: var(--success);
+  box-shadow: 0 0 6px rgba(0, 186, 124, 0.4);
+}
+.timeline-dot.failed {
+  background: var(--danger);
+  box-shadow: 0 0 6px rgba(244, 33, 46, 0.4);
+}
+.timeline-time {
+  font-size: 11px;
+  color: var(--text-muted);
+  font-family: var(--font-mono);
+}
+
+.btn-sm {
+  padding: 4px 10px;
+  font-size: 12px;
+}

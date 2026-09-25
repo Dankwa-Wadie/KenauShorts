@@ -12,6 +12,29 @@ what's actually on `origin/main`.
 
 ## Current state (update this section each handoff)
 
+- **Stage 4 Completed (Pipeline & Job Management)**:
+  - **Persistent Job Execution Metadata**: SQLite `jobs` records now track `started_at` (populated at `pending -> running` transition), `finished_at` (populated on all terminal outcomes: completed, failed, cancelled, interrupted), and execution `duration_seconds` (`round(finished - started, 1)` strictly execution time, distinct from queue wait time).
+  - **Pipeline Stage Timeline**: Capped at 50 events (`job["stages"]`) with consecutive stage deduplication. Every state transition, worker step, and agent step records timestamped progress.
+  - **Structured Failure Diagnostics**: 4-tier fallback extraction (`KENAU_SUMMARY` message -> exception/error keyword -> non-zero exit code -> log tail). Automatic secret redaction for API keys (Google `AIza...`, OpenAI `sk-...`), bearer tokens (`Bearer ...`), and sensitive query parameters.
+  - **Persistent Job History API**: Added `GET /api/jobs` supporting `status` filtering (`all`, `pending`, `running`, `completed`, `failed`, `cancelled`, `idle`, `interrupted`) and `limit` parameter (1 to 200). Serves lightweight records with logs capped at 500 characters, while `/api/job?id=` provides full logs.
+  - **Retry of Eligible Terminal Jobs**: `POST /api/job/retry` under `GUARD` reconstructs commands from semantic inputs (`action`, `key`, `extra`) using current `sys.executable`. Links `new_job["retry_of"]` and `source_job["retried_by"]`. Rejects active (`pending`, `running`) or already succeeded (`completed`, `idle`) jobs. Rejects duplicate active retries. Preserves immutable history on original records.
+  - **Queue Management Visibility & Cancellation by ID**: `POST /api/job/cancel` accepts `{ "id": job_id }` to cancel specific pending or running jobs. Immediate process termination, artifact cleanup, queue unblocking, and queue event signalling.
+  - **Worker Progress Reporting**: `studio/worker.py` emits `agent.emit_progress()` stages (`Preparing render`, `Applying style preset`, `Compositing video card`, `Finalizing render`) and `agent.emit_summary()` structured payloads for render and upload actions.
+  - **Pipeline & Queue Studio UI**: Added first-class "Pipeline & Queue" tab (`data-page="queue"`), real-time active execution card, queued tasks list with position badges and individual cancel buttons, execution history table with filter tabs (`All`, `Completed`, `Failed`, `Cancelled`), and comprehensive Job Detail modal (`#job-detail-modal`) with stage progression stepper, diagnostic failure box, retry actions, and direct log viewer link.
+  - **Test Suite**:
+    - `tests/test_stage4_pipeline.py`: 14/14 tests passed (0.7s).
+    - `tests/test_stage3_reliability.py`: 12/12 tests passed (4.8s).
+    - `tests/test_stage2_queue_cancel.py`: 11/11 tests passed (6.1s).
+    - `tests/test_style_presets.py`: 14/14 tests passed (0.2s).
+    - Full test suite: 120 tests total, 112 passed, 0 failures, 8 known environment-specific errors/skips (6 NVENC, 1 macOS, 1 flaky socket timing).
+  - **Live Runtime Verification**: Verified against running server at `http://127.0.0.1:8766/`:
+    1. Normal job: Real YouTube download and ffmpeg composite rendered (`out/short_1790361134_yt_Ba_vdCp.mp4`) with `status: completed`, `duration_seconds: 158.7s`, 7 stages.
+    2. Multiple queued jobs: Enqueued `j1` and `j2`, verified positions, cancelled `j2` from queue.
+    3. Active cancellation: Cancelled running job, verified `status: cancelled`, `stage: Cancelled by user`, `duration_seconds: 1.4s`.
+    4. Controlled failure: Triggered failing worker job, verified `status: failed`, clean diagnostic `ValueError: Video nonexistent_draft_999 not found`.
+    5. Retry: Retried cancelled job, verified new job created with `retry_of` and `retried_by` linkage.
+    6. Persistent job history API: Retrieved `/api/jobs` with pagination and status filters.
+    7. Server-lock mutual exclusion: Confirmed second instance rejected cleanly with `.server.lock` (`[Errno 13] Permission denied`).
 - **Manual Style Preset Override in Studio UI (Completed)**:
   - Backend validation: Updated `/api/video` POST handler in `studio/server.py` to validate `style_preset` against known presets in `STYLE_PRESETS` or empty string (`""` / `None` for Auto), rejecting invalid preset names or non-string values with a clear error.
   - Re-rendering with preset: Updated `studio/worker.py`'s `"render"` action to read `record.get("style_preset")`. When a preset is set on the record, it applies that preset directly (skipping aspect probing). If unset/empty (`""`), it performs aspect-ratio matching (or fallback) automatically. Also preserves the original `raw_video` reference for future re-renders.

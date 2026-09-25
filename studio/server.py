@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import contextlib
 import copy
+import datetime as dt
 import json
 import logging
 import mimetypes
@@ -110,6 +111,10 @@ def redact(text: str) -> str:
         except Exception:
             pass
     text = re.sub(r"(https?://\S+)[?]\S+", r"\1?[hidden]", text)
+    text = re.sub(r"AIza[0-9A-Za-z_-]{30,40}", "[REDACTED_KEY]", text)
+    text = re.sub(r"sk-[a-zA-Z0-9_-]{20,}", "[REDACTED_KEY]", text)
+    text = re.sub(r"(?i)bearer\s+ya29\.[a-zA-Z0-9_.-]+", "Bearer [REDACTED_TOKEN]", text)
+    text = re.sub(r"(?i)bearer\s+[a-zA-Z0-9_.-]{15,}", "Bearer [REDACTED_TOKEN]", text)
     text = re.sub(r"(?i)(key|token|secret|authorization)([=: ]+)[^\s,]+", r"\1\2[hidden]", text)
     return text[-8000:]
 
@@ -268,6 +273,77 @@ def cleanup_job_artifacts(job: dict) -> None:
             except Exception as e:
                 LOG.warning("Failed to clean up artifact %s: %s", path_str, e)
 
+def append_job_stage(job: dict, stage: str, timestamp: str | None = None) -> None:
+    """Append a new stage to job['stages'] if changed, capped at 50 entries."""
+    if not stage:
+        return
+    at = timestamp or store.now()
+    stages = job.setdefault("stages", [])
+    if stages and stages[-1].get("stage") == stage:
+        stages[-1]["at"] = at
+        return
+    stages.append({"stage": stage, "at": at})
+    if len(stages) > 50:
+        job["stages"] = stages[-50:]
+
+def compute_duration_seconds(started_at: str | None, finished_at: str | None) -> float | None:
+    """Calculate actual execution duration in seconds (started_at to finished_at)."""
+    if not started_at or not finished_at:
+        return None
+    try:
+        s = dt.datetime.fromisoformat(started_at).timestamp()
+        f = dt.datetime.fromisoformat(finished_at).timestamp()
+        return max(0.0, round(f - s, 1))
+    except Exception:
+        return None
+
+def extract_diagnostic_error(log_input: list[str] | str, returncode: int | None = None) -> str:
+    """Extract the most descriptive error line from recent log lines."""
+    if isinstance(log_input, str):
+        log_lines = log_input.splitlines()
+    elif isinstance(log_input, list):
+        log_lines = log_input
+    else:
+        log_lines = []
+
+    if not log_lines:
+        if returncode is not None and returncode != 0:
+            return f"Process exited with code {returncode}"
+        return "Process terminated with error"
+
+    # Priority 1: KENAU_SUMMARY message if failed
+    for line in reversed(log_lines):
+        clean = line.strip()
+        if "KENAU_SUMMARY:" in clean:
+            try:
+                json_part = clean.split("KENAU_SUMMARY:", 1)[1].strip()
+                data = json.loads(json_part)
+                if data.get("status") == "failed" and data.get("message"):
+                    return redact(data["message"])
+            except Exception:
+                pass
+
+    # Priority 2: Exception or error keywords
+    for line in reversed(log_lines[-30:]):
+        clean = line.strip()
+        if not clean:
+            continue
+        lower = clean.lower()
+        if any(err_kw in lower for err_kw in ("error:", "exception:", "traceback", "failed:", "fatal:")):
+            return redact(clean)
+
+    # Priority 3: Non-zero exit code
+    if returncode is not None and returncode != 0:
+        return f"Process exited with code {returncode}"
+
+    # Priority 4: Last non-empty line
+    for line in reversed(log_lines[-5:]):
+        clean = line.strip()
+        if clean:
+            return redact(clean)
+
+    return "Process terminated with error"
+
 def run_job_process(job: dict, command: list[str]) -> None:
     global ACTIVE_JOB, ACTIVE_PROC
     log_lines = []
@@ -291,17 +367,32 @@ def run_job_process(job: dict, command: list[str]) -> None:
         )
 
         with GUARD:
+            current = store.get("jobs", job["id"])
+            if current and current.get("status") == "cancelled":
+                terminate_process_tree(proc.pid)
+                cleanup_job_artifacts(job)
+                ACTIVE_PROC = None
+                ACTIVE_JOB = None
+                return
             ACTIVE_PROC = proc
             job["pid"] = proc.pid
             job["pid_created_at"] = get_process_creation_time(proc.pid)
             store.put("jobs", job["id"], job)
 
         for line in proc.stdout:
+            with GUARD:
+                current = store.get("jobs", job["id"])
+                if current and current.get("status") == "cancelled":
+                    terminate_process_tree(proc.pid)
+                    break
             line_str = line.strip()
             if line_str.startswith("KENAU_PROGRESS "):
                 try:
                     p = json.loads(line_str[15:])
-                    job["stage"] = p.get("stage", job["stage"])
+                    new_stage = p.get("stage")
+                    if new_stage:
+                        job["stage"] = new_stage
+                        append_job_stage(job, new_stage)
                 except Exception:
                     pass
             elif line_str.startswith("KENAU_SUMMARY "):
@@ -322,9 +413,12 @@ def run_job_process(job: dict, command: list[str]) -> None:
 
         with GUARD:
             current = store.get("jobs", job["id"]) or job
+            finished_at = store.now()
             if current.get("status") == "cancelled":
                 job["status"] = "cancelled"
                 job["stage"] = current.get("stage", "Cancelled")
+                job["error"] = current.get("error") or "Cancelled by user"
+                append_job_stage(job, job["stage"], finished_at)
                 cleanup_job_artifacts(job)
             else:
                 summary = job.get("summary") or {}
@@ -334,20 +428,31 @@ def run_job_process(job: dict, command: list[str]) -> None:
                 if summary_status == "failed":
                     job["status"] = "failed"
                     job["stage"] = f"Failed: {summary_msg}" if summary_msg else "Failed"
+                    job["error"] = summary_msg or "Pipeline step failed"
+                    append_job_stage(job, job["stage"], finished_at)
                 elif summary_status == "idle":
                     job["status"] = "idle"
                     job["stage"] = f"Idle: {summary_msg}" if summary_msg else "Idle: No new candidates"
+                    job["error"] = ""
+                    append_job_stage(job, job["stage"], finished_at)
                 elif summary_status in ("completed", "ok"):
                     job["status"] = "completed"
                     job["stage"] = "Completed"
+                    job["error"] = ""
+                    append_job_stage(job, "Completed", finished_at)
                 elif code == 0:
                     job["status"] = "completed"
                     job["stage"] = "Completed"
+                    job["error"] = ""
+                    append_job_stage(job, "Completed", finished_at)
                 else:
                     job["status"] = "failed"
                     job["stage"] = "Failed"
+                    job["error"] = extract_diagnostic_error(log_lines, returncode=code)
+                    append_job_stage(job, "Failed", finished_at)
 
-            job["finished_at"] = store.now()
+            job["finished_at"] = finished_at
+            job["duration_seconds"] = compute_duration_seconds(job.get("started_at"), finished_at)
             job["log_file"] = f"{job['id']}.log"
             store.put("jobs", job["id"], job)
             ACTIVE_JOB = None
@@ -356,22 +461,29 @@ def run_job_process(job: dict, command: list[str]) -> None:
     except Exception as e:
         with GUARD:
             current = store.get("jobs", job["id"]) or job
+            finished_at = store.now()
             if current.get("status") == "cancelled":
                 job["status"] = "cancelled"
                 job["stage"] = current.get("stage", "Cancelled")
+                job["error"] = current.get("error") or "Cancelled by user"
+                append_job_stage(job, job["stage"], finished_at)
                 cleanup_job_artifacts(job)
             else:
                 job["status"] = "failed"
                 job["stage"] = "Failed"
+                job["error"] = redact(str(e))
+                append_job_stage(job, "Failed", finished_at)
                 error_line = f"Error: {redact(str(e))}"
                 log_lines.append(error_line)
                 write_full_log()
                 job["log"] = "\n".join(log_lines[-200:])
-            job["finished_at"] = store.now()
+            job["finished_at"] = finished_at
+            job["duration_seconds"] = compute_duration_seconds(job.get("started_at"), finished_at)
             job["log_file"] = f"{job['id']}.log"
             store.put("jobs", job["id"], job)
             ACTIVE_JOB = None
             ACTIVE_PROC = None
+
     finally:
         if proc and proc.stdout:
             try:
@@ -408,8 +520,11 @@ def queue_worker_loop() -> None:
                     if candidate:
                         fresh = store.get("jobs", candidate["id"])
                         if fresh and fresh.get("status") == "pending":
+                            now_ts = store.now()
                             fresh["status"] = "running"
                             fresh["stage"] = "Starting"
+                            fresh["started_at"] = fresh.get("started_at") or now_ts
+                            append_job_stage(fresh, "Starting", now_ts)
                             store.put("jobs", fresh["id"], fresh)
                             ACTIVE_JOB = fresh
                             job_to_run = fresh
@@ -435,12 +550,17 @@ def queue_worker_loop() -> None:
                     run_job_process(job_to_run, command_to_run)
                 else:
                     with GUARD:
+                        finished_at = store.now()
                         job_to_run["status"] = "failed"
                         job_to_run["stage"] = "Failed (Missing command)"
-                        job_to_run["finished_at"] = store.now()
+                        job_to_run["error"] = "Missing command"
+                        append_job_stage(job_to_run, "Failed (Missing command)", finished_at)
+                        job_to_run["finished_at"] = finished_at
+                        job_to_run["duration_seconds"] = compute_duration_seconds(job_to_run.get("started_at"), finished_at)
                         store.put("jobs", job_to_run["id"], job_to_run)
                         ACTIVE_JOB = None
                 continue
+
 
             QUEUE_EVENT.wait(timeout=2.0)
             QUEUE_EVENT.clear()
@@ -468,9 +588,13 @@ def cancel_job(job_id: str | None = None) -> dict:
         if ACTIVE_JOB and ACTIVE_JOB.get("id") == job_id:
             pid = ACTIVE_JOB.get("pid")
             pid_created_at = ACTIVE_JOB.get("pid_created_at")
+            finished_at = store.now()
             ACTIVE_JOB["status"] = "cancelled"
             ACTIVE_JOB["stage"] = "Cancelled by user"
-            ACTIVE_JOB["finished_at"] = store.now()
+            ACTIVE_JOB["error"] = "Cancelled by user"
+            append_job_stage(ACTIVE_JOB, "Cancelled by user", finished_at)
+            ACTIVE_JOB["finished_at"] = finished_at
+            ACTIVE_JOB["duration_seconds"] = compute_duration_seconds(ACTIVE_JOB.get("started_at"), finished_at)
             store.put("jobs", job_id, ACTIVE_JOB)
 
             if pid:
@@ -481,6 +605,9 @@ def cancel_job(job_id: str | None = None) -> dict:
                 except Exception:
                     pass
             cleanup_job_artifacts(ACTIVE_JOB)
+            ACTIVE_JOB = None
+            ACTIVE_PROC = None
+            QUEUE_EVENT.set()
             return {"status": "cancelled", "id": job_id, "message": "Active job cancelled"}
 
         # Case 2: Job in store (pending or other)
@@ -490,22 +617,42 @@ def cancel_job(job_id: str | None = None) -> dict:
 
         status = job.get("status")
         if status == "pending":
+            finished_at = store.now()
             job["status"] = "cancelled"
             job["stage"] = "Cancelled from queue"
-            job["finished_at"] = store.now()
+            job["error"] = "Cancelled from queue"
+            append_job_stage(job, "Cancelled from queue", finished_at)
+            job["finished_at"] = finished_at
+            job["started_at"] = None
+            job["duration_seconds"] = 0.0
             store.put("jobs", job_id, job)
             return {"status": "cancelled", "id": job_id, "message": "Pending job removed from queue"}
 
         if status == "running":
             pid = job.get("pid")
             pid_created_at = job.get("pid_created_at")
+            if not pid and ACTIVE_PROC and ACTIVE_PROC.pid:
+                pid = ACTIVE_PROC.pid
+            finished_at = store.now()
             job["status"] = "cancelled"
             job["stage"] = "Cancelled by user"
-            job["finished_at"] = store.now()
+            job["error"] = "Cancelled by user"
+            append_job_stage(job, "Cancelled by user", finished_at)
+            job["finished_at"] = finished_at
+            job["duration_seconds"] = compute_duration_seconds(job.get("started_at"), finished_at)
             store.put("jobs", job_id, job)
             if pid:
                 terminate_process_tree(pid, expected_created_at=pid_created_at)
+            if ACTIVE_PROC and ACTIVE_PROC.poll() is None:
+                try:
+                    ACTIVE_PROC.kill()
+                except Exception:
+                    pass
             cleanup_job_artifacts(job)
+            if ACTIVE_JOB and ACTIVE_JOB.get("id") == job_id:
+                ACTIVE_JOB = None
+                ACTIVE_PROC = None
+            QUEUE_EVENT.set()
             return {"status": "cancelled", "id": job_id, "message": "Job cancelled"}
 
         return {"status": status, "id": job_id, "message": f"Job is already {status}"}
@@ -539,6 +686,7 @@ def start_job(action: str, key: str = "", automatic: bool = False, extra: dict |
 
     with GUARD:
         job_id = uuid.uuid4().hex
+        now_ts = store.now()
         job = {
             "id": job_id,
             "action": action,
@@ -547,7 +695,12 @@ def start_job(action: str, key: str = "", automatic: bool = False, extra: dict |
             "extra": extra or {},
             "status": "pending",
             "stage": "Queued",
-            "created_at": store.now(),
+            "stages": [{"stage": "Queued", "at": now_ts}],
+            "created_at": now_ts,
+            "started_at": None,
+            "finished_at": None,
+            "duration_seconds": None,
+            "error": "",
             "automatic": automatic,
             "log": "",
         }
@@ -564,6 +717,95 @@ def start_job(action: str, key: str = "", automatic: bool = False, extra: dict |
         res = dict(job)
         res["queue_position"] = 0 if is_immediate else pos
         return res
+
+def retry_job(source_id: str) -> dict:
+    with GUARD:
+        source_job = store.get("jobs", source_id)
+        if not source_job:
+            raise ValueError(f"Job not found: {source_id}")
+
+        status = source_job.get("status")
+        if status in ("pending", "running"):
+            raise ValueError(f"Cannot retry job in '{status}' status (must be failed, cancelled, or interrupted)")
+        if status in ("completed", "idle"):
+            raise ValueError(f"Cannot retry job in '{status}' status (already succeeded or idle)")
+        if status not in ("failed", "cancelled", "interrupted"):
+            raise ValueError(f"Cannot retry job in '{status}' status")
+
+        # Check if this job already has a retry pending or running
+        retried_by_id = source_job.get("retried_by")
+        if retried_by_id:
+            retried_job = store.get("jobs", retried_by_id)
+            if retried_job and retried_job.get("status") in ("pending", "running"):
+                raise ValueError("An active retry for this job is already queued or running")
+
+        action = source_job.get("action", "")
+        key = source_job.get("key", "")
+        extra = source_job.get("extra", {})
+
+        # Reconstruct command safely from semantic inputs
+        python = sys.executable
+        if action in ("preview", "run"):
+            command = [python, "-u", "-m", "core.agent"]
+            if action == "preview":
+                command.append("--dry-run")
+        elif action in ("upload", "render"):
+            command = [python, "-u", "-m", "studio.worker", action, key]
+        elif action == "youtube_connect":
+            command = [python, "-u", "-m", "core.youtube_auth"]
+        elif action == "manual":
+            url = extra.get("url", "")
+            if not url:
+                raise ValueError("A video URL is required.")
+            command = [python, "-u", "-m", "core.agent", "--dry-run", "--url", url]
+            headline = extra.get("headline", "")
+            description = extra.get("description", "")
+            if headline:
+                command += ["--headline", headline]
+            if description:
+                command += ["--description", description]
+        else:
+            raise ValueError(f"Cannot retry unknown job action: {action}")
+
+        now_ts = store.now()
+        new_job_id = uuid.uuid4().hex
+        new_job = {
+            "id": new_job_id,
+            "action": action,
+            "command": command,
+            "key": key,
+            "extra": extra,
+            "status": "pending",
+            "stage": "Queued",
+            "stages": [{"stage": "Queued", "at": now_ts}],
+            "created_at": now_ts,
+            "started_at": None,
+            "finished_at": None,
+            "duration_seconds": None,
+            "error": "",
+            "automatic": False,
+            "log": "",
+            "retry_of": source_id,
+        }
+        store.put("jobs", new_job_id, new_job)
+
+        source_job["retried_by"] = new_job_id
+        source_job["retried_at"] = now_ts
+        store.put("jobs", source_id, source_job)
+
+        ensure_queue_worker()
+        QUEUE_EVENT.set()
+
+        records = store.records("jobs")
+        pending = [j for j in records if j.get("status") == "pending"]
+        pending.sort(key=lambda j: j.get("created_at", ""))
+        pos = next((i + 1 for i, j in enumerate(pending) if j.get("id") == new_job_id), 1)
+
+        is_immediate = (ACTIVE_JOB is None and not store.busy() and pos == 1)
+        res = dict(new_job)
+        res["queue_position"] = 0 if is_immediate else pos
+        return res
+
 
 def automation_loop() -> None:
     while not STOP_EVENT.is_set():
@@ -814,6 +1056,27 @@ class StudioHandler(BaseHTTPRequestHandler):
                 })
             return
 
+        if path == "/api/jobs":
+            with GUARD:
+                status_filter = query.get("status", ["all"])[0].strip().lower()
+                valid_statuses = {"all", "pending", "running", "completed", "failed", "cancelled", "idle", "interrupted"}
+                if status_filter not in valid_statuses:
+                    self.send_json({"error": f"Invalid status filter. Must be one of {sorted(valid_statuses)}"}, 400)
+                    return
+                try:
+                    limit = min(200, max(1, int(query.get("limit", [50])[0])))
+                except ValueError:
+                    limit = 50
+                raw_jobs = store.jobs_list(limit=limit, status=status_filter if status_filter != "all" else None)
+                lightweight_jobs = []
+                for j in raw_jobs:
+                    item = dict(j)
+                    if "log" in item and len(item["log"]) > 500:
+                        item["log"] = item["log"][-500:]
+                    lightweight_jobs.append(item)
+                self.send_json(lightweight_jobs)
+            return
+
         if path == "/api/videos":
             records = store.records("videos")
             self.send_json(records)
@@ -995,9 +1258,20 @@ class StudioHandler(BaseHTTPRequestHandler):
         if path == "/api/job/cancel":
             return cancel_job(data.get("id"))
 
+        if path == "/api/job/retry":
+            source_id = data.get("id")
+            if not source_id:
+                raise ValueError("Missing job id to retry")
+            return retry_job(source_id)
+
         if path == "/api/job":
             if data.get("action") == "cancel":
                 return cancel_job(data.get("id"))
+            if data.get("action") == "retry":
+                source_id = data.get("id")
+                if not source_id:
+                    raise ValueError("Missing job id to retry")
+                return retry_job(source_id)
             return start_job(data.get("action", ""), data.get("key", ""), extra=data)
             
         if path == "/api/video":
@@ -1267,10 +1541,14 @@ def recover_interrupted_jobs() -> None:
                 if is_python_process(pid):
                     LOG.info("Terminating orphan process tree for PID %d from interrupted job %s", pid, job["id"])
                     terminate_process_tree(pid, expected_created_at=pid_created_at)
+            finished_at = store.now()
+            append_job_stage(job, "Interrupted by server restart", finished_at)
             job.update(
                 status="interrupted",
                 stage="Interrupted by server restart",
-                finished_at=store.now(),
+                finished_at=finished_at,
+                duration_seconds=compute_duration_seconds(job.get("started_at"), finished_at),
+                error="The previous job was interrupted by server restart. Review before retrying.",
             )
             store.put("jobs", job["id"], job)
 
