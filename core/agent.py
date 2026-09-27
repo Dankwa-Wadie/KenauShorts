@@ -849,8 +849,11 @@ def upload_to_youtube(
     privacy: str,
     token_path: Path,
     category_id: str = "28",
+    on_session_created: Any = None,
+    resumable_uri: str | None = None,
+    chunksize: int = 5 * 1024 * 1024,
 ) -> str | None:
-    """Upload completed video to YouTube Shorts."""
+    """Upload completed video to YouTube Shorts with resumable recovery support."""
     emit_progress("Uploading to YouTube")
     if not token_path.exists():
         raise FileNotFoundError("YouTube token.json not found. Authorize YouTube via Studio first.")
@@ -875,16 +878,36 @@ def upload_to_youtube(
         },
     }
 
-    media = MediaFileUpload(str(video_path), chunksize=-1, resumable=True, mimetype="video/mp4")
+    media = MediaFileUpload(str(video_path), chunksize=chunksize, resumable=True, mimetype="video/mp4")
     request = youtube.videos().insert(part="snippet,status", body=body, media_body=media)
+    if resumable_uri:
+        request.resumable_uri = resumable_uri
 
     response = None
+    session_notified = bool(resumable_uri)
     while response is None:
-        status, response = request.next_chunk()
+        try:
+            status, response = request.next_chunk()
+        except Exception as e:
+            if getattr(request, "resumable_uri", None) and on_session_created and not session_notified:
+                try:
+                    on_session_created(request.resumable_uri)
+                    session_notified = True
+                except Exception:
+                    pass
+            raise
+
+        if getattr(request, "resumable_uri", None) and on_session_created and not session_notified:
+            try:
+                on_session_created(request.resumable_uri)
+                session_notified = True
+            except Exception:
+                pass
+
         if status:
             emit_progress(f"Uploading ({int(status.progress() * 100)}%)")
 
-    video_id = response.get("id")
+    video_id = response.get("id") if response else None
     LOG.info("Uploaded successfully! Video ID: %s", video_id)
     return video_id
 
@@ -1122,7 +1145,7 @@ def run_pipeline(config_path: Path, dry_run: bool = False) -> None:
         video_id = ""
         if not dry_run:
             token_path = ROOT / "token.json"
-            privacy = config.get("posting", {}).get("privacy", "private")
+            privacy = config.get("posting", {}).get("privacy", "public")
             tags = config.get("posting", {}).get("tags", []) + pick.hashtags
             try:
                 video_id = upload_to_youtube(final_mp4, pick.title, pick.description, tags, privacy, token_path)

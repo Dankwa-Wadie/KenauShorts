@@ -12,6 +12,48 @@ what's actually on `origin/main`.
 
 ## Current state (update this section each handoff)
 
+- **Stage 6 Completed (Reliable YouTube Publishing, Resumable Upload Recovery, OAuth Health & Approval-Gated Automation)**:
+  - **Multi-Layer Human Approval Enforcement**: Strictly prohibits publishing unreviewed or rejected videos. Human review decision (`review_status == "approved"`) is independently validated in `studio/server.py` (`start_job`, `retry_job`), `studio/worker.py` (before any YouTube upload call or network touch), and `studio/web/app.js` (Upload button is disabled for unapproved videos). Automation loop operates strictly in `preview` or `publish_approved` mode; no bypass or auto-approval mechanism exists.
+  - **Resumable Upload Recovery with Google's Supported Protocol**: Implemented resilient resumable uploads via `core/agent.py` (`upload_to_youtube`) with a 5MB chunksize (`MediaFileUpload(..., chunksize=5*1024*1024, resumable=True)`), session URI capture callback (`on_session_created`), and recovery query using standard authorized HTTP `PUT` with `Content-Range: bytes */size` and `Content-Length: 0`:
+    - `HTTP 200/201`: Video upload completed; parses video ID, marks video `uploaded`, sets canonical YouTube URL, and clears session.
+    - `HTTP 308 Resume Incomplete`: Resumable session active; records received `Range` header, keeps video in `upload_unknown`, ready for resumption without re-uploading from byte 0.
+    - `HTTP 404/410`: Session expired / gone on Google's side; per YouTube upload protocol, expired sessions do NOT prove video absence, transitioning record to `upload_unresolved` and requiring manual operator confirmation on YouTube Studio.
+    - Network/5xx/Auth failures: Keeps video in `upload_unknown`, preserving session URI for subsequent retry.
+  - **Publishing State Machine & Duplicate Guards (HTTP 409 Conflict)**: Fully hardened against double-clicks, concurrent queue submissions, manual+automation races, and restart races. Validates state before enqueuing upload jobs:
+    - Rejects already `uploaded` videos (`ConflictError` HTTP 409).
+    - Rejects actively `uploading` videos (`ConflictError` HTTP 409).
+    - Rejects `upload_unknown` and `upload_unresolved` videos until reconciled or manually resolved (`ConflictError` HTTP 409).
+    - Rejects concurrent duplicate jobs in queue matching the target video (`ConflictError` HTTP 409).
+    - Validates presence of rendered video artifact on disk prior to queueing.
+    - Enforces retry eligibility: retry of upload jobs strictly blocked if video is unapproved, uploaded, upload_unknown, or upload_unresolved.
+  - **Manual Resolution Mechanism (`POST /api/video/resolve`)**: Explicit operator resolution endpoints for ambiguous publishing states:
+    - `confirm_uploaded`: Requires valid YouTube Video ID or URL; sets video to `uploaded`, derives canonical URL, clears failure state.
+    - `confirm_absent`: Operator confirms video does not exist on YouTube; clears failure reason and session URI, resets status to `ready` allowing a fresh upload.
+  - **Startup Interruption Recovery**: When the server restarts, `recover_interrupted_jobs()` automatically identifies any videos left in `uploading` state and converts them to `upload_unknown` with a clear explanation (`upload_failure_reason`), preventing silent false successes or duplicate uploads.
+  - **Tiered OAuth Health Model & Channel Identity**:
+    - Evaluates OAuth health across distinct states: `not_configured`, `configured`, `healthy`, `expired`, `invalid`, `error`.
+    - Added `POST /api/connections/test` to verify YouTube credentials, refresh tokens securely, query channel identity (`channels.list`), and cache channel details in `studio-channel.json`. Added `youtube.readonly` to OAuth scopes in `core/youtube_auth.py` for identity queries while gracefully handling upload-only tokens.
+  - **YouTube API Quota Model (2026 Rules)**:
+    - Corrected quota accounting to match current 2026 YouTube Data API v3 rules: independent 100-calls/day bucket for `videos.insert` (1 unit/call), independent 100-calls/day bucket for `search.list` (1 unit/call), and 10,000 general units/day for all other methods (`channels.list`, etc.).
+    - Tracks local daily activity in `studio-quota.json` relative to US Pacific Time (midnight PT daily reset).
+    - Distinctly labeled in backend and UI as a local tracker estimate, explicitly noting Google Developer Console as the authoritative source of truth (Google API returns no remaining quota header).
+  - **Studio UI Enhancements**:
+    - Library: Status pills reflect `uploaded` (with direct link to YouTube short), `uploading`, `upload_unknown` (amber), and `upload_unresolved` (red).
+    - Review Modal: Displays publishing privacy selector (`public`, `unlisted`, `private`), disabled upload button for unapproved videos, ambiguous upload diagnostic boxes with "Reconcile Upload Session" and "Resolve Manually" action buttons.
+    - Connections Page: Tiered OAuth status badge, channel identity card with channel ID and link, "Test Connection" button, and 3-bucket 2026 YouTube Quota Tracker card.
+    - Automation Page: Mode selector offers "Preview Only (Generate Drafts)" and "Publish Approved (Upload approved ready videos FIFO)" with clear explanation that human approval is strictly required.
+  - **Test Suite**:
+    - `tests/test_stage6_publishing.py`: 30/30 passed (1.1s).
+    - `tests/test_stage5_library.py`: 15/15 passed (0.9s).
+    - `tests/test_stage4_pipeline.py`: 14/14 passed (0.8s).
+    - `tests/test_stage3_reliability.py`: 12/12 passed (4.5s).
+    - `tests/test_stage2_queue_cancel.py`: 11/11 passed (5.9s).
+    - `tests/test_style_presets.py`: 14/14 passed (0.3s).
+    - Full discovery suite: 165 tests total, 158 passed, 0 failures, 7 known environment-specific errors (6 NVENC, 1 macOS).
+  - **Live Runtime Verification**: Verified live against server at `http://127.0.0.1:8766/`:
+    1. Verified `GET /api/connections` serves tiered OAuth status (`healthy`), channel identity, and local 2026 quota tracker.
+    2. Verified `POST /api/connections/test` tests OAuth credentials, refreshes tokens, and queries channel identity.
+    3. Verified `POST /api/video/reconcile` and `POST /api/video/resolve` handle ambiguous states with CSRF protection.
 - **Stage 5 Completed (Video Library & Review)**:
   - **Editorial Review Status & Separation of Concerns**: Added explicit review state (`unreviewed`, `approved`, `rejected`) strictly decoupled from processing status (`ready`, `rendering`, `uploaded`, `failed`). Existing records default to `unreviewed` (uploaded status does NOT imply approved). Persisted in SQLite `videos` table via `POST /api/video`. Strict validation returns HTTP 400 on invalid values.
   - **Re-render Review State Semantics**: Genuinely re-rendering a card with new style/content resets `review_status` to `"unreviewed"` only upon successful completion. Failed renders preserve the previous review decision.

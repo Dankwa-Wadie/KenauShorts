@@ -657,9 +657,383 @@ def cancel_job(job_id: str | None = None) -> dict:
 
         return {"status": status, "id": job_id, "message": f"Job is already {status}"}
 
+class ConflictError(Exception):
+    """Raised when an operation conflicts with the current state (e.g. uploading an already-uploaded video)."""
+    pass
+
+def job_matches_video(job: dict[str, Any], video_id: str) -> bool:
+    """
+    Deterministic resolution for whether a Stage 4 job is associated with video_id:
+    1. Exact video key match for worker actions ('render', 'upload') or any job where key == video_id.
+    2. Explicit target video metadata in job['summary']['video_id'].
+    3. Validated target artifact stem fallback: Path(job['target_file']).stem == video_id.
+    """
+    if not video_id:
+        return False
+
+    action = job.get("action", "")
+    key = job.get("key", "")
+    if action in ("render", "upload") and key == video_id:
+        return True
+    if key and key == video_id:
+        return True
+    if job.get("extra", {}).get("key") == video_id:
+        return True
+
+    summary = job.get("summary") or {}
+    if summary.get("video_id") == video_id:
+        return True
+
+    target_file = job.get("target_file")
+    if target_file:
+        try:
+            if Path(target_file).stem == video_id:
+                return True
+        except Exception:
+            pass
+
+    return False
+
+def get_latest_job_for_video(video_id: str, jobs: list[dict[str, Any]] | None = None) -> dict[str, Any] | None:
+    """Return the most recent job associated with video_id, or None."""
+    if jobs is None:
+        try:
+            jobs = store.records("jobs")
+        except Exception:
+            return None
+    for j in jobs:
+        if job_matches_video(j, video_id):
+            return j
+    return None
+
+def get_youtube_access_token() -> str | None:
+    """Retrieve or refresh valid access token from token.json."""
+    token_file = ROOT / "token.json"
+    if not token_file.exists():
+        return None
+    try:
+        from google.oauth2.credentials import Credentials
+        from google.auth.transport.requests import Request
+        creds = Credentials.from_authorized_user_file(str(token_file))
+        if creds.expired and creds.refresh_token:
+            creds.refresh(Request())
+            token_file.write_text(creds.to_json(), encoding="utf-8")
+        return creds.token
+    except Exception as e:
+        LOG.warning("Failed to get YouTube access token: %s", e)
+        return None
+
+def check_oauth_health() -> str:
+    """
+    Tiered OAuth health assessment:
+    'not_configured' -> neither client_secret.json nor token.json
+    'configured'     -> client_secret.json present, token.json missing
+    'healthy'        -> token valid or refreshable
+    'expired'        -> expired and no refresh_token
+    'invalid'        -> revoked or malformed
+    'error'          -> other failure
+    """
+    client_secret_file = ROOT / "client_secret.json"
+    token_file = ROOT / "token.json"
+
+    if not client_secret_file.exists() and not token_file.exists():
+        return "not_configured"
+    if client_secret_file.exists() and not token_file.exists():
+        return "configured"
+
+    try:
+        from google.oauth2.credentials import Credentials
+        creds = Credentials.from_authorized_user_file(str(token_file))
+        if not creds:
+            return "invalid"
+        if creds.expired:
+            if not creds.refresh_token:
+                return "expired"
+            return "healthy"
+        return "healthy"
+    except Exception as e:
+        err = str(e).lower()
+        if "invalid_grant" in err or "revoked" in err:
+            return "invalid"
+        if "expired" in err:
+            return "expired"
+        return "error"
+
+def test_youtube_connection() -> dict[str, Any]:
+    """Perform live test of YouTube OAuth credentials and fetch channel identity."""
+    token_file = ROOT / "token.json"
+    client_secret_file = ROOT / "client_secret.json"
+
+    if not client_secret_file.exists():
+        return {
+            "status": "not_configured",
+            "error": "client_secret.json not found. Place OAuth client secrets in project root.",
+        }
+    if not token_file.exists():
+        return {
+            "status": "configured",
+            "error": "token.json not found. Connect YouTube channel to authorize.",
+        }
+
+    try:
+        from google.oauth2.credentials import Credentials
+        from google.auth.transport.requests import Request
+        from googleapiclient.discovery import build
+        from googleapiclient.errors import HttpError
+
+        creds = Credentials.from_authorized_user_file(str(token_file))
+        if creds.expired and creds.refresh_token:
+            try:
+                creds.refresh(Request())
+                token_file.write_text(creds.to_json(), encoding="utf-8")
+            except Exception as re:
+                if "invalid_grant" in str(re).lower():
+                    return {"status": "invalid", "error": f"OAuth token revoked or expired: {re}"}
+                return {"status": "error", "error": f"Failed to refresh OAuth token: {re}"}
+
+        if not creds.valid:
+            return {"status": "expired", "error": "OAuth token is expired and cannot be refreshed."}
+
+        channel_info = {}
+        try:
+            yt = build("youtube", "v3", credentials=creds)
+            res = yt.channels().list(mine=True, part="id,snippet").execute()
+            store.record_local_quota_activity("general", 1)
+            items = res.get("items", [])
+            if items:
+                ch = items[0]
+                channel_info = {
+                    "channel_id": ch.get("id", ""),
+                    "channel_title": ch.get("snippet", {}).get("title", ""),
+                    "channel_custom_url": ch.get("snippet", {}).get("customUrl", ""),
+                    "verified_at": store.now(),
+                }
+                write_json(ROOT / "studio-channel.json", channel_info)
+        except HttpError as he:
+            if he.resp.status == 403 and "insufficient" in str(he).lower():
+                cached = read_json(ROOT / "studio-channel.json", {})
+                return {
+                    "status": "healthy",
+                    "channel_id": cached.get("channel_id", ""),
+                    "channel_title": cached.get("channel_title") or "YouTube Channel (Upload Scope Verified)",
+                    "channel_custom_url": cached.get("channel_custom_url", ""),
+                    "message": "OAuth credentials verified for video upload.",
+                }
+            return {"status": "error", "error": f"YouTube API error: {he}"}
+        except Exception as qe:
+            LOG.warning("Could not fetch channel details: %s", qe)
+
+        return {
+            "status": "healthy",
+            "channel_id": channel_info.get("channel_id", ""),
+            "channel_title": channel_info.get("channel_title") or "Connected YouTube Channel",
+            "channel_custom_url": channel_info.get("channel_custom_url", ""),
+            "message": f"Successfully verified connection to YouTube channel '{channel_info.get('channel_title', '')}'.",
+        }
+    except Exception as e:
+        return {"status": "error", "error": str(e)}
+
+def reconcile_video_upload(vid_id: str) -> dict[str, Any]:
+    """
+    Query Google Resumable Upload protocol to reconcile ambiguous upload state.
+    Sends authorized HTTP PUT Content-Range: bytes */size to resumable_uri.
+    - 200/201: Completed -> uploaded, extract id.
+    - 308: Incomplete -> upload_unknown (ready to resume from Range).
+    - 404/410: Expired session -> upload_unresolved (finite session expired; does NOT prove absent).
+    - Other/Network: Transient error -> remain upload_unknown.
+    """
+    with GUARD:
+        video = store.get("videos", vid_id)
+        if not video:
+            raise ValueError(f"Video '{vid_id}' not found")
+
+        resumable_uri = video.get("resumable_uri")
+        if not resumable_uri:
+            return {
+                "status": video.get("status", "upload_unknown"),
+                "message": "No active resumable upload session found for this video. Use manual resolution.",
+                "has_resumable_session": False,
+            }
+
+        file_path = video.get("video")
+        total_size = "*"
+        if file_path:
+            p = (ROOT / file_path).resolve()
+            if p.is_file():
+                total_size = str(p.stat().st_size)
+
+        token = get_youtube_access_token()
+        headers = {
+            "Content-Length": "0",
+            "Content-Range": f"bytes */{total_size}",
+        }
+        if token:
+            headers["Authorization"] = f"Bearer {token}"
+
+        import requests
+        try:
+            resp = requests.put(resumable_uri, headers=headers, timeout=15)
+        except Exception as net_err:
+            LOG.warning("Reconciliation network error for %s: %s", vid_id, net_err)
+            return {
+                "status": "upload_unknown",
+                "message": f"Network error contacting upload session: {net_err}. Status remains upload_unknown.",
+                "has_resumable_session": True,
+            }
+
+        if resp.status_code in (200, 201):
+            try:
+                data = resp.json()
+                yt_id = data.get("id", "")
+            except Exception:
+                yt_id = ""
+            video["status"] = "uploaded"
+            if yt_id:
+                video["youtube_id"] = yt_id
+                video["youtube_url"] = f"https://www.youtube.com/watch?v={yt_id}"
+            video["resumable_uri"] = None
+            video["upload_failure_reason"] = ""
+            video["error"] = ""
+            store.put("videos", vid_id, video)
+            return {
+                "status": "uploaded",
+                "youtube_id": video.get("youtube_id", ""),
+                "youtube_url": video.get("youtube_url", ""),
+                "message": "Upload completed successfully according to YouTube session.",
+                "has_resumable_session": False,
+            }
+
+        if resp.status_code == 308:
+            range_hdr = resp.headers.get("Range", "")
+            video["status"] = "upload_unknown"
+            video["upload_failure_reason"] = f"Upload incomplete at byte range: {range_hdr or '0'}. Resumable session active."
+            store.put("videos", vid_id, video)
+            return {
+                "status": "resumable",
+                "range": range_hdr,
+                "message": f"Resumable session active ({range_hdr or '0 bytes received'}). You can resume uploading.",
+                "has_resumable_session": True,
+            }
+
+        if resp.status_code in (404, 410):
+            video["status"] = "upload_unresolved"
+            video["resumable_uri"] = None
+            video["upload_failure_reason"] = f"Resumable upload session expired (HTTP {resp.status_code}). Manual verification on YouTube Studio required."
+            store.put("videos", vid_id, video)
+            return {
+                "status": "upload_unresolved",
+                "message": f"Resumable upload session has expired (HTTP {resp.status_code}). Manual verification on YouTube Studio is required.",
+                "has_resumable_session": False,
+            }
+
+        return {
+            "status": "upload_unknown",
+            "message": f"Unexpected response from upload session (HTTP {resp.status_code}). Status remains upload_unknown.",
+            "has_resumable_session": True,
+        }
+
+def resolve_manual_video(vid_id: str, resolution: str, youtube_id: str = "") -> dict[str, Any]:
+    """Manually resolve an ambiguous upload outcome (upload_unknown / upload_unresolved)."""
+    with GUARD:
+        video = store.get("videos", vid_id)
+        if not video:
+            raise ValueError(f"Video '{vid_id}' not found")
+
+        current_status = video.get("status")
+        if current_status not in ("upload_unknown", "upload_unresolved", "failed"):
+            raise ValueError(f"Video '{vid_id}' is in status '{current_status}'. Only upload_unknown, upload_unresolved, or failed videos can be manually resolved.")
+
+        if resolution == "confirm_uploaded":
+            yt_id = (youtube_id or "").strip()
+            if "v=" in yt_id:
+                yt_id = yt_id.split("v=")[1].split("&")[0].split("?")[0]
+            elif "youtu.be/" in yt_id:
+                yt_id = yt_id.split("youtu.be/")[1].split("?")[0]
+            elif "/shorts/" in yt_id:
+                yt_id = yt_id.split("/shorts/")[1].split("?")[0]
+
+            if not yt_id or len(yt_id) < 6:
+                raise ValueError("A valid YouTube Video ID or URL is required to confirm upload.")
+
+            video["status"] = "uploaded"
+            video["youtube_id"] = yt_id
+            video["youtube_url"] = f"https://www.youtube.com/watch?v={yt_id}"
+            video["resumable_uri"] = None
+            video["upload_failure_reason"] = ""
+            video["error"] = ""
+            store.put("videos", vid_id, video)
+            return {
+                "status": "uploaded",
+                "youtube_id": yt_id,
+                "youtube_url": video["youtube_url"],
+                "message": f"Video manually confirmed as uploaded to YouTube ({yt_id}).",
+            }
+
+        elif resolution == "confirm_absent":
+            video["status"] = "ready"
+            video["youtube_id"] = ""
+            video["youtube_url"] = ""
+            video["resumable_uri"] = None
+            video["upload_failure_reason"] = "Operator confirmed absent on YouTube; reset to ready."
+            video["error"] = ""
+            store.put("videos", vid_id, video)
+            return {
+                "status": "ready",
+                "message": "Video confirmed absent on YouTube and reset to ready for fresh upload.",
+            }
+
+        else:
+            raise ValueError(f"Invalid resolution '{resolution}'. Must be 'confirm_uploaded' or 'confirm_absent'.")
+
 def start_job(action: str, key: str = "", automatic: bool = False, extra: dict | None = None) -> dict:
     if shutil.disk_usage(ROOT).free < 512 * 1024 * 1024:
         raise ValueError("Free at least 512 MB of disk space before starting video generation.")
+
+    if action == "upload":
+        if not key:
+            raise ValueError("A video ID is required for upload.")
+        record = store.get("videos", key)
+        if not record:
+            raise ValueError(f"Video '{key}' not found.")
+
+        # Multi-layer approval enforcement: must be explicitly approved
+        review_status = record.get("review_status", "unreviewed")
+        if review_status != "approved":
+            raise ValueError(f"Video '{key}' cannot be uploaded: review status is '{review_status}'. Only approved videos may be uploaded.")
+
+        # State machine validations & duplicate guards
+        vid_status = record.get("status")
+        if vid_status == "uploaded":
+            yt_ref = record.get("youtube_id") or record.get("youtube_url") or "completed"
+            raise ConflictError(f"Video '{key}' has already been uploaded to YouTube ({yt_ref}).")
+        if vid_status == "uploading":
+            raise ConflictError(f"Video '{key}' is already currently uploading.")
+        if vid_status == "upload_unknown":
+            raise ConflictError(f"Video '{key}' is in 'upload_unknown' state. Run reconciliation or resolve manually before uploading.")
+        if vid_status == "upload_unresolved":
+            raise ConflictError(f"Video '{key}' is in 'upload_unresolved' state. Run manual resolution before uploading.")
+
+        # Guard against concurrent/duplicate upload jobs in the queue
+        all_jobs = store.records("jobs")
+        for j in all_jobs:
+            if j.get("status") in ("pending", "running") and j.get("action") == "upload":
+                if job_matches_video(j, key):
+                    raise ConflictError(f"An upload job for video '{key}' is already {j.get('status')} in the pipeline.")
+
+        # Validate that rendered video file exists on disk
+        video_file = record.get("video")
+        if not video_file:
+            raise ValueError(f"Video '{key}' has no rendered video file.")
+        video_path = (ROOT / video_file).resolve()
+        if not video_path.is_file():
+            raise ValueError(f"Rendered video file not found at {video_file}.")
+
+        # Privacy override support
+        if extra and "privacy" in extra:
+            p_val = extra["privacy"]
+            if p_val in ("public", "unlisted", "private"):
+                record["privacy"] = p_val
+                store.put("videos", key, record)
 
     python = sys.executable
     if action in ("preview", "run"):
@@ -742,6 +1116,19 @@ def retry_job(source_id: str) -> dict:
         action = source_job.get("action", "")
         key = source_job.get("key", "")
         extra = source_job.get("extra", {})
+
+        if action == "upload":
+            record = store.get("videos", key)
+            if not record:
+                raise ValueError(f"Video '{key}' not found")
+            review_status = record.get("review_status", "unreviewed")
+            if review_status != "approved":
+                raise ValueError(f"Cannot retry upload for video '{key}': review status is '{review_status}'. Only approved videos may be uploaded.")
+            vid_status = record.get("status")
+            if vid_status == "uploaded":
+                raise ConflictError(f"Cannot retry upload: video '{key}' is already uploaded ({record.get('youtube_id')}).")
+            if vid_status in ("upload_unknown", "upload_unresolved"):
+                raise ConflictError(f"Cannot retry upload: video '{key}' is in '{vid_status}'. You must reconcile or resolve manually first.")
 
         # Reconstruct command safely from semantic inputs
         python = sys.executable
@@ -827,7 +1214,29 @@ def automation_loop() -> None:
                     write_json(ROOT / "studio-settings.json", settings)
 
                     mode = settings.get("mode", "preview")
-                    start_job("preview" if mode == "preview" else "run", automatic=True)
+                    if mode in ("publish_approved", "publish"):
+                        videos = store.records("videos")
+                        videos.sort(key=lambda v: v.get("created_at", ""))
+                        all_jobs = store.records("jobs")
+                        active_upload_keys = {
+                            j.get("key") for j in all_jobs
+                            if j.get("status") in ("pending", "running") and j.get("action") == "upload"
+                        }
+                        candidate = None
+                        for v in videos:
+                            if (v.get("review_status") == "approved"
+                                    and v.get("status") == "ready"
+                                    and v.get("id") not in active_upload_keys):
+                                candidate = v
+                                break
+
+                        if candidate:
+                            LOG.info("Automation: Selected approved video '%s' for publishing.", candidate["id"])
+                            start_job("upload", key=candidate["id"], automatic=True)
+                        else:
+                            LOG.info("Automation: publish_approved mode enabled, but no approved ready videos available.")
+                    else:
+                        start_job("preview", automatic=True)
         except Exception as e:
             LOG.error("Automation error: %s", e)
 
@@ -995,58 +1404,6 @@ CSP_HEADER = (
     "style-src 'self' 'unsafe-inline'; img-src 'self' data:; media-src 'self'; "
     "connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'"
 )
-
-class ConflictError(Exception):
-    """Raised when an operation conflicts with the current state (e.g. deleting an actively targeted video)."""
-    pass
-
-def job_matches_video(job: dict[str, Any], video_id: str) -> bool:
-    """
-    Deterministic resolution for whether a Stage 4 job is associated with video_id:
-    1. Exact video key match for worker actions ('render', 'upload') or any job where key == video_id.
-    2. Explicit target video metadata in job['summary']['video_id'].
-    3. Validated target artifact stem fallback: Path(job['target_file']).stem == video_id.
-    """
-    if not video_id:
-        return False
-
-    # 1. Exact key match for actions that explicitly track a video target
-    action = job.get("action", "")
-    key = job.get("key", "")
-    if action in ("render", "upload") and key == video_id:
-        return True
-    if key and key == video_id:
-        return True
-    if job.get("extra", {}).get("key") == video_id:
-        return True
-
-    # 2. Explicit target video metadata in summary payload
-    summary = job.get("summary") or {}
-    if summary.get("video_id") == video_id:
-        return True
-
-    # 3. Validated target artifact stem fallback
-    target_file = job.get("target_file")
-    if target_file:
-        try:
-            if Path(target_file).stem == video_id:
-                return True
-        except Exception:
-            pass
-
-    return False
-
-def get_latest_job_for_video(video_id: str, jobs: list[dict[str, Any]] | None = None) -> dict[str, Any] | None:
-    """Return the most recent job associated with video_id, or None."""
-    if jobs is None:
-        try:
-            jobs = store.records("jobs")
-        except Exception:
-            return None
-    for j in jobs:
-        if job_matches_video(j, video_id):
-            return j
-    return None
 
 class StudioHandler(BaseHTTPRequestHandler):
     def log_message(self, format, *args):
@@ -1217,6 +1574,7 @@ class StudioHandler(BaseHTTPRequestHandler):
             secrets_data = read_json(ROOT / "studio-secrets.json", {})
             token_file = ROOT / "token.json"
             client_secret_file = ROOT / "client_secret.json"
+            channel_data = read_json(ROOT / "studio-channel.json", {})
 
             def mask(val: str) -> str:
                 return f"...{val[-4:]}" if len(val) > 6 else ("Configured" if val else "")
@@ -1230,6 +1588,12 @@ class StudioHandler(BaseHTTPRequestHandler):
                 "reddit_id": bool(secrets_data.get("REDDIT_CLIENT_ID") or os.environ.get("REDDIT_CLIENT_ID")),
                 "youtube_oauth_ready": token_file.exists(),
                 "youtube_client_secret_present": client_secret_file.exists(),
+                "oauth_status": check_oauth_health(),
+                "channel_id": channel_data.get("channel_id", ""),
+                "channel_title": channel_data.get("channel_title", ""),
+                "channel_custom_url": channel_data.get("channel_custom_url", ""),
+                "channel_verified_at": channel_data.get("verified_at", ""),
+                "quota_tracker": store.get_local_quota_tracker(),
             })
             return
 
@@ -1402,9 +1766,32 @@ class StudioHandler(BaseHTTPRequestHandler):
                 if val not in valid_reviews:
                     raise ValueError(f"Invalid review_status: '{val}'. Must be one of {sorted(valid_reviews)}")
                 record["review_status"] = val
+            if "privacy" in data:
+                p_val = data["privacy"]
+                if not isinstance(p_val, str) or p_val not in ("public", "unlisted", "private"):
+                    raise ValueError(f"Invalid privacy: '{p_val}'. Must be one of ('public', 'unlisted', 'private')")
+                record["privacy"] = p_val
             record.setdefault("review_status", "unreviewed")
             store.put("videos", vid_id, record)
             return record
+
+        if path == "/api/video/reconcile":
+            vid_id = data.get("id")
+            if not vid_id:
+                raise ValueError("Missing video id to reconcile")
+            return reconcile_video_upload(vid_id)
+
+        if path == "/api/video/resolve":
+            vid_id = data.get("id")
+            if not vid_id:
+                raise ValueError("Missing video id to resolve")
+            resolution = data.get("resolution")
+            if not resolution:
+                raise ValueError("Missing resolution action ('confirm_uploaded' or 'confirm_absent')")
+            return resolve_manual_video(vid_id, resolution, data.get("youtube_id", ""))
+
+        if path == "/api/connections/test":
+            return test_youtube_connection()
 
         if path == "/api/connections":
             secrets_path = ROOT / "studio-secrets.json"
@@ -1528,7 +1915,7 @@ class StudioHandler(BaseHTTPRequestHandler):
                         or not isinstance(auto.get("enabled"), bool)
                         or not _is_number(auto.get("interval_hours"))
                         or not 1 <= auto["interval_hours"] <= 168
-                        or auto.get("mode") not in ("preview", "publish")):
+                        or auto.get("mode") not in ("preview", "publish", "publish_approved")):
                     raise ValueError("Choose an interval of 1-168 hours and a valid mode")
                 current_auto = get_automation_settings()
                 current_auto.update(auto)
@@ -1646,9 +2033,11 @@ def recover_interrupted_jobs() -> None:
     if not store.busy():
         for r in store.records("videos"):
             if r.get("status") in ("uploading", "rendering"):
+                is_upload = (r["status"] == "uploading")
                 r.update(
-                    status="upload_unknown" if r["status"] == "uploading" else "render_failed",
-                    error="The previous job was interrupted. Review before retrying.",
+                    status="upload_unknown" if is_upload else "render_failed",
+                    upload_failure_reason="The previous upload job was interrupted by server restart. Resumable session or manual reconciliation required." if is_upload else "",
+                    error="The previous job was interrupted by server restart. Review before retrying.",
                 )
                 store.put("videos", r["id"], r)
 

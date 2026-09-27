@@ -37,44 +37,79 @@ def work(action: str, key: str) -> None:
         config = json.loads(cfg_path.read_text(encoding="utf-8"))
 
         if action == "upload":
-            if record["status"] == "uploaded":
+            if record.get("review_status") != "approved":
+                raise ValueError("Worker refused upload: Video must be reviewed and marked 'approved' before publishing.")
+            if record.get("status") == "uploaded":
                 raise ValueError("This video has already been uploaded.")
+            if record.get("status") in ("upload_unknown", "upload_unresolved"):
+                raise ValueError(f"Cannot upload: Video is in '{record.get('status')}' state. Reconcile or resolve status first.")
             if not record.get("title", "").strip():
                 raise ValueError("Please provide a title before uploading.")
+
+            video_file = (store.ROOT / record["video"]).resolve()
+            if not video_file.is_file():
+                raise FileNotFoundError(f"Video file not found on disk: {record['video']}")
 
             record["status"] = "uploading"
             record["error"] = ""
             store.put("videos", key, record)
 
             token_path = store.ROOT / "token.json"
+            def on_session_created(uri: str) -> None:
+                try:
+                    rec = store.get("videos", key)
+                    if rec and rec.get("resumable_uri") != uri:
+                        rec["resumable_uri"] = uri
+                        store.put("videos", key, rec)
+                except Exception as log_e:
+                    LOG.warning("Could not persist session URI: %s", log_e)
+
+            # Merge posting tags with candidate hashtags
+            tags = list(config.get("posting", {}).get("tags", []))
+            cand = record.get("candidate", {})
+            for tag in cand.get("hashtags", []):
+                if tag and tag not in tags:
+                    tags.append(tag)
+
+            privacy = record.get("privacy") or config.get("posting", {}).get("privacy", "public")
+            resumable_uri = record.get("resumable_uri") or None
+
             try:
+                agent.emit_progress("Preparing YouTube upload")
                 vid_id = agent.upload_to_youtube(
-                    video_path=Path(record["video"]),
+                    video_path=video_file,
                     title=record["title"],
                     description=record.get("description", ""),
-                    tags=config.get("posting", {}).get("tags", []),
-                    privacy=config.get("posting", {}).get("privacy", "public"),
+                    tags=tags,
+                    privacy=privacy,
                     token_path=token_path,
+                    category_id=config.get("posting", {}).get("category_id", "28"),
+                    on_session_created=on_session_created,
+                    resumable_uri=resumable_uri,
                 )
                 if not vid_id:
                     raise RuntimeError("No YouTube video ID returned.")
 
+                canonical_url = f"https://youtube.com/shorts/{vid_id}"
                 record.update(
                     status="uploaded",
                     youtube_id=vid_id,
+                    youtube_url=canonical_url,
                     uploaded_at=store.now(),
+                    resumable_uri="",
+                    upload_failure_reason="",
+                    error="",
                 )
                 store.put("videos", key, record)
                 LOG.info("Upload complete for %s -> %s", key, vid_id)
                 agent.emit_summary({
                     "status": "completed",
                     "video_id": vid_id,
+                    "youtube_url": canonical_url,
                     "message": "Uploaded to YouTube successfully",
                 })
 
-                # Without this, an upload triggered from the Studio (as
-                # opposed to a full core.agent run) never reaches state.json —
-                # the same story could be picked and re-uploaded again later.
+                # Persist to state.json for discovery deduplication
                 candidate_key = record.get("candidate", {}).get("key")
                 if candidate_key:
                     state = State(store.ROOT / "state.json")
@@ -87,11 +122,40 @@ def work(action: str, key: str) -> None:
                         "dry_run": False,
                         "at": time.time(),
                     })
+                    store.record_local_quota_activity("videos_insert", 1)
 
             except Exception as e:
-                agent.emit_summary({"status": "failed", "message": str(e)})
-                record.update(status="failed", error=str(e))
-                store.put("videos", key, record)
+                err_msg = str(e)
+                latest_rec = store.get("videos", key) or record
+                has_session = bool(latest_rec.get("resumable_uri"))
+
+                is_pre_transfer = (
+                    isinstance(e, (FileNotFoundError, ValueError))
+                    or "not found" in err_msg.lower()
+                    or "invalid_grant" in err_msg.lower()
+                    or "unapproved" in err_msg.lower()
+                    or "must be reviewed" in err_msg.lower()
+                )
+
+                if has_session and not is_pre_transfer:
+                    latest_rec.update(
+                        status="upload_unknown",
+                        upload_failure_reason=err_msg,
+                        error=err_msg,
+                    )
+                    store.put("videos", key, latest_rec)
+                    agent.emit_summary({
+                        "status": "upload_unknown",
+                        "message": f"Upload outcome ambiguous: {err_msg}",
+                    })
+                    LOG.warning("Upload outcome for %s is ambiguous (%s); set to upload_unknown", key, e)
+                else:
+                    latest_rec.update(
+                        status="failed",
+                        error=err_msg,
+                    )
+                    store.put("videos", key, latest_rec)
+                    agent.emit_summary({"status": "failed", "message": err_msg})
                 raise
 
         elif action == "render":

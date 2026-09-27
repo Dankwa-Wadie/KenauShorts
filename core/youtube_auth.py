@@ -15,7 +15,10 @@ import sys
 from pathlib import Path
 
 LOG = logging.getLogger("kenaushorts.youtube_auth")
-SCOPES = ["https://www.googleapis.com/auth/youtube.upload"]
+SCOPES = [
+    "https://www.googleapis.com/auth/youtube.upload",
+    "https://www.googleapis.com/auth/youtube.readonly",
+]
 
 def authenticate_youtube(
     client_secret_path: Path,

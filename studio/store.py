@@ -151,7 +151,10 @@ def draft(
     candidate_data: dict[str, Any] | None = None,
     style_preset: str = "",
     review_status: str = "unreviewed",
+    privacy: str = "",
 ) -> dict[str, Any]:
+    posting_cfg = config.get("posting", {}) if isinstance(config, dict) else {}
+    eff_privacy = privacy or posting_cfg.get("privacy", "public")
     record = {
         "id": video_stem,
         "created_at": now(),
@@ -165,7 +168,11 @@ def draft(
         "config": config,
         "candidate": candidate_data or {},
         "style_preset": style_preset,
+        "privacy": eff_privacy,
         "youtube_id": "",
+        "youtube_url": "",
+        "resumable_uri": "",
+        "upload_failure_reason": "",
         "error": "",
     }
     put("videos", record["id"], record)
@@ -173,11 +180,23 @@ def draft(
 
 def enrich_video_record(record: dict[str, Any]) -> dict[str, Any]:
     """
-    Enrich a video record dictionary with default review_status and
-    lightweight artifact existence flags (without mutating SQLite).
+    Enrich a video record dictionary with default review_status, privacy,
+    canonical youtube_url, and artifact existence flags (without mutating SQLite).
+    Masks internal resumable_uri from client exposure while signaling session presence.
     """
     rec = dict(record)
     rec.setdefault("review_status", "unreviewed")
+    rec.setdefault("status", "ready")
+    rec.setdefault("privacy", "public")
+
+    yt_id = rec.get("youtube_id", "").strip()
+    if yt_id and not rec.get("youtube_url"):
+        rec["youtube_url"] = f"https://youtube.com/shorts/{yt_id}"
+
+    # Protect sensitive resumable session URI from browser exposure
+    raw_uri = rec.get("resumable_uri")
+    rec["has_resumable_session"] = bool(raw_uri)
+    rec.pop("resumable_uri", None)
 
     video_path = rec.get("video")
     poster_path = rec.get("poster")
@@ -259,3 +278,62 @@ def import_legacy() -> None:
             "error": "",
             "legacy": True,
         })
+
+
+def get_pacific_date() -> str:
+    """Return today's date string (YYYY-MM-DD) in US Pacific Time (midnight reset boundary for YouTube quota)."""
+    now_utc = dt.datetime.now(dt.timezone.utc)
+    year = now_utc.year
+    mar1_weekday = dt.date(year, 3, 1).weekday()
+    dst_start_day = 1 + ((6 - mar1_weekday) % 7) + 7
+    dst_start = dt.datetime(year, 3, dst_start_day, 10, 0, tzinfo=dt.timezone.utc)
+    nov1_weekday = dt.date(year, 11, 1).weekday()
+    dst_end_day = 1 + ((6 - nov1_weekday) % 7)
+    dst_end = dt.datetime(year, 11, dst_end_day, 9, 0, tzinfo=dt.timezone.utc)
+    offset_hours = -7 if (dst_start <= now_utc < dst_end) else -8
+    pt_time = now_utc + dt.timedelta(hours=offset_hours)
+    return pt_time.strftime("%Y-%m-%d")
+
+
+def get_local_quota_tracker() -> dict[str, Any]:
+    """Retrieve local YouTube API quota usage estimate for the current Pacific Time day."""
+    today_pt = get_pacific_date()
+    quota_path = ROOT / "studio-quota.json"
+    data: dict[str, Any] = {}
+    if quota_path.exists():
+        try:
+            data = json.loads(quota_path.read_text(encoding="utf-8"))
+        except Exception:
+            data = {}
+    if data.get("date_pt") != today_pt:
+        data = {
+            "date_pt": today_pt,
+            "videos_insert_count": 0,
+            "search_list_count": 0,
+            "general_units": 0,
+            "videos_insert_limit": 100,
+            "search_list_limit": 100,
+            "general_units_limit": 10000,
+            "disclaimer": "Local estimate only. Google Developer Console is the authoritative source of truth.",
+        }
+        try:
+            quota_path.write_text(json.dumps(data, indent=2), encoding="utf-8")
+        except Exception:
+            pass
+    return data
+
+
+def record_local_quota_activity(action_type: str, units: int = 1) -> dict[str, Any]:
+    """Record YouTube API activity in the local daily tracker."""
+    tracker = get_local_quota_tracker()
+    if action_type == "videos_insert":
+        tracker["videos_insert_count"] = tracker.get("videos_insert_count", 0) + units
+    elif action_type == "search_list":
+        tracker["search_list_count"] = tracker.get("search_list_count", 0) + units
+    elif action_type == "general":
+        tracker["general_units"] = tracker.get("general_units", 0) + units
+    try:
+        (ROOT / "studio-quota.json").write_text(json.dumps(tracker, indent=2), encoding="utf-8")
+    except Exception:
+        pass
+    return tracker

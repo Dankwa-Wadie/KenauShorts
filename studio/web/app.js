@@ -816,6 +816,28 @@ async function openVideoModal(id) {
             </div>
           </div>
 
+          <!-- Ambiguous Publishing Diagnostics & Reconciliation -->
+          ${v.status === 'upload_unknown' ? `
+            <div style="background: rgba(245, 158, 11, 0.1); border: 1px solid rgba(245, 158, 11, 0.4); border-radius: var(--radius-sm); padding: 12px 14px; margin-bottom: 16px;">
+              <div style="font-weight: 700; color: #fbbf24; margin-bottom: 4px;">⚠️ Ambiguous Upload Outcome (upload_unknown)</div>
+              <div style="font-size: 12px; color: var(--text-muted); margin-bottom: 10px;">${escapeHtml(v.upload_failure_reason || 'The network or process was interrupted during transfer. Do not upload again blindly.')}</div>
+              <div style="display: flex; gap: 8px; flex-wrap: wrap;">
+                ${v.has_resumable_session ? `<button class="btn btn-secondary btn-sm" onclick="reconcileSession('${v.id}')">🔄 Reconcile Upload Session</button>` : ''}
+                <button class="btn btn-secondary btn-sm" onclick="promptManualResolution('${v.id}')">🛠 Resolve Manually</button>
+              </div>
+            </div>
+          ` : ''}
+
+          ${v.status === 'upload_unresolved' ? `
+            <div style="background: rgba(239, 68, 68, 0.1); border: 1px solid rgba(239, 68, 68, 0.4); border-radius: var(--radius-sm); padding: 12px 14px; margin-bottom: 16px;">
+              <div style="font-weight: 700; color: #f87171; margin-bottom: 4px;">⚠️ Resumable Session Expired (upload_unresolved)</div>
+              <div style="font-size: 12px; color: var(--text-muted); margin-bottom: 10px;">The upload session expired without definitive proof of video creation. Check your YouTube Studio channel manually to verify if the video was created before retrying.</div>
+              <div style="display: flex; gap: 8px; flex-wrap: wrap;">
+                <button class="btn btn-secondary btn-sm" onclick="promptManualResolution('${v.id}')">🛠 Confirm Upload or Reset</button>
+              </div>
+            </div>
+          ` : ''}
+
           <!-- Metadata Form -->
           <div class="form-group">
             <label>Short Title</label>
@@ -842,6 +864,16 @@ async function openVideoModal(id) {
           </div>
 
           <div class="form-group">
+            <label>Publishing Privacy</label>
+            <select class="form-input" id="edit-privacy">
+              <option value="public" ${(v.privacy || 'public') === 'public' ? 'selected' : ''}>Public (Direct to YouTube Shorts feed)</option>
+              <option value="unlisted" ${(v.privacy || '') === 'unlisted' ? 'selected' : ''}>Unlisted (Link only)</option>
+              <option value="private" ${(v.privacy || '') === 'private' ? 'selected' : ''}>Private (Draft / Testing)</option>
+            </select>
+            <p class="form-help">Privacy status when published to YouTube.</p>
+          </div>
+
+          <div class="form-group">
             <label>YouTube Description</label>
             <textarea class="form-input" id="edit-desc" rows="3">${escapeHtml(v.description || '')}</textarea>
           </div>
@@ -865,7 +897,17 @@ async function openVideoModal(id) {
           <div style="display: flex; gap: 12px; margin-top: 24px; flex-wrap: wrap;">
             <button class="btn btn-secondary" onclick="saveVideoEdits('${v.id}')"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="vertical-align:-2px;margin-right:4px;"><path d="M19 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11l5 5v11a2 2 0 0 1-2 2Z"></path><polyline points="17 21 17 13 7 13 7 21"></polyline><polyline points="7 3 7 8 15 8"></polyline></svg>Save Details</button>
             <button class="btn btn-secondary" onclick="reRenderDraft('${v.id}')"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="vertical-align:-2px;margin-right:4px;"><polyline points="23 4 23 10 17 10"></polyline><polyline points="1 20 1 14 7 14"></polyline><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"></path></svg>Re-render Card</button>
-            ${v.status !== 'uploaded' ? `<button class="btn btn-primary" onclick="uploadDraft('${v.id}')"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="vertical-align:-2px;margin-right:4px;"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path><polyline points="17 8 12 3 7 8"></polyline><line x1="12" y1="3" x2="12" y2="15"></line></svg>Upload to YouTube</button>` : `<span class="badge" style="color: var(--success); padding: 10px 16px;">✓ Uploaded to YouTube</span>`}
+            ${v.status === 'uploaded' ? `
+              <span class="badge" style="color: var(--success); padding: 10px 16px; font-weight: 600;">✓ Uploaded (<a href="https://youtube.com/shorts/${escapeHtml(v.youtube_id || '')}" target="_blank" rel="noopener noreferrer" style="color: inherit; text-decoration: underline;">View Short ↗</a>)</span>
+            ` : v.status === 'uploading' ? `
+              <button class="btn btn-primary" disabled style="opacity: 0.6; cursor: not-allowed;">⏳ Uploading...</button>
+            ` : (rev !== 'approved') ? `
+              <button class="btn btn-primary" disabled style="opacity: 0.5; cursor: not-allowed;" title="Approve this video before uploading"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="vertical-align:-2px;margin-right:4px;"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path><polyline points="17 8 12 3 7 8"></polyline><line x1="12" y1="3" x2="12" y2="15"></line></svg>Upload to YouTube (Needs Approval)</button>
+            ` : (v.status === 'upload_unknown' || v.status === 'upload_unresolved') ? `
+              <button class="btn btn-primary" disabled style="opacity: 0.5; cursor: not-allowed;" title="Reconcile or resolve this video before uploading"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="vertical-align:-2px;margin-right:4px;"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path><polyline points="17 8 12 3 7 8"></polyline><line x1="12" y1="3" x2="12" y2="15"></line></svg>Upload to YouTube (Resolve First)</button>
+            ` : `
+              <button class="btn btn-primary" onclick="uploadDraft('${v.id}')"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="vertical-align:-2px;margin-right:4px;"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path><polyline points="17 8 12 3 7 8"></polyline><line x1="12" y1="3" x2="12" y2="15"></line></svg>Upload to YouTube</button>
+            `}
             <button class="btn btn-danger" onclick="deleteVideo('${v.id}')"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="vertical-align:-2px;margin-right:4px;"><polyline points="3 6 5 6 21 6"></polyline><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"></path><line x1="10" y1="11" x2="10" y2="17"></line><line x1="14" y1="11" x2="14" y2="17"></line></svg>Delete</button>
           </div>
         </div>
@@ -927,11 +969,13 @@ async function saveVideoEdits(id) {
   const description = document.getElementById('edit-desc').value;
   const presetEl = document.getElementById('edit-style-preset');
   const style_preset = presetEl ? presetEl.value : '';
+  const privacyEl = document.getElementById('edit-privacy');
+  const privacy = privacyEl ? privacyEl.value : 'public';
   const reviewEl = document.getElementById('edit-review-status');
   const review_status = reviewEl ? reviewEl.value : 'unreviewed';
 
   try {
-    const res = await postJSON('/api/video', { id, title, headline, description, style_preset, review_status });
+    const res = await postJSON('/api/video', { id, title, headline, description, style_preset, privacy, review_status });
     const data = await res.json();
     if (!res.ok || data.error) throw new Error(data.error || 'Save failed');
     showNotification('Video details and review status saved.', 'success');
@@ -943,6 +987,7 @@ async function saveVideoEdits(id) {
       item.headline = headline;
       item.description = description;
       item.style_preset = style_preset;
+      item.privacy = privacy;
       item.review_status = review_status;
       renderLibraryGrid();
     }
@@ -967,9 +1012,12 @@ async function reRenderDraft(id) {
 
 async function uploadDraft(id) {
   await saveVideoEdits(id);
-  if (!confirm('Upload this short to your YouTube channel now?')) return;
+  const privacyEl = document.getElementById('edit-privacy');
+  const privacy = privacyEl ? privacyEl.value : 'public';
+
+  if (!confirm(`Upload this short to your YouTube channel now (Privacy: ${privacy})?`)) return;
   try {
-    const res = await postJSON('/api/job', { action: 'upload', key: id });
+    const res = await postJSON('/api/job', { action: 'upload', key: id, privacy });
     const data = await res.json();
     if (!res.ok || data.error) throw new Error(data.error || 'Upload failed');
     showNotification('Upload job started! Monitoring progress in Pipeline & Queue.', 'success');
@@ -977,6 +1025,54 @@ async function uploadDraft(id) {
     pollStatus();
   } catch (e) {
     showNotification(e.message, 'error');
+  }
+}
+
+async function reconcileSession(id) {
+  try {
+    showNotification('Querying YouTube upload session...', 'info');
+    const res = await postJSON('/api/video/reconcile', { id });
+    const data = await res.json();
+    if (!res.ok || data.error) throw new Error(data.error || 'Reconciliation failed');
+    showNotification(data.message || `Reconciled: ${data.status}`, 'success');
+    await openVideoModal(id);
+    if (currentPage === 'library') loadLibrary(document.getElementById('content-view'));
+  } catch (e) {
+    showNotification(`Reconciliation failed: ${e.message}`, 'error');
+  }
+}
+
+async function promptManualResolution(id) {
+  const choice = prompt('Ambiguous Upload Resolution:\n1 = Confirm video was uploaded (Enter YouTube Video ID)\n2 = Confirm video is absent on YouTube (Reset to ready)\n\nEnter 1 or 2:');
+  if (!choice) return;
+
+  if (choice.trim() === '1') {
+    const ytId = prompt('Enter YouTube Video ID or URL:');
+    if (!ytId || !ytId.trim()) return;
+    try {
+      const res = await postJSON('/api/video/resolve', { id, resolution: 'confirm_uploaded', youtube_id: ytId.trim() });
+      const data = await res.json();
+      if (!res.ok || data.error) throw new Error(data.error || 'Resolution failed');
+      showNotification('Video marked as uploaded.', 'success');
+      await openVideoModal(id);
+      if (currentPage === 'library') loadLibrary(document.getElementById('content-view'));
+    } catch (e) {
+      showNotification(`Resolution failed: ${e.message}`, 'error');
+    }
+  } else if (choice.trim() === '2') {
+    if (!confirm('Confirm that this video is absent on YouTube? This resets the card so you can safely upload it.')) return;
+    try {
+      const res = await postJSON('/api/video/resolve', { id, resolution: 'confirm_absent' });
+      const data = await res.json();
+      if (!res.ok || data.error) throw new Error(data.error || 'Resolution failed');
+      showNotification('Video reset to ready for fresh upload.', 'success');
+      await openVideoModal(id);
+      if (currentPage === 'library') loadLibrary(document.getElementById('content-view'));
+    } catch (e) {
+      showNotification(`Resolution failed: ${e.message}`, 'error');
+    }
+  } else {
+    alert('Invalid choice. Please enter 1 or 2.');
   }
 }
 
@@ -1243,6 +1339,28 @@ async function loadConnections(container) {
   try {
     const conn = await fetch('/api/connections').then(r => r.json());
 
+    let oauthBadge = '';
+    const st = conn.oauth_status || (conn.youtube_oauth_ready ? 'healthy' : 'not_configured');
+    if (st === 'healthy') {
+      oauthBadge = `<span class="badge" style="background: rgba(16, 185, 129, 0.15); color: #10b981; border: 1px solid rgba(16, 185, 129, 0.3); padding: 4px 8px;">✓ Healthy & Authorized</span>`;
+    } else if (st === 'configured') {
+      oauthBadge = `<span class="badge" style="background: rgba(245, 158, 11, 0.15); color: #f59e0b; border: 1px solid rgba(245, 158, 11, 0.3); padding: 4px 8px;">Configured (Needs User Auth)</span>`;
+    } else if (st === 'expired') {
+      oauthBadge = `<span class="badge" style="background: rgba(239, 68, 68, 0.15); color: #ef4444; border: 1px solid rgba(239, 68, 68, 0.3); padding: 4px 8px;">Token Expired</span>`;
+    } else if (st === 'invalid') {
+      oauthBadge = `<span class="badge" style="background: rgba(239, 68, 68, 0.15); color: #ef4444; border: 1px solid rgba(239, 68, 68, 0.3); padding: 4px 8px;">Token Revoked / Invalid</span>`;
+    } else {
+      oauthBadge = `<span class="badge" style="background: rgba(100, 116, 139, 0.15); color: #94a3b8; border: 1px solid rgba(100, 116, 139, 0.3); padding: 4px 8px;">Not Configured</span>`;
+    }
+
+    const channelHtml = conn.channel_title ? `
+      <div style="margin-top: 10px; padding: 10px; background: rgba(255,255,255,0.02); border-radius: 4px; font-size: 13px;">
+        <div>Channel: <strong>${escapeHtml(conn.channel_title)}</strong></div>
+        ${conn.channel_id ? `<div style="font-size: 11px; color: var(--text-muted); margin-top: 2px;">Channel ID: <code>${escapeHtml(conn.channel_id)}</code></div>` : ''}
+        ${conn.channel_custom_url ? `<div style="font-size: 11px; color: var(--text-muted); margin-top: 2px;"><a href="https://youtube.com/${escapeHtml(conn.channel_custom_url)}" target="_blank" rel="noopener noreferrer" style="color: var(--accent);">${escapeHtml(conn.channel_custom_url)} ↗</a></div>` : ''}
+      </div>
+    ` : '';
+
     container.innerHTML = `
       <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 24px;">
         <!-- AI Keys -->
@@ -1253,7 +1371,7 @@ async function loadConnections(container) {
           </p>
 
           <div class="form-group">
-            <label>Google Gemini API Key ${conn.gemini ? '<span style="color:var(--success); font-size:12px;">(âœ“ Configured)</span>' : ''}</label>
+            <label>Google Gemini API Key ${conn.gemini ? '<span style="color:var(--success); font-size:12px;">(✓ Configured)</span>' : ''}</label>
             <div style="display: flex; gap: 8px;">
               <input type="password" class="form-input" id="key-gemini" placeholder="${conn.gemini_preview || 'AIzaSy...'}">
               ${conn.gemini ? `<button class="btn btn-danger" style="white-space: nowrap;" onclick="removeApiKey('GEMINI_API_KEY')">Remove</button>` : ''}
@@ -1262,7 +1380,7 @@ async function loadConnections(container) {
           </div>
 
           <div class="form-group">
-            <label>Anthropic (Claude) API Key ${conn.anthropic ? '<span style="color:var(--success); font-size:12px;">(âœ“ Configured)</span>' : ''}</label>
+            <label>Anthropic (Claude) API Key ${conn.anthropic ? '<span style="color:var(--success); font-size:12px;">(✓ Configured)</span>' : ''}</label>
             <div style="display: flex; gap: 8px;">
               <input type="password" class="form-input" id="key-anthropic" placeholder="sk-ant-...">
               ${conn.anthropic ? `<button class="btn btn-danger" style="white-space: nowrap;" onclick="removeApiKey('ANTHROPIC_API_KEY')">Remove</button>` : ''}
@@ -1270,7 +1388,7 @@ async function loadConnections(container) {
           </div>
 
           <div class="form-group">
-            <label>OpenAI API Key ${conn.openai ? '<span style="color:var(--success); font-size:12px;">(âœ“ Configured)</span>' : ''}</label>
+            <label>OpenAI API Key ${conn.openai ? '<span style="color:var(--success); font-size:12px;">(✓ Configured)</span>' : ''}</label>
             <div style="display: flex; gap: 8px;">
               <input type="password" class="form-input" id="key-openai" placeholder="sk-...">
               ${conn.openai ? `<button class="btn btn-danger" style="white-space: nowrap;" onclick="removeApiKey('OPENAI_API_KEY')">Remove</button>` : ''}
@@ -1284,36 +1402,79 @@ async function loadConnections(container) {
         <div class="panel">
           <h3 class="panel-title">YouTube Publishing OAuth</h3>
           <p style="color: var(--text-muted); font-size: 13px; margin-bottom: 12px;">
-            Uploading a video needs your explicit consent, so this can't be a pasted API key like the ones on the
-            left — Google only allows it through a one-time OAuth sign-in. It's also a different Google product:
-            the AI keys above come from <a href="https://aistudio.google.com/app/apikey" target="_blank" style="color:var(--accent);">Google AI Studio</a>,
-            while this comes from <a href="https://console.cloud.google.com/apis/credentials" target="_blank" style="color:var(--accent);">Google Cloud Console</a>.
+            Uploading a video requires your explicit consent via Google OAuth. Tokens are refreshed automatically.
           </p>
           <p style="color: var(--text-muted); font-size: 13px; margin-bottom: 20px;">
-            Full walkthrough: <code>docs/YOUTUBE_API_SETUP.md</code> in your installation.
+            Full walkthrough: <code>docs/YOUTUBE_API_SETUP.md</code>.
           </p>
 
           <div style="margin-bottom: 20px; padding: 16px; border-radius: var(--radius-sm); background: #101318; border: 1px solid var(--border);">
-            <div style="font-size: 14px; font-weight: 600; margin-bottom: 6px;">
-              OAuth Status: ${conn.youtube_oauth_ready ? '<span style="color:var(--success)">Connected & Ready</span>' : '<span style="color:var(--warning)">Not Authorized</span>'}
+            <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px;">
+              <span style="font-size: 14px; font-weight: 600;">OAuth Status</span>
+              ${oauthBadge}
             </div>
-            <p style="color: var(--text-muted); font-size: 12px;">
+            <p style="color: var(--text-muted); font-size: 12px; margin-bottom: 6px;">
               ${conn.youtube_client_secret_present
                 ? 'client_secret.json detected in root folder.'
-                : 'No client_secret.json yet — follow docs/YOUTUBE_API_SETUP.md to create a Desktop OAuth client in Google Cloud Console and download it there first.'}
+                : 'No client_secret.json yet — follow docs/YOUTUBE_API_SETUP.md to create a Desktop OAuth client.'}
             </p>
+            ${channelHtml}
           </div>
 
-          ${conn.youtube_client_secret_present
-            ? `<button class="btn btn-secondary" onclick="connectYouTube()">🔑 Connect / Authorize YouTube</button>
-               <p class="form-help" style="margin-top: 10px;">This opens a real Google sign-in window in your browser — that's expected, not an error. Approve access, then come back here.</p>`
-            : `<button class="btn btn-secondary" disabled title="Add client_secret.json first — see docs/YOUTUBE_API_SETUP.md">🔑 Connect / Authorize YouTube</button>
-               <p class="form-help" style="margin-top: 10px;">This button unlocks once client_secret.json is in place.</p>`}
+          <div style="display: flex; gap: 8px; flex-wrap: wrap;">
+            ${conn.youtube_oauth_ready ? `<button class="btn btn-secondary" onclick="testConnection()">⚡ Test Connection</button>` : ''}
+            ${conn.youtube_client_secret_present
+              ? `<button class="btn btn-secondary" onclick="connectYouTube()">🔑 Connect / Authorize YouTube</button>`
+              : `<button class="btn btn-secondary" disabled title="Add client_secret.json first — see docs/YOUTUBE_API_SETUP.md">🔑 Connect / Authorize YouTube</button>`}
+          </div>
+          <p class="form-help" style="margin-top: 10px;">Connect opens a real Google sign-in window in your browser to approve YouTube upload permissions.</p>
+        </div>
+
+        <!-- YouTube Quota Tracker Panel -->
+        <div class="panel" style="grid-column: 1 / -1;">
+          <h3 class="panel-title">YouTube API Quota Tracker (2026 Model)</h3>
+          <p style="color: var(--text-muted); font-size: 13px; margin-bottom: 16px;">
+            YouTube enforces quota in independent daily buckets resetting at midnight Pacific Time.
+            <br><strong style="color: var(--text-main);">Note:</strong> Google does not provide an API to query remaining quota; this records KenauShorts local activity. The Google Developer Console is the authoritative source of truth.
+          </p>
+          <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 16px; margin-bottom: 12px;">
+            <div style="background: #101318; border: 1px solid var(--border); border-radius: var(--radius-sm); padding: 14px;">
+              <div style="font-size: 12px; color: var(--text-muted); margin-bottom: 6px;">VIDEOS INSERT BUCKET</div>
+              <div style="font-size: 20px; font-weight: 700; color: var(--accent);">${conn.quota_tracker?.videos_insert_count || 0} <span style="font-size: 13px; font-weight: 400; color: var(--text-muted);">/ ${conn.quota_tracker?.videos_insert_limit || 100} uploads</span></div>
+              <div style="font-size: 11px; color: var(--text-muted); margin-top: 4px;">Independent daily limit (1 unit / upload)</div>
+            </div>
+            <div style="background: #101318; border: 1px solid var(--border); border-radius: var(--radius-sm); padding: 14px;">
+              <div style="font-size: 12px; color: var(--text-muted); margin-bottom: 6px;">SEARCH LIST BUCKET</div>
+              <div style="font-size: 20px; font-weight: 700; color: var(--accent);">${conn.quota_tracker?.search_list_count || 0} <span style="font-size: 13px; font-weight: 400; color: var(--text-muted);">/ ${conn.quota_tracker?.search_list_limit || 100} queries</span></div>
+              <div style="font-size: 11px; color: var(--text-muted); margin-top: 4px;">Independent daily limit (1 unit / search)</div>
+            </div>
+            <div style="background: #101318; border: 1px solid var(--border); border-radius: var(--radius-sm); padding: 14px;">
+              <div style="font-size: 12px; color: var(--text-muted); margin-bottom: 6px;">GENERAL QUOTA BUCKET</div>
+              <div style="font-size: 20px; font-weight: 700; color: var(--success);">${conn.quota_tracker?.general_units || 0} <span style="font-size: 13px; font-weight: 400; color: var(--text-muted);">/ ${conn.quota_tracker?.general_units_limit || 10000} units</span></div>
+              <div style="font-size: 11px; color: var(--text-muted); margin-top: 4px;">Channels/videos list & other calls</div>
+            </div>
+          </div>
+          <div style="font-size: 11px; color: var(--text-muted);">
+            Current PT Date: <code>${conn.quota_tracker?.date_pt || 'N/A'}</code> • Resets nightly at 00:00 Pacific Time.
+          </div>
         </div>
       </div>
     `;
   } catch (e) {
     container.innerHTML = `<p style="color: var(--danger)">Failed to load connections: ${e.message}</p>`;
+  }
+}
+
+async function testConnection() {
+  try {
+    showNotification('Testing YouTube OAuth connection & channel identity...', 'info');
+    const res = await postJSON('/api/connections/test', {});
+    const data = await res.json();
+    if (!res.ok || data.error) throw new Error(data.error || 'Connection test failed');
+    showNotification(data.message || `Connection healthy: ${data.channel_title || 'Channel connected'}`, 'success');
+    loadConnections(document.getElementById('content-view'));
+  } catch (e) {
+    showNotification(`Test failed: ${e.message}`, 'error');
   }
 }
 
@@ -1440,9 +1601,10 @@ async function loadAutomation(container) {
         <div class="form-group">
           <label>Automation Mode</label>
           <select class="form-input" id="auto-mode">
-            <option value="preview" ${auto.mode === 'preview' ? 'selected' : ''}>Create Previews (Wait for manual review)</option>
-            <option value="publish" ${auto.mode === 'publish' ? 'selected' : ''}>Auto-Publish to YouTube</option>
+            <option value="preview" ${(auto.mode === 'preview' || !auto.mode) ? 'selected' : ''}>Preview Only (Generate Drafts for Manual Review)</option>
+            <option value="publish_approved" ${(auto.mode === 'publish_approved' || auto.mode === 'publish') ? 'selected' : ''}>Publish Approved (Upload approved ready videos FIFO)</option>
           </select>
+          <p class="form-help">Publish Approved strictly requires explicit human approval before any video is published. Unreviewed videos are never published automatically.</p>
         </div>
 
         <button class="btn btn-primary" onclick="saveAutomationSettings()">Save Automation Settings</button>

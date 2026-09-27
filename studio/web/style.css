@@ -411,6 +411,9 @@ main {
 
 .status-pill.ready { color: var(--accent); }
 .status-pill.uploaded { color: var(--success); }
+.status-pill.uploading { color: var(--warning); }
+.status-pill.upload_unknown { color: #f59e0b; }
+.status-pill.upload_unresolved { color: #ef4444; }
 .status-pill.failed { color: var(--danger); }
 
 .video-info {

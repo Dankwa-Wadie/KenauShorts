@@ -14,6 +14,8 @@ config.json
 *.sqlite3-journal
 state.json
 studio-settings.json
+studio-quota.json
+studio-channel.json
 .pipeline.lock
 .studio.lock
 .server.lock
