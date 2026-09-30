@@ -138,9 +138,13 @@ def work(action: str, key: str) -> None:
                     or "must be reviewed" in err_msg.lower()
                 )
 
-                is_expired = has_session and ("expired" in err_msg.lower() or "404" in err_msg or "410" in err_msg)
+                is_session_expired = (
+                    has_session
+                    and "oauth" not in err_msg.lower()
+                    and ("session expired" in err_msg.lower() or "404" in err_msg or "410" in err_msg)
+                )
 
-                if is_expired:
+                if is_session_expired:
                     latest_rec.update(
                         status="upload_unresolved",
                         resumable_uri="",
@@ -153,7 +157,7 @@ def work(action: str, key: str) -> None:
                         "message": f"Upload session expired: {err_msg}",
                     })
                     LOG.warning("Upload session for %s expired; set to upload_unresolved", key)
-                elif has_session and not is_pre_transfer:
+                elif has_session:
                     latest_rec.update(
                         status="upload_unknown",
                         upload_failure_reason=err_msg,

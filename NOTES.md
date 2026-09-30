@@ -17,9 +17,10 @@ what's actually on `origin/main`.
   - **Resumable Upload Recovery with Google's Supported Public HTTP Protocol**: Implemented resilient resumable uploads via `core/agent.py` (`upload_to_youtube`) with a 5MB chunksize (`MediaFileUpload(..., chunksize=5*1024*1024, resumable=True)`) and public session URI capture callback (`on_session_created`). Interrupted uploads resume via direct, authenticated HTTP (`_resume_resumable_upload`) using standard authorized HTTP `PUT` requests with zero reliance on undocumented private Google client internals (`_in_error_state` completely removed):
     - Status query: Authorized empty `PUT` with `Content-Range: bytes */size` and `Content-Length: 0`.
     - `HTTP 200/201`: Video upload completed; parses video ID, marks video `uploaded`, sets canonical YouTube URL, and clears session.
-    - `HTTP 308 Resume Incomplete`: Resumable session active; extracts received `Range` header to seek local file to next byte offset, transmitting remaining bytes to the same session URI without re-uploading from byte 0.
+    - `HTTP 308 Resume Incomplete`: Resumable session active; authoritatively parses and validates server's `Range` header via `parse_resumable_range()` (checking standard prefix, valid integer range, non-negative bounds, and non-regressive progression). Explicitly seeks local file stream to the acknowledged byte offset before reading each subsequent chunk (`f.seek(current_offset)`), safely supporting partial chunk acknowledgements.
     - `HTTP 404/410`: Session expired / gone on Google's side; per YouTube upload protocol, expired sessions do NOT prove video absence, transitioning record to `upload_unresolved` and requiring manual operator confirmation on YouTube Studio.
-    - Network/5xx/Auth failures: Keeps video in `upload_unknown`, preserving session URI for subsequent retry without initiating fresh duplicate uploads.
+    - Network/5xx/OAuth failures: Keeps video in `upload_unknown`, preserving session URI for subsequent retry without initiating fresh duplicate uploads. Differentiates session expiration (404/410 from upload server) from OAuth token/refresh failures, ensuring OAuth token expiration preserves `resumable_uri`.
+    - OAuth Refresh Hardening in Recovery: Validates and refreshes expired OAuth credentials before creating headers or opening network connections; redacts sensitive secrets/tokens (`[REDACTED]`) in error messages, makes zero HTTP requests with stale tokens on refresh failure, and preserves the untouched resumable session in `upload_unknown`.
   - **Publishing State Machine & Duplicate Guards (HTTP 409 Conflict)**: Fully hardened against double-clicks, concurrent queue submissions, manual+automation races, and restart races. Validates state before enqueuing upload jobs:
     - Rejects already `uploaded` videos (`ConflictError` HTTP 409).
     - Rejects actively `uploading` videos (`ConflictError` HTTP 409).
@@ -45,13 +46,13 @@ what's actually on `origin/main`.
     - Connections Page: Tiered OAuth status badge, channel identity card with channel ID and link, "Test Connection" button, and 3-bucket 2026 YouTube Quota Tracker card.
     - Automation Page: Mode selector offers "Preview Only (Generate Drafts)" and "Publish Approved (Upload approved ready videos FIFO)" with clear explanation that human approval is strictly required.
   - **Test Suite**:
-    - `tests/test_stage6_publishing.py`: 34/34 passed (4.5s) covering the complete loopback HTTP server lifecycle, expired sessions, 5xx ambiguity preservation, and static verification of zero private client internals.
+    - `tests/test_stage6_publishing.py`: 36/36 passed (5.3s) covering the complete loopback HTTP server lifecycle, partial chunk acknowledgement seeking, range validation, OAuth refresh failure handling with secret redaction, expired sessions (404), 5xx ambiguity preservation, and static verification of zero private client internals.
     - `tests/test_stage5_library.py`: 15/15 passed (0.9s).
     - `tests/test_stage4_pipeline.py`: 14/14 passed (0.8s).
-    - `tests/test_stage3_reliability.py`: 12/12 passed (4.5s).
-    - `tests/test_stage2_queue_cancel.py`: 11/11 passed (5.9s).
-    - `tests/test_style_presets.py`: 14/14 passed (0.3s).
-    - Full discovery suite: 169 tests total (all functional test suites pass; 13 known environment-specific items: 6 NVENC, 1 macOS, 6 Windows terminal cp1252 print).
+    - `tests/test_stage3_reliability.py`: 12/12 passed (4.6s).
+    - `tests/test_stage2_queue_cancel.py`: 11/11 passed (5.1s).
+    - `tests/test_style_presets.py`: 14/14 passed (0.2s).
+    - Full discovery suite: 171 tests total (all functional test suites pass; 13 known environment-specific items: 6 NVENC, 1 macOS, 6 Windows terminal cp1252 print).
   - **Live Runtime Verification**: Verified live against server at `http://127.0.0.1:8766/`:
     1. Verified `GET /api/connections` serves tiered OAuth status (`healthy`), channel identity, and local 2026 quota tracker.
     2. Verified `POST /api/connections/test` tests OAuth credentials, refreshes tokens, and queries channel identity.

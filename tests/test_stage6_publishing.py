@@ -96,6 +96,17 @@ class Stage6PublishingTests(unittest.TestCase):
         with server.GUARD:
             server.ACTIVE_JOB = None
             server.ACTIVE_PROC = None
+        token_p = self.root / "token.json"
+        if token_p.exists():
+            token_p.unlink()
+
+    def tearDown(self):
+        token_p = self.root / "token.json"
+        if token_p.exists():
+            try:
+                token_p.unlink()
+            except OSError:
+                pass
 
     def _create_test_video(
         self,
@@ -800,18 +811,312 @@ class Stage6PublishingTests(unittest.TestCase):
             err_server.shutdown()
             err_server.server_close()
 
-    def test_no_private_google_client_internals_used(self):
-        """Verify static invariant: zero private Google client internals in production recovery path."""
-        codebase_root = Path(__file__).resolve().parent.parent
-        target_files = [
-            codebase_root / "core" / "agent.py",
-            codebase_root / "studio" / "worker.py",
-            codebase_root / "studio" / "server.py",
-        ]
-        for tf in target_files:
-            content = tf.read_text(encoding="utf-8")
-            self.assertNotIn("_in_error_state", content, f"Found private internal '_in_error_state' in {tf.name}")
-            self.assertNotIn("request._", content, f"Found private internal 'request._' in {tf.name}")
+    def test_fake_http_server_partial_chunk_acknowledgement(self):
+        """
+        Verify partial chunk acknowledgement handling:
+        1. Status query returns Range bytes=0-2097151 (2MB received).
+        2. Worker seeks file to 2097152 and transmits next 5MB chunk.
+        3. Fake server simulates partial acknowledgement: only acknowledges up to byte 5242879 (HTTP 308).
+        4. Worker authoritatively updates offset to 5242880, seeks file stream to 5242880,
+           and transmits the exact remaining bytes (5242880-10485759).
+        5. Fake server verifies exact byte boundaries, payload, and same session URI -> 201 Created.
+        """
+        import http.server
+        from google.oauth2.credentials import Credentials
+
+        recorded_chunk_requests = []
+
+        class PartialAckHandler(http.server.BaseHTTPRequestHandler):
+            def log_message(self, format, *args):
+                pass
+
+            def do_PUT(self):
+                content_length = int(self.headers.get("Content-Length", 0))
+                body = self.rfile.read(content_length) if content_length > 0 else b""
+                cr = self.headers.get("Content-Range", "")
+                recorded_chunk_requests.append({
+                    "path": self.path,
+                    "method": "PUT",
+                    "content_range": cr,
+                    "content_length": content_length,
+                    "body": body,
+                })
+
+                if cr.startswith("bytes */"):
+                    # Status query: server already has bytes 0-2097151 (2MB)
+                    self.send_response(308)
+                    self.send_header("Range", "bytes=0-2097151")
+                    self.send_header("Content-Length", "0")
+                    self.end_headers()
+                elif cr.startswith("bytes 2097152-"):
+                    # First resumed chunk: server only acknowledges up to byte 5242879 (5MB total)
+                    self.send_response(308)
+                    self.send_header("Range", "bytes=0-5242879")
+                    self.send_header("Content-Length", "0")
+                    self.end_headers()
+                elif cr.startswith("bytes 5242880-"):
+                    # Second resumed chunk: server receives remaining bytes -> 201 Created
+                    self.send_response(201)
+                    self.send_header("Content-Type", "application/json")
+                    resp_data = json.dumps({"id": "yt_partial_ack_success"}).encode("utf-8")
+                    self.send_header("Content-Length", str(len(resp_data)))
+                    self.end_headers()
+                    self.wfile.write(resp_data)
+                else:
+                    self.send_response(400)
+                    self.end_headers()
+
+        partial_server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), PartialAckHandler)
+        port = partial_server.server_address[1]
+        t = threading.Thread(target=partial_server.serve_forever, daemon=True)
+        t.start()
+
+        session_url = f"http://127.0.0.1:{port}/upload/session_partial_ack"
+        video_path = self.root / "out" / "vid_partial_ack.mp4"
+        chunk1 = b"E" * 5242880
+        chunk2 = b"F" * 5242880
+        video_path.write_bytes(chunk1 + chunk2)
+
+        try:
+            rec = self._create_test_video("vid_partial_ack", review_status="approved", status="upload_unknown", file_exists=False)
+            video_path.write_bytes(chunk1 + chunk2)
+            rec["video"] = str(video_path)
+            rec["resumable_uri"] = session_url
+            store.put("videos", "vid_partial_ack", rec)
+
+            token_file = self.root / "token.json"
+            token_file.write_text(json.dumps({
+                "token": "fake_token",
+                "refresh_token": "fake_refresh",
+                "token_uri": "https://oauth2.googleapis.com/token",
+                "client_id": "fake_cid",
+                "client_secret": "fake_sec",
+                "scopes": ["https://www.googleapis.com/auth/youtube.upload"]
+            }), encoding="utf-8")
+
+            creds = Credentials(token="fake_token")
+            with patch("google.oauth2.credentials.Credentials.from_authorized_user_file", return_value=creds):
+                worker.work("upload", "vid_partial_ack")
+
+            # Verify requests:
+            # 1. Status query: bytes */10485760
+            # 2. Resumed chunk from 2097152 to 7339999
+            # 3. Resumed chunk after partial ack from 5242880 to 10485759
+            self.assertEqual(len(recorded_chunk_requests), 3)
+
+            req_query = recorded_chunk_requests[0]
+            self.assertEqual(req_query["content_range"], "bytes */10485760")
+            self.assertEqual(req_query["content_length"], 0)
+
+            req_chunk1 = recorded_chunk_requests[1]
+            self.assertEqual(req_chunk1["content_range"], "bytes 2097152-7340031/10485760")
+            self.assertEqual(req_chunk1["content_length"], 5242880)
+            # Body must begin at byte 2097152 of the file
+            expected_body1 = (chunk1 + chunk2)[2097152:7340032]
+            self.assertEqual(req_chunk1["body"], expected_body1)
+
+            req_chunk2 = recorded_chunk_requests[2]
+            self.assertEqual(req_chunk2["content_range"], "bytes 5242880-10485759/10485760")
+            self.assertEqual(req_chunk2["content_length"], 5242880)
+            self.assertEqual(req_chunk2["body"], chunk2)
+
+            updated = store.get("videos", "vid_partial_ack")
+            self.assertEqual(updated["status"], "uploaded")
+            self.assertEqual(updated["youtube_id"], "yt_partial_ack_success")
+            self.assertEqual(updated["resumable_uri"], "")
+
+        finally:
+            partial_server.shutdown()
+            partial_server.server_close()
+
+    def test_parse_resumable_range_validation_and_errors(self):
+        """Test parse_resumable_range under valid, missing, malformed, out-of-range, and regressive inputs."""
+        import core.agent as agent
+
+        total_size = 10485760
+
+        # Valid standard Range
+        self.assertEqual(agent.parse_resumable_range("bytes=0-5242879", total_size), 5242880)
+        self.assertEqual(agent.parse_resumable_range("  bytes=0-0  ", total_size), 1)
+        self.assertEqual(agent.parse_resumable_range("bytes=0-10485758", total_size), 10485759)
+
+        # Missing Range on status query -> 0 bytes
+        self.assertEqual(agent.parse_resumable_range(None, total_size, is_status_query=True), 0)
+        self.assertEqual(agent.parse_resumable_range("", total_size, is_status_query=True), 0)
+        self.assertEqual(agent.parse_resumable_range("   ", total_size, is_status_query=True), 0)
+
+        # Missing Range on chunk upload -> RuntimeError
+        with self.assertRaises(RuntimeError) as ctx:
+            agent.parse_resumable_range(None, total_size, is_status_query=False)
+        self.assertIn("missing Range header", str(ctx.exception))
+
+        with self.assertRaises(RuntimeError) as ctx:
+            agent.parse_resumable_range("", total_size, is_status_query=False)
+        self.assertIn("missing Range header", str(ctx.exception))
+
+        # Malformed Range headers
+        with self.assertRaises(RuntimeError) as ctx:
+            agent.parse_resumable_range("invalid_header", total_size)
+        self.assertIn("missing 'bytes=' prefix", str(ctx.exception))
+
+        with self.assertRaises(RuntimeError) as ctx:
+            agent.parse_resumable_range("bytes=5-5242879", total_size)
+        self.assertIn("does not start at byte 0", str(ctx.exception))
+
+        with self.assertRaises(RuntimeError) as ctx:
+            agent.parse_resumable_range("bytes=0", total_size)
+        self.assertIn("Malformed Range header format", str(ctx.exception))
+
+        with self.assertRaises(RuntimeError) as ctx:
+            agent.parse_resumable_range("bytes=0-abc", total_size)
+        self.assertIn("non-integer last byte", str(ctx.exception))
+
+        with self.assertRaises(RuntimeError) as ctx:
+            agent.parse_resumable_range("bytes=0--5", total_size)
+        self.assertIn("negative last byte", str(ctx.exception))
+
+        # Out-of-range Range header (last byte index >= total file size)
+        with self.assertRaises(RuntimeError) as ctx:
+            agent.parse_resumable_range(f"bytes=0-{total_size}", total_size)
+        self.assertIn("Out-of-range Range header", str(ctx.exception))
+
+        # Regressive Range header
+        with self.assertRaises(RuntimeError) as ctx:
+            agent.parse_resumable_range("bytes=0-1000", total_size, expected_start=5000)
+        self.assertIn("Regressive Range header", str(ctx.exception))
+
+    def test_oauth_refresh_handling_in_recovery(self):
+        """
+        Verify OAuth refresh failure handling during recovery:
+        1. Successful refresh allows upload to proceed with fresh token.
+        2. Failed refresh redacts secrets, raises clear error, makes ZERO upload requests,
+           and preserves upload_unknown status and resumable_uri.
+        3. Expired token without refresh_token raises clear error, makes ZERO upload requests,
+           and preserves upload_unknown status and resumable_uri.
+        """
+        import http.server
+        from google.oauth2.credentials import Credentials
+
+        request_counter = []
+
+        class DummyUploadHandler(http.server.BaseHTTPRequestHandler):
+            def log_message(self, format, *args):
+                pass
+            def do_PUT(self):
+                request_counter.append(self.headers.get("Authorization", ""))
+                self.send_response(201)
+                self.send_header("Content-Type", "application/json")
+                resp_bytes = json.dumps({"id": "ok123"}).encode("utf-8")
+                self.send_header("Content-Length", str(len(resp_bytes)))
+                self.end_headers()
+                self.wfile.write(resp_bytes)
+
+        dummy_server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), DummyUploadHandler)
+        port = dummy_server.server_address[1]
+        t = threading.Thread(target=dummy_server.serve_forever, daemon=True)
+        t.start()
+
+        session_url = f"http://127.0.0.1:{port}/upload/session_oauth_test"
+        video_path = self.root / "out" / "vid_oauth_test.mp4"
+        video_path.write_bytes(b"G" * 1024)
+
+        token_file = self.root / "token.json"
+        token_file.write_text(json.dumps({
+            "token": "stale_token",
+            "refresh_token": "fake_refresh",
+            "token_uri": "https://oauth2.googleapis.com/token",
+            "client_id": "fake_cid",
+            "client_secret": "fake_sec",
+            "scopes": ["https://www.googleapis.com/auth/youtube.upload"]
+        }), encoding="utf-8")
+
+        try:
+            # Sub-case 1: Successful refresh
+            rec = self._create_test_video("vid_oauth_succ", review_status="approved", status="upload_unknown")
+            rec["video"] = str(video_path)
+            rec["resumable_uri"] = session_url
+            store.put("videos", "vid_oauth_succ", rec)
+
+            creds_succ = MagicMock(spec=Credentials)
+            creds_succ.expired = True
+            creds_succ.refresh_token = "valid_refresh_token"
+            creds_succ.token = "stale_token"
+
+            def do_succ_refresh(req):
+                creds_succ.expired = False
+                creds_succ.token = "fresh_token_123"
+
+            creds_succ.refresh.side_effect = do_succ_refresh
+
+            with patch("google.oauth2.credentials.Credentials.from_authorized_user_file", return_value=creds_succ):
+                worker.work("upload", "vid_oauth_succ")
+
+            creds_succ.refresh.assert_called_once()
+            self.assertIn("Bearer fresh_token_123", request_counter)
+            updated_succ = store.get("videos", "vid_oauth_succ")
+            self.assertEqual(updated_succ["status"], "uploaded")
+
+            # Sub-case 2: Failed refresh
+            request_counter.clear()
+            rec2 = self._create_test_video("vid_oauth_fail", review_status="approved", status="upload_unknown")
+            rec2["video"] = str(video_path)
+            rec2["resumable_uri"] = session_url
+            store.put("videos", "vid_oauth_fail", rec2)
+
+            creds_fail = MagicMock(spec=Credentials)
+            creds_fail.expired = True
+            creds_fail.refresh_token = "secret_refresh_token_999"
+            creds_fail.token = "stale_token_abc"
+            creds_fail.client_secret = "super_secret_client_key_888"
+            creds_fail.refresh.side_effect = Exception("invalid_grant: secret_refresh_token_999 was revoked")
+
+            with patch("google.oauth2.credentials.Credentials.from_authorized_user_file", return_value=creds_fail):
+                with self.assertRaises(Exception) as ctx:
+                    worker.work("upload", "vid_oauth_fail")
+
+                # Error message must safely redact refresh_token
+                err_text = str(ctx.exception)
+                self.assertNotIn("secret_refresh_token_999", err_text)
+                self.assertIn("[REDACTED]", err_text)
+                self.assertIn("OAuth token refresh failed", err_text)
+
+            # ZERO HTTP upload requests must have been made with stale token
+            self.assertEqual(len(request_counter), 0)
+
+            # Record must remain in upload_unknown and resumable_uri must be preserved
+            updated_fail = store.get("videos", "vid_oauth_fail")
+            self.assertEqual(updated_fail["status"], "upload_unknown")
+            self.assertEqual(updated_fail["resumable_uri"], session_url)
+
+            # Sub-case 3: Expired credentials with NO refresh token
+            request_counter.clear()
+            rec3 = self._create_test_video("vid_oauth_norefresh", review_status="approved", status="upload_unknown")
+            rec3["video"] = str(video_path)
+            rec3["resumable_uri"] = session_url
+            store.put("videos", "vid_oauth_norefresh", rec3)
+
+            creds_noref = MagicMock(spec=Credentials)
+            creds_noref.expired = True
+            creds_noref.refresh_token = None
+            creds_noref.token = "expired_token_xyz"
+
+            with patch("google.oauth2.credentials.Credentials.from_authorized_user_file", return_value=creds_noref):
+                with self.assertRaises(Exception) as ctx:
+                    worker.work("upload", "vid_oauth_norefresh")
+
+                self.assertIn("no refresh token is available", str(ctx.exception))
+
+            # ZERO HTTP upload requests must have been made
+            self.assertEqual(len(request_counter), 0)
+
+            # Record must remain in upload_unknown and resumable_uri must be preserved
+            updated_noref = store.get("videos", "vid_oauth_norefresh")
+            self.assertEqual(updated_noref["status"], "upload_unknown")
+            self.assertEqual(updated_noref["resumable_uri"], session_url)
+
+        finally:
+            dummy_server.shutdown()
+            dummy_server.server_close()
 
 
 

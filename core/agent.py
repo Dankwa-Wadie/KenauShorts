@@ -841,6 +841,65 @@ def download_images(urls: list[str], dest_dir: Path, stem: str) -> list[Path]:
 # YouTube Upload
 # --------------------------------------------------------------------------
 
+def parse_resumable_range(
+    range_hdr: str | None,
+    total_size: int,
+    expected_start: int = 0,
+    is_status_query: bool = False,
+) -> int:
+    """
+    Parse and validate a Range header (e.g. 'bytes=0-5242879') from an HTTP 308 response.
+    Returns the next expected byte offset (e.g. 5242880).
+
+    Rules:
+    - If range_hdr is missing/empty:
+      - On status query: indicates 0 bytes acknowledged -> returns 0.
+      - On chunk upload: raises RuntimeError (server cannot omit Range after chunk upload).
+    - Must match standard format: 'bytes=0-<last_byte>'.
+    - 0 <= last_byte < total_size.
+    - Next offset = last_byte + 1.
+    - Non-regressive: next offset must be >= expected_start.
+    """
+    if not range_hdr or not range_hdr.strip():
+        if is_status_query:
+            return 0
+        raise RuntimeError("HTTP 308 Resume Incomplete response missing Range header after chunk upload.")
+
+    header_val = range_hdr.strip()
+    if not header_val.startswith("bytes="):
+        raise RuntimeError(f"Malformed Range header (missing 'bytes=' prefix): '{header_val}'")
+
+    parts = header_val[6:].split("-", 1)
+    if len(parts) != 2:
+        raise RuntimeError(f"Malformed Range header format: '{header_val}'")
+
+    start_str, end_str = parts[0].strip(), parts[1].strip()
+    if start_str != "0":
+        raise RuntimeError(f"Malformed Range header (does not start at byte 0): '{header_val}'")
+
+    try:
+        last_byte = int(end_str)
+    except ValueError:
+        raise RuntimeError(f"Malformed Range header (non-integer last byte): '{header_val}'")
+
+    if last_byte < 0:
+        raise RuntimeError(f"Malformed Range header (negative last byte): '{header_val}'")
+
+    if last_byte >= total_size:
+        raise RuntimeError(
+            f"Out-of-range Range header: '{header_val}' indicates last byte {last_byte} >= total file size {total_size}."
+        )
+
+    next_offset = last_byte + 1
+
+    if next_offset < expected_start:
+        raise RuntimeError(
+            f"Regressive Range header from server: '{header_val}' indicates offset {next_offset}, "
+            f"which is less than previously acknowledged offset {expected_start}."
+        )
+
+    return next_offset
+
 def _resume_resumable_upload(
     resumable_uri: str,
     video_path: Path,
@@ -855,18 +914,28 @@ def _resume_resumable_upload(
     """
     emit_progress("Resuming upload to YouTube")
 
-    # Refresh credentials if expired
-    if hasattr(creds, "expired") and creds.expired and getattr(creds, "refresh_token", None):
+    # 1. Ensure credentials are valid and fresh before making any HTTP requests
+    if hasattr(creds, "expired") and creds.expired:
+        refresh_token = getattr(creds, "refresh_token", None)
+        if not refresh_token:
+            raise RuntimeError("OAuth credentials expired and no refresh token is available. Re-authenticate via Studio.")
         try:
             from google.auth.transport.requests import Request
             creds.refresh(Request())
         except Exception as e:
-            LOG.warning("Could not refresh OAuth credentials during resumable recovery: %s", e)
+            err_msg = str(e)
+            for sensitive in [getattr(creds, "client_secret", ""), refresh_token, getattr(creds, "token", "")]:
+                if sensitive and len(sensitive) > 4:
+                    err_msg = err_msg.replace(sensitive, "[REDACTED]")
+            raise RuntimeError(f"OAuth token refresh failed during upload recovery: {err_msg}")
 
     token = getattr(creds, "token", None)
+    if not token and hasattr(creds, "valid") and not creds.valid:
+        raise RuntimeError("OAuth credentials are not valid and have no access token.")
+
     total_size = video_path.stat().st_size
 
-    # 1. Query current session state via empty PUT Content-Range: bytes */size, Content-Length: 0
+    # 2. Query current session state via empty PUT Content-Range: bytes */size, Content-Length: 0
     query_headers = {
         "Content-Length": "0",
         "Content-Range": f"bytes */{total_size}",
@@ -893,11 +962,13 @@ def _resume_resumable_upload(
     if resp.status_code != 308:
         raise RuntimeError(f"Unexpected status query response from upload session (HTTP {resp.status_code}): {resp.text[:200]}")
 
-    range_hdr = resp.headers.get("Range", "")
-    if range_hdr:
-        start_byte = int(range_hdr.split("-")[1]) + 1
-    else:
-        start_byte = 0
+    # Parse and validate Range header from status query
+    start_byte = parse_resumable_range(
+        range_hdr=resp.headers.get("Range"),
+        total_size=total_size,
+        expected_start=0,
+        is_status_query=True,
+    )
 
     if "Location" in resp.headers:
         resumable_uri = resp.headers["Location"]
@@ -907,12 +978,13 @@ def _resume_resumable_upload(
             except Exception:
                 pass
 
-    # 2. Transmit remaining bytes in chunksize blocks
+    # 3. Transmit remaining bytes in chunksize blocks
     with open(video_path, "rb") as f:
-        f.seek(start_byte)
         current_offset = start_byte
 
         while current_offset < total_size:
+            # Explicitly seek file stream to current_offset before reading next chunk
+            f.seek(current_offset)
             bytes_to_read = min(chunksize, total_size - current_offset)
             chunk = f.read(bytes_to_read)
             if not chunk:
@@ -938,11 +1010,15 @@ def _resume_resumable_upload(
                 return vid_id
 
             if chunk_resp.status_code == 308:
-                c_range = chunk_resp.headers.get("Range", "")
-                if c_range:
-                    current_offset = int(c_range.split("-")[1]) + 1
-                else:
-                    current_offset = chunk_end + 1
+                # Parse and validate server's Range header authoritatively
+                new_offset = parse_resumable_range(
+                    range_hdr=chunk_resp.headers.get("Range"),
+                    total_size=total_size,
+                    expected_start=current_offset,
+                    is_status_query=False,
+                )
+                current_offset = new_offset
+
                 if "Location" in chunk_resp.headers:
                     resumable_uri = chunk_resp.headers["Location"]
                     if on_session_created:
