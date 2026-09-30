@@ -841,6 +841,126 @@ def download_images(urls: list[str], dest_dir: Path, stem: str) -> list[Path]:
 # YouTube Upload
 # --------------------------------------------------------------------------
 
+def _resume_resumable_upload(
+    resumable_uri: str,
+    video_path: Path,
+    creds: Any,
+    chunksize: int = 5 * 1024 * 1024,
+    on_session_created: Any = None,
+) -> str:
+    """
+    Resume an existing Google Resumable Upload session using direct, authenticated HTTP.
+    Adheres strictly to the Google Resumable Upload specification and RFC 7233.
+    Avoids any undocumented or private Google client internals.
+    """
+    emit_progress("Resuming upload to YouTube")
+
+    # Refresh credentials if expired
+    if hasattr(creds, "expired") and creds.expired and getattr(creds, "refresh_token", None):
+        try:
+            from google.auth.transport.requests import Request
+            creds.refresh(Request())
+        except Exception as e:
+            LOG.warning("Could not refresh OAuth credentials during resumable recovery: %s", e)
+
+    token = getattr(creds, "token", None)
+    total_size = video_path.stat().st_size
+
+    # 1. Query current session state via empty PUT Content-Range: bytes */size, Content-Length: 0
+    query_headers = {
+        "Content-Length": "0",
+        "Content-Range": f"bytes */{total_size}",
+    }
+    if token:
+        query_headers["Authorization"] = f"Bearer {token}"
+
+    resp = requests.put(resumable_uri, headers=query_headers, timeout=30)
+
+    # 200/201: Upload completed previously
+    if resp.status_code in (200, 201):
+        data = resp.json()
+        vid_id = data.get("id")
+        if not vid_id:
+            raise RuntimeError("Resumed upload completed but no video ID was returned by YouTube.")
+        LOG.info("Uploaded successfully! Video ID: %s", vid_id)
+        return vid_id
+
+    # 404/410: Resumable session expired on server
+    if resp.status_code in (404, 410):
+        raise RuntimeError(f"Resumable upload session expired (HTTP {resp.status_code}). Manual verification on YouTube Studio required.")
+
+    # 308: Incomplete upload ready for resumption
+    if resp.status_code != 308:
+        raise RuntimeError(f"Unexpected status query response from upload session (HTTP {resp.status_code}): {resp.text[:200]}")
+
+    range_hdr = resp.headers.get("Range", "")
+    if range_hdr:
+        start_byte = int(range_hdr.split("-")[1]) + 1
+    else:
+        start_byte = 0
+
+    if "Location" in resp.headers:
+        resumable_uri = resp.headers["Location"]
+        if on_session_created:
+            try:
+                on_session_created(resumable_uri)
+            except Exception:
+                pass
+
+    # 2. Transmit remaining bytes in chunksize blocks
+    with open(video_path, "rb") as f:
+        f.seek(start_byte)
+        current_offset = start_byte
+
+        while current_offset < total_size:
+            bytes_to_read = min(chunksize, total_size - current_offset)
+            chunk = f.read(bytes_to_read)
+            if not chunk:
+                break
+            chunk_end = current_offset + len(chunk) - 1
+
+            chunk_headers = {
+                "Content-Length": str(len(chunk)),
+                "Content-Range": f"bytes {current_offset}-{chunk_end}/{total_size}",
+                "Content-Type": "video/mp4",
+            }
+            if token:
+                chunk_headers["Authorization"] = f"Bearer {token}"
+
+            chunk_resp = requests.put(resumable_uri, headers=chunk_headers, data=chunk, timeout=60)
+
+            if chunk_resp.status_code in (200, 201):
+                data = chunk_resp.json()
+                vid_id = data.get("id")
+                if not vid_id:
+                    raise RuntimeError("Upload succeeded but no video ID was returned.")
+                LOG.info("Uploaded successfully! Video ID: %s", vid_id)
+                return vid_id
+
+            if chunk_resp.status_code == 308:
+                c_range = chunk_resp.headers.get("Range", "")
+                if c_range:
+                    current_offset = int(c_range.split("-")[1]) + 1
+                else:
+                    current_offset = chunk_end + 1
+                if "Location" in chunk_resp.headers:
+                    resumable_uri = chunk_resp.headers["Location"]
+                    if on_session_created:
+                        try:
+                            on_session_created(resumable_uri)
+                        except Exception:
+                            pass
+                progress_pct = int((current_offset / total_size) * 100)
+                emit_progress(f"Uploading ({progress_pct}%)")
+
+            elif chunk_resp.status_code in (404, 410):
+                raise RuntimeError(f"Resumable upload session expired during transfer (HTTP {chunk_resp.status_code}).")
+
+            else:
+                raise RuntimeError(f"Upload chunk failed with HTTP {chunk_resp.status_code}: {chunk_resp.text[:200]}")
+
+    raise RuntimeError("Upload session finished transmitting chunks but did not return 200/201 completion.")
+
 def upload_to_youtube(
     video_path: Path,
     title: str,
@@ -859,10 +979,23 @@ def upload_to_youtube(
         raise FileNotFoundError("YouTube token.json not found. Authorize YouTube via Studio first.")
 
     from google.oauth2.credentials import Credentials
+
+    creds = Credentials.from_authorized_user_file(str(token_path))
+
+    # If an existing resumable URI is provided, resume using direct authenticated HTTP
+    # without touching private Google client internals.
+    if resumable_uri:
+        return _resume_resumable_upload(
+            resumable_uri=resumable_uri,
+            video_path=video_path,
+            creds=creds,
+            chunksize=chunksize,
+            on_session_created=on_session_created,
+        )
+
     from googleapiclient.discovery import build
     from googleapiclient.http import MediaFileUpload
 
-    creds = Credentials.from_authorized_user_file(str(token_path))
     youtube = build("youtube", "v3", credentials=creds)
 
     body = {
@@ -880,15 +1013,13 @@ def upload_to_youtube(
 
     media = MediaFileUpload(str(video_path), chunksize=chunksize, resumable=True, mimetype="video/mp4")
     request = youtube.videos().insert(part="snippet,status", body=body, media_body=media)
-    if resumable_uri:
-        request.resumable_uri = resumable_uri
 
     response = None
-    session_notified = bool(resumable_uri)
+    session_notified = False
     while response is None:
         try:
             status, response = request.next_chunk()
-        except Exception as e:
+        except Exception:
             if getattr(request, "resumable_uri", None) and on_session_created and not session_notified:
                 try:
                     on_session_created(request.resumable_uri)

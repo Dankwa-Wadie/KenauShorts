@@ -982,8 +982,21 @@ def resolve_manual_video(vid_id: str, resolution: str, youtube_id: str = "") -> 
                 "message": "Video confirmed absent on YouTube and reset to ready for fresh upload.",
             }
 
+        elif resolution == "resume":
+            if not video.get("resumable_uri"):
+                raise ValueError("No resumable upload session exists for this video.")
+            video["status"] = "ready"
+            video["upload_failure_reason"] = "Operator marked ready to resume upload session."
+            video["error"] = ""
+            store.put("videos", vid_id, video)
+            return {
+                "status": "ready",
+                "resumable": True,
+                "message": "Video marked ready to resume upload from active session.",
+            }
+
         else:
-            raise ValueError(f"Invalid resolution '{resolution}'. Must be 'confirm_uploaded' or 'confirm_absent'.")
+            raise ValueError(f"Invalid resolution '{resolution}'. Must be 'confirm_uploaded', 'confirm_absent', or 'resume'.")
 
 def start_job(action: str, key: str = "", automatic: bool = False, extra: dict | None = None) -> dict:
     if shutil.disk_usage(ROOT).free < 512 * 1024 * 1024:
@@ -1009,7 +1022,8 @@ def start_job(action: str, key: str = "", automatic: bool = False, extra: dict |
         if vid_status == "uploading":
             raise ConflictError(f"Video '{key}' is already currently uploading.")
         if vid_status == "upload_unknown":
-            raise ConflictError(f"Video '{key}' is in 'upload_unknown' state. Run reconciliation or resolve manually before uploading.")
+            if not (extra and extra.get("resume") and record.get("resumable_uri")):
+                raise ConflictError(f"Video '{key}' is in 'upload_unknown' state. Run reconciliation or resolve manually before uploading.")
         if vid_status == "upload_unresolved":
             raise ConflictError(f"Video '{key}' is in 'upload_unresolved' state. Run manual resolution before uploading.")
 
@@ -1128,7 +1142,8 @@ def retry_job(source_id: str) -> dict:
             if vid_status == "uploaded":
                 raise ConflictError(f"Cannot retry upload: video '{key}' is already uploaded ({record.get('youtube_id')}).")
             if vid_status in ("upload_unknown", "upload_unresolved"):
-                raise ConflictError(f"Cannot retry upload: video '{key}' is in '{vid_status}'. You must reconcile or resolve manually first.")
+                if not (vid_status == "upload_unknown" and record.get("resumable_uri")):
+                    raise ConflictError(f"Cannot retry upload: video '{key}' is in '{vid_status}'. You must reconcile or resolve manually first.")
 
         # Reconstruct command safely from semantic inputs
         python = sys.executable

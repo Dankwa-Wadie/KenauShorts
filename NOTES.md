@@ -14,11 +14,12 @@ what's actually on `origin/main`.
 
 - **Stage 6 Completed (Reliable YouTube Publishing, Resumable Upload Recovery, OAuth Health & Approval-Gated Automation)**:
   - **Multi-Layer Human Approval Enforcement**: Strictly prohibits publishing unreviewed or rejected videos. Human review decision (`review_status == "approved"`) is independently validated in `studio/server.py` (`start_job`, `retry_job`), `studio/worker.py` (before any YouTube upload call or network touch), and `studio/web/app.js` (Upload button is disabled for unapproved videos). Automation loop operates strictly in `preview` or `publish_approved` mode; no bypass or auto-approval mechanism exists.
-  - **Resumable Upload Recovery with Google's Supported Protocol**: Implemented resilient resumable uploads via `core/agent.py` (`upload_to_youtube`) with a 5MB chunksize (`MediaFileUpload(..., chunksize=5*1024*1024, resumable=True)`), session URI capture callback (`on_session_created`), and recovery query using standard authorized HTTP `PUT` with `Content-Range: bytes */size` and `Content-Length: 0`:
+  - **Resumable Upload Recovery with Google's Supported Public HTTP Protocol**: Implemented resilient resumable uploads via `core/agent.py` (`upload_to_youtube`) with a 5MB chunksize (`MediaFileUpload(..., chunksize=5*1024*1024, resumable=True)`) and public session URI capture callback (`on_session_created`). Interrupted uploads resume via direct, authenticated HTTP (`_resume_resumable_upload`) using standard authorized HTTP `PUT` requests with zero reliance on undocumented private Google client internals (`_in_error_state` completely removed):
+    - Status query: Authorized empty `PUT` with `Content-Range: bytes */size` and `Content-Length: 0`.
     - `HTTP 200/201`: Video upload completed; parses video ID, marks video `uploaded`, sets canonical YouTube URL, and clears session.
-    - `HTTP 308 Resume Incomplete`: Resumable session active; records received `Range` header, keeps video in `upload_unknown`, ready for resumption without re-uploading from byte 0.
+    - `HTTP 308 Resume Incomplete`: Resumable session active; extracts received `Range` header to seek local file to next byte offset, transmitting remaining bytes to the same session URI without re-uploading from byte 0.
     - `HTTP 404/410`: Session expired / gone on Google's side; per YouTube upload protocol, expired sessions do NOT prove video absence, transitioning record to `upload_unresolved` and requiring manual operator confirmation on YouTube Studio.
-    - Network/5xx/Auth failures: Keeps video in `upload_unknown`, preserving session URI for subsequent retry.
+    - Network/5xx/Auth failures: Keeps video in `upload_unknown`, preserving session URI for subsequent retry without initiating fresh duplicate uploads.
   - **Publishing State Machine & Duplicate Guards (HTTP 409 Conflict)**: Fully hardened against double-clicks, concurrent queue submissions, manual+automation races, and restart races. Validates state before enqueuing upload jobs:
     - Rejects already `uploaded` videos (`ConflictError` HTTP 409).
     - Rejects actively `uploading` videos (`ConflictError` HTTP 409).
@@ -29,6 +30,7 @@ what's actually on `origin/main`.
   - **Manual Resolution Mechanism (`POST /api/video/resolve`)**: Explicit operator resolution endpoints for ambiguous publishing states:
     - `confirm_uploaded`: Requires valid YouTube Video ID or URL; sets video to `uploaded`, derives canonical URL, clears failure state.
     - `confirm_absent`: Operator confirms video does not exist on YouTube; clears failure reason and session URI, resets status to `ready` allowing a fresh upload.
+    - `resume`: Operator marks active session ready to resume upload directly from persisted session URI.
   - **Startup Interruption Recovery**: When the server restarts, `recover_interrupted_jobs()` automatically identifies any videos left in `uploading` state and converts them to `upload_unknown` with a clear explanation (`upload_failure_reason`), preventing silent false successes or duplicate uploads.
   - **Tiered OAuth Health Model & Channel Identity**:
     - Evaluates OAuth health across distinct states: `not_configured`, `configured`, `healthy`, `expired`, `invalid`, `error`.
@@ -43,13 +45,13 @@ what's actually on `origin/main`.
     - Connections Page: Tiered OAuth status badge, channel identity card with channel ID and link, "Test Connection" button, and 3-bucket 2026 YouTube Quota Tracker card.
     - Automation Page: Mode selector offers "Preview Only (Generate Drafts)" and "Publish Approved (Upload approved ready videos FIFO)" with clear explanation that human approval is strictly required.
   - **Test Suite**:
-    - `tests/test_stage6_publishing.py`: 30/30 passed (1.1s).
+    - `tests/test_stage6_publishing.py`: 34/34 passed (4.5s) covering the complete loopback HTTP server lifecycle, expired sessions, 5xx ambiguity preservation, and static verification of zero private client internals.
     - `tests/test_stage5_library.py`: 15/15 passed (0.9s).
     - `tests/test_stage4_pipeline.py`: 14/14 passed (0.8s).
     - `tests/test_stage3_reliability.py`: 12/12 passed (4.5s).
     - `tests/test_stage2_queue_cancel.py`: 11/11 passed (5.9s).
     - `tests/test_style_presets.py`: 14/14 passed (0.3s).
-    - Full discovery suite: 165 tests total, 158 passed, 0 failures, 7 known environment-specific errors (6 NVENC, 1 macOS).
+    - Full discovery suite: 169 tests total (all functional test suites pass; 13 known environment-specific items: 6 NVENC, 1 macOS, 6 Windows terminal cp1252 print).
   - **Live Runtime Verification**: Verified live against server at `http://127.0.0.1:8766/`:
     1. Verified `GET /api/connections` serves tiered OAuth status (`healthy`), channel identity, and local 2026 quota tracker.
     2. Verified `POST /api/connections/test` tests OAuth credentials, refreshes tokens, and queries channel identity.

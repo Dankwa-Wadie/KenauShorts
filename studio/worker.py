@@ -42,7 +42,8 @@ def work(action: str, key: str) -> None:
             if record.get("status") == "uploaded":
                 raise ValueError("This video has already been uploaded.")
             if record.get("status") in ("upload_unknown", "upload_unresolved"):
-                raise ValueError(f"Cannot upload: Video is in '{record.get('status')}' state. Reconcile or resolve status first.")
+                if not record.get("resumable_uri"):
+                    raise ValueError(f"Cannot upload: Video is in '{record.get('status')}' state. Reconcile or resolve status first.")
             if not record.get("title", "").strip():
                 raise ValueError("Please provide a title before uploading.")
 
@@ -137,7 +138,22 @@ def work(action: str, key: str) -> None:
                     or "must be reviewed" in err_msg.lower()
                 )
 
-                if has_session and not is_pre_transfer:
+                is_expired = has_session and ("expired" in err_msg.lower() or "404" in err_msg or "410" in err_msg)
+
+                if is_expired:
+                    latest_rec.update(
+                        status="upload_unresolved",
+                        resumable_uri="",
+                        upload_failure_reason=err_msg,
+                        error=err_msg,
+                    )
+                    store.put("videos", key, latest_rec)
+                    agent.emit_summary({
+                        "status": "upload_unresolved",
+                        "message": f"Upload session expired: {err_msg}",
+                    })
+                    LOG.warning("Upload session for %s expired; set to upload_unresolved", key)
+                elif has_session and not is_pre_transfer:
                     latest_rec.update(
                         status="upload_unknown",
                         upload_failure_reason=err_msg,

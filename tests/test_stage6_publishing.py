@@ -536,6 +536,284 @@ class Stage6PublishingTests(unittest.TestCase):
         rec = store.get("videos", "vid_priv_upd")
         self.assertEqual(rec["privacy"], "unlisted")
 
+    def test_fake_http_server_resumable_upload_lifecycle(self):
+        """
+        Prove Google Resumable Upload protocol lifecycle with a live loopback HTTP server:
+        1. Initial session creation and URI persistence.
+        2. Partial upload followed by network interruption -> record transitions to upload_unknown.
+        3. Status query (PUT bytes */size, Content-Length: 0) against existing URI.
+        4. 308 response and Range handling (determines next byte).
+        5. Resumed PUT to the exact same URI.
+        6. Correct Content-Range, Content-Length, and request body.
+        7. Successful completion (201 Created) -> record marked uploaded with YouTube video ID.
+        """
+        import http.server
+        from google.oauth2.credentials import Credentials
+
+        recorded_requests = []
+
+        class FakeUploadHandler(http.server.BaseHTTPRequestHandler):
+            def log_message(self, format, *args):
+                pass
+
+            def do_PUT(self):
+                content_length = int(self.headers.get("Content-Length", 0))
+                body = self.rfile.read(content_length) if content_length > 0 else b""
+                cr = self.headers.get("Content-Range", "")
+                recorded_requests.append({
+                    "path": self.path,
+                    "method": "PUT",
+                    "content_range": cr,
+                    "content_length": content_length,
+                    "body": body,
+                })
+
+                if cr.startswith("bytes */"):
+                    # Status query
+                    self.send_response(308)
+                    self.send_header("Range", "bytes=0-5242879")
+                    self.send_header("Content-Length", "0")
+                    self.end_headers()
+                elif cr.startswith("bytes 0-"):
+                    # Chunk 1
+                    self.send_response(308)
+                    self.send_header("Range", "bytes=0-5242879")
+                    self.send_header("Content-Length", "0")
+                    self.end_headers()
+                elif cr.startswith("bytes 5242880-"):
+                    # Resumed Chunk 2 -> 201 Created
+                    self.send_response(201)
+                    self.send_header("Content-Type", "application/json")
+                    resp_data = json.dumps({"id": "yt_e2e_resumed_999"}).encode("utf-8")
+                    self.send_header("Content-Length", str(len(resp_data)))
+                    self.end_headers()
+                    self.wfile.write(resp_data)
+                else:
+                    self.send_response(400)
+                    self.end_headers()
+
+        fake_server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), FakeUploadHandler)
+        fake_port = fake_server.server_address[1]
+        server_thread = threading.Thread(target=fake_server.serve_forever, daemon=True)
+        server_thread.start()
+
+        session_url = f"http://127.0.0.1:{fake_port}/upload/session_e2e_test"
+        video_path = self.root / "out" / "vid_e2e_lifecycle.mp4"
+        chunk1 = b"C" * 5242880
+        chunk2 = b"D" * 5242880
+
+        try:
+            # 1. Create approved video with NO initial session URI
+            rec = self._create_test_video("vid_e2e_lifecycle", review_status="approved", status="ready")
+            video_path.write_bytes(chunk1 + chunk2)
+            rec["video"] = str(video_path)
+            rec["resumable_uri"] = None
+            store.put("videos", "vid_e2e_lifecycle", rec)
+
+            token_file = self.root / "token.json"
+            token_file.write_text(json.dumps({
+                "token": "fake_token",
+                "refresh_token": "fake_refresh",
+                "token_uri": "https://oauth2.googleapis.com/token",
+                "client_id": "fake_cid",
+                "client_secret": "fake_sec",
+                "scopes": ["https://www.googleapis.com/auth/youtube.upload"]
+            }), encoding="utf-8")
+
+            # 2. Simulate initial upload starting, capturing session URI, and dropping connection
+            def simulate_partial_upload(**kwargs):
+                cb = kwargs.get("on_session_created")
+                if cb:
+                    cb(session_url)
+                raise ConnectionResetError("Simulated network drop during transfer")
+
+            try:
+                with patch("core.agent.upload_to_youtube", side_effect=simulate_partial_upload):
+                    worker.work("upload", "vid_e2e_lifecycle")
+            except ConnectionResetError:
+                pass
+
+            # Verify session URI was persisted and status transitioned to upload_unknown
+            after_drop = store.get("videos", "vid_e2e_lifecycle")
+            self.assertEqual(after_drop["status"], "upload_unknown")
+            self.assertEqual(after_drop["resumable_uri"], session_url)
+            self.assertIn("Simulated network drop", after_drop["upload_failure_reason"])
+
+            # 3. Reconciliation via reconcile_video_upload sends empty PUT bytes */size
+            reconcile_res = server.reconcile_video_upload("vid_e2e_lifecycle")
+            self.assertEqual(reconcile_res["status"], "resumable")
+            self.assertEqual(reconcile_res["range"], "bytes=0-5242879")
+            self.assertTrue(reconcile_res["has_resumable_session"])
+
+            # 4. Resumed upload execution using public direct HTTP mechanism
+            recorded_requests.clear()
+            creds = Credentials(token="fake_token")
+            with patch("google.oauth2.credentials.Credentials.from_authorized_user_file", return_value=creds):
+                worker.work("upload", "vid_e2e_lifecycle")
+
+            # 5. Verify fake server received exact requests
+            self.assertEqual(len(recorded_requests), 2)
+            # Request A: empty PUT status check
+            req_query = recorded_requests[0]
+            self.assertEqual(req_query["method"], "PUT")
+            self.assertEqual(req_query["path"], "/upload/session_e2e_test")
+            self.assertEqual(req_query["content_range"], "bytes */10485760")
+            self.assertEqual(req_query["content_length"], 0)
+
+            # Request B: resumed chunk starting at byte 5242880
+            req_chunk = recorded_requests[1]
+            self.assertEqual(req_chunk["method"], "PUT")
+            self.assertEqual(req_chunk["path"], "/upload/session_e2e_test")
+            self.assertEqual(req_chunk["content_range"], "bytes 5242880-10485759/10485760")
+            self.assertEqual(req_chunk["content_length"], 5242880)
+            self.assertEqual(req_chunk["body"], chunk2)
+
+            # 6. Verify database record updated to uploaded with YouTube ID
+            completed = store.get("videos", "vid_e2e_lifecycle")
+            self.assertEqual(completed["status"], "uploaded")
+            self.assertEqual(completed["youtube_id"], "yt_e2e_resumed_999")
+            self.assertEqual(completed["youtube_url"], "https://youtube.com/shorts/yt_e2e_resumed_999")
+            self.assertEqual(completed["resumable_uri"], "")
+            self.assertEqual(completed["upload_failure_reason"], "")
+
+        finally:
+            fake_server.shutdown()
+            fake_server.server_close()
+
+    def test_fake_http_server_expired_session_transitions_to_unresolved(self):
+        """
+        Verify that an expired session (HTTP 404/410) during recovery:
+        1. Transitions video record to 'upload_unresolved'.
+        2. Clears the resumable_uri.
+        3. Never initiates a fresh upload or masks the ambiguity.
+        """
+        import http.server
+        from google.oauth2.credentials import Credentials
+
+        class ExpiredSessionHandler(http.server.BaseHTTPRequestHandler):
+            def log_message(self, format, *args):
+                pass
+
+            def do_PUT(self):
+                # Google responds 404 Not Found when resumable session expires
+                self.send_error(404, "Resumable session expired")
+
+        expired_server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), ExpiredSessionHandler)
+        port = expired_server.server_address[1]
+        t = threading.Thread(target=expired_server.serve_forever, daemon=True)
+        t.start()
+
+        session_url = f"http://127.0.0.1:{port}/upload/session_expired_test"
+        video_path = self.root / "out" / "vid_exp_test.mp4"
+        video_path.write_bytes(b"A" * 1024 * 1024)
+
+        try:
+            rec = self._create_test_video("vid_exp_test", review_status="approved", status="upload_unknown")
+            rec["video"] = str(video_path)
+            rec["resumable_uri"] = session_url
+            store.put("videos", "vid_exp_test", rec)
+
+            token_file = self.root / "token.json"
+            token_file.write_text(json.dumps({
+                "token": "fake_token",
+                "refresh_token": "fake_refresh",
+                "token_uri": "https://oauth2.googleapis.com/token",
+                "client_id": "fake_cid",
+                "client_secret": "fake_sec",
+                "scopes": ["https://www.googleapis.com/auth/youtube.upload"]
+            }), encoding="utf-8")
+
+            # Worker attempts resumed upload against expired session
+            creds = Credentials(token="fake_token")
+            with patch("google.oauth2.credentials.Credentials.from_authorized_user_file", return_value=creds):
+                with self.assertRaises(Exception) as ctx:
+                    worker.work("upload", "vid_exp_test")
+                self.assertIn("expired", str(ctx.exception).lower())
+
+            # Record must transition to upload_unresolved and session URI must be cleared
+            updated = store.get("videos", "vid_exp_test")
+            self.assertEqual(updated["status"], "upload_unresolved")
+            self.assertEqual(updated["resumable_uri"], "")
+            self.assertIn("expired", updated["upload_failure_reason"].lower())
+
+        finally:
+            expired_server.shutdown()
+            expired_server.server_close()
+
+    def test_fake_http_server_transient_error_preserves_upload_unknown(self):
+        """
+        Verify that a transient network/5xx error during resumable recovery:
+        1. Keeps the video in 'upload_unknown'.
+        2. Preserves the resumable_uri for future retry.
+        3. Never initiates a fresh upload.
+        """
+        import http.server
+        from google.oauth2.credentials import Credentials
+
+        class TransientErrorHandler(http.server.BaseHTTPRequestHandler):
+            def log_message(self, format, *args):
+                pass
+
+            def do_PUT(self):
+                # Google responds 503 Service Unavailable during backend outage
+                self.send_error(503, "Service Unavailable")
+
+        err_server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), TransientErrorHandler)
+        port = err_server.server_address[1]
+        t = threading.Thread(target=err_server.serve_forever, daemon=True)
+        t.start()
+
+        session_url = f"http://127.0.0.1:{port}/upload/session_503_test"
+        video_path = self.root / "out" / "vid_503_test.mp4"
+        video_path.write_bytes(b"B" * 1024 * 1024)
+
+        try:
+            rec = self._create_test_video("vid_503_test", review_status="approved", status="upload_unknown")
+            rec["video"] = str(video_path)
+            rec["resumable_uri"] = session_url
+            store.put("videos", "vid_503_test", rec)
+
+            token_file = self.root / "token.json"
+            token_file.write_text(json.dumps({
+                "token": "fake_token",
+                "refresh_token": "fake_refresh",
+                "token_uri": "https://oauth2.googleapis.com/token",
+                "client_id": "fake_cid",
+                "client_secret": "fake_sec",
+                "scopes": ["https://www.googleapis.com/auth/youtube.upload"]
+            }), encoding="utf-8")
+
+            # Worker attempts resumed upload against server returning 503
+            creds = Credentials(token="fake_token")
+            with patch("google.oauth2.credentials.Credentials.from_authorized_user_file", return_value=creds):
+                with self.assertRaises(Exception) as ctx:
+                    worker.work("upload", "vid_503_test")
+                self.assertIn("503", str(ctx.exception))
+
+            # Record must remain upload_unknown and session URI must be preserved
+            updated = store.get("videos", "vid_503_test")
+            self.assertEqual(updated["status"], "upload_unknown")
+            self.assertEqual(updated["resumable_uri"], session_url)
+            self.assertIn("503", updated["upload_failure_reason"])
+
+        finally:
+            err_server.shutdown()
+            err_server.server_close()
+
+    def test_no_private_google_client_internals_used(self):
+        """Verify static invariant: zero private Google client internals in production recovery path."""
+        codebase_root = Path(__file__).resolve().parent.parent
+        target_files = [
+            codebase_root / "core" / "agent.py",
+            codebase_root / "studio" / "worker.py",
+            codebase_root / "studio" / "server.py",
+        ]
+        for tf in target_files:
+            content = tf.read_text(encoding="utf-8")
+            self.assertNotIn("_in_error_state", content, f"Found private internal '_in_error_state' in {tf.name}")
+            self.assertNotIn("request._", content, f"Found private internal 'request._' in {tf.name}")
+
+
 
 if __name__ == "__main__":
     unittest.main()
