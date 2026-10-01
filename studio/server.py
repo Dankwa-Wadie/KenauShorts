@@ -57,6 +57,9 @@ QUEUE_WORKER_THREAD: threading.Thread | None = None
 _CONNECTION_TEST_LOCK = threading.Lock()
 _RECONCILING_VIDEOS: set[str] = set()
 _RECONCILE_LOCK = threading.Lock()
+_ONLINE_CACHE: dict[str, Any] = {"status": True, "checked_at": 0.0}
+_ONLINE_LOCK = threading.Lock()
+ONLINE_CACHE_TTL: float = 10.0  # seconds: balance fresh status with avoiding socket churn
 
 DEFAULT_AUTOMATION = {
     "enabled": False,
@@ -86,7 +89,8 @@ def write_json(path: Path, data: dict, private: bool = False) -> None:
 def get_automation_settings() -> dict:
     return {**DEFAULT_AUTOMATION, **read_json(ROOT / "studio-settings.json", {})}
 
-def is_online() -> bool:
+def probe_network_connectivity() -> bool:
+    """Raw socket probe to check external connectivity outside of any locks."""
     for host in ("www.google.com", "1.1.1.1"):
         try:
             with socket.create_connection((host, 443), timeout=3):
@@ -94,6 +98,35 @@ def is_online() -> bool:
         except OSError:
             pass
     return False
+
+def is_online(cached: bool = True) -> bool:
+    """
+    Check if the host has internet connectivity.
+    When cached=True (default), returns cached status if checked within ONLINE_CACHE_TTL (10s),
+    and uses a non-blocking probe lock so concurrent callers do not stack probes.
+    Network probing is never performed while holding GUARD.
+    """
+    global _ONLINE_CACHE
+    now = time.time()
+    if cached and (now - _ONLINE_CACHE.get("checked_at", 0.0) < ONLINE_CACHE_TTL):
+        return bool(_ONLINE_CACHE.get("status", True))
+
+    if not _ONLINE_LOCK.acquire(blocking=False):
+        # Another thread is actively probing; return current cached state immediately without waiting
+        return bool(_ONLINE_CACHE.get("status", True))
+
+    try:
+        now = time.time()
+        if cached and (now - _ONLINE_CACHE.get("checked_at", 0.0) < ONLINE_CACHE_TTL):
+            return bool(_ONLINE_CACHE.get("status", True))
+        online = probe_network_connectivity()
+        _ONLINE_CACHE = {"status": online, "checked_at": time.time()}
+        return online
+    except Exception as e:
+        LOG.warning("Network connectivity check exception: %s", e)
+        return bool(_ONLINE_CACHE.get("status", False))
+    finally:
+        _ONLINE_LOCK.release()
 
 def get_config() -> dict:
     cfg = ROOT / "config.json"
@@ -884,6 +917,18 @@ def reconcile_video_upload(vid_id: str) -> dict[str, Any]:
             if not video:
                 raise ValueError(f"Video '{vid_id}' not found")
 
+            if video.get("status") == "uploaded":
+                yt_id = video.get("youtube_id", "")
+                if yt_id:
+                    _sync_candidate_posted(video, yt_id)
+                return {
+                    "status": "uploaded",
+                    "youtube_id": yt_id,
+                    "youtube_url": video.get("youtube_url") or (f"https://www.youtube.com/watch?v={yt_id}" if yt_id else ""),
+                    "message": "Video is already marked uploaded; candidate state synchronized.",
+                    "has_resumable_session": False,
+                }
+
             resumable_uri = video.get("resumable_uri")
             if not resumable_uri:
                 return {
@@ -925,10 +970,13 @@ def reconcile_video_upload(vid_id: str) -> dict[str, Any]:
                 raise ValueError(f"Video '{vid_id}' not found")
 
             if latest_video.get("status") == "uploaded":
+                yt_id = latest_video.get("youtube_id", "")
+                if yt_id:
+                    _sync_candidate_posted(latest_video, yt_id)
                 return {
                     "status": "uploaded",
-                    "youtube_id": latest_video.get("youtube_id", ""),
-                    "youtube_url": latest_video.get("youtube_url", ""),
+                    "youtube_id": yt_id,
+                    "youtube_url": latest_video.get("youtube_url") or (f"https://www.youtube.com/watch?v={yt_id}" if yt_id else ""),
                     "message": "Upload completed successfully according to YouTube session.",
                     "has_resumable_session": False,
                 }
@@ -1520,14 +1568,15 @@ class StudioHandler(BaseHTTPRequestHandler):
 
         # API Routes
         if path == "/api/status":
+            online = is_online()
             with GUARD:
                 cfg = get_automation_settings()
                 records = store.records("jobs")
                 pending = [j for j in records if j.get("status") == "pending"]
                 pending.sort(key=lambda j: j.get("created_at", ""))
-                self.send_json({
+                payload = {
                     "csrf": CSRF,
-                    "online": is_online(),
+                    "online": online,
                     "active_job": ACTIVE_JOB,
                     "busy": store.busy(),
                     "free_space_mb": int(shutil.disk_usage(ROOT).free / (1024 * 1024)),
@@ -1535,7 +1584,8 @@ class StudioHandler(BaseHTTPRequestHandler):
                     "platform": platform.system(),
                     "queue_count": len(pending),
                     "queued_jobs": [j["id"] for j in pending],
-                })
+                }
+            self.send_json(payload)
             return
 
         if path == "/api/queue":
@@ -2133,6 +2183,11 @@ def recover_interrupted_jobs() -> None:
                     error="The previous job was interrupted by server restart. Review before retrying.",
                 )
                 store.put("videos", r["id"], r)
+            elif r.get("status") == "uploaded" and r.get("youtube_id"):
+                try:
+                    _sync_candidate_posted(r, r["youtube_id"])
+                except Exception as e:
+                    LOG.warning("Could not sync candidate state for uploaded video %s on startup: %s", r.get("id"), e)
 
 @contextlib.contextmanager
 def server_lock():

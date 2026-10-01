@@ -127,7 +127,8 @@ class Stage7Phase1Tests(unittest.TestCase):
             test_finish.wait(timeout=5)
             return {"status": "ok", "channel": "KenauTest", "channel_id": "UC123"}
 
-        with patch.object(server, "test_youtube_connection", side_effect=slow_connection_test):
+        with patch.object(server, "test_youtube_connection", side_effect=slow_connection_test), \
+             patch.object(server, "is_online", return_value=True):
             # Launch connection test in separate thread via HTTP
             def run_test():
                 self._request("POST", "/api/connections/test", {})
@@ -190,7 +191,8 @@ class Stage7Phase1Tests(unittest.TestCase):
             return mock_resp
 
         import requests
-        with patch.object(requests, "put", side_effect=slow_requests_put):
+        with patch.object(requests, "put", side_effect=slow_requests_put), \
+             patch.object(server, "is_online", return_value=True):
             def run_reconcile():
                 self._request("POST", "/api/video/reconcile", {"id": vid_id})
 
@@ -210,6 +212,90 @@ class Stage7Phase1Tests(unittest.TestCase):
 
             put_finish.set()
             th.join(timeout=2)
+
+
+    def test_status_slow_probe_does_not_block_guard(self):
+        """A slow network connectivity probe in is_online does not block unrelated guarded operations."""
+        probe_started = threading.Event()
+        probe_finish = threading.Event()
+
+        def slow_probe():
+            probe_started.set()
+            probe_finish.wait(timeout=5)
+            return True
+
+        server._ONLINE_CACHE = {"status": True, "checked_at": 0.0}
+
+        with patch.object(server, "probe_network_connectivity", side_effect=slow_probe):
+            th = threading.Thread(target=lambda: self._request("GET", "/api/status"), daemon=True)
+            th.start()
+
+            self.assertTrue(probe_started.wait(timeout=3))
+
+            # While probe is running outside GUARD, verify GUARD can be acquired immediately
+            t0 = time.time()
+            guard_acquired = False
+            with server.GUARD:
+                guard_acquired = True
+            elapsed = time.time() - t0
+
+            self.assertTrue(guard_acquired)
+            self.assertLess(elapsed, 0.5, "GUARD was blocked by network probe!")
+
+            probe_finish.set()
+            th.join(timeout=2)
+
+    def test_status_concurrent_requests_use_cached_probe(self):
+        """Concurrent status requests do not trigger multiple simultaneous probes."""
+        probe_count = 0
+        probe_lock = threading.Lock()
+
+        def counted_probe():
+            nonlocal probe_count
+            with probe_lock:
+                probe_count += 1
+            time.sleep(0.05)
+            return True
+
+        server._ONLINE_CACHE = {"status": True, "checked_at": 0.0}
+
+        threads = []
+        statuses = []
+
+        def worker():
+            code, body = self._request("GET", "/api/status")
+            statuses.append((code, body.get("online")))
+
+        with patch.object(server, "probe_network_connectivity", side_effect=counted_probe):
+            for _ in range(5):
+                t = threading.Thread(target=worker)
+                threads.append(t)
+                t.start()
+
+            for t in threads:
+                t.join(timeout=3)
+
+        self.assertEqual(len(statuses), 5)
+        for code, online in statuses:
+            self.assertEqual(code, 200)
+            self.assertTrue(online)
+        self.assertLessEqual(probe_count, 2)
+
+    def test_status_probe_exception_does_not_break_status(self):
+        """Probe exceptions do not leave probe lock held or break /api/status response."""
+        server._ONLINE_CACHE = {"status": False, "checked_at": 0.0}
+
+        def failing_probe():
+            raise OSError("Simulated socket error")
+
+        with patch.object(server, "probe_network_connectivity", side_effect=failing_probe):
+            code, body = self._request("GET", "/api/status")
+            self.assertEqual(code, 200)
+            self.assertIn("online", body)
+            self.assertFalse(body["online"])
+
+        # Probe lock must not be left held
+        self.assertFalse(server._ONLINE_LOCK.locked())
 
     def test_reconcile_concurrent_same_video_rejected(self):
         """Concurrent reconciliation of the same video ID raises ConflictError (HTTP 409)."""
@@ -271,6 +357,104 @@ class Stage7Phase1Tests(unittest.TestCase):
         posted = [p for p in state.posted if p.get("key") == cand_key]
         self.assertEqual(len(posted), 1)
         self.assertEqual(posted[0]["youtube_id"], "yt_rec_done_999")
+        self.assertIn(cand_key, state.seen)
+
+
+    def test_reconcile_state_sync_failure_and_retry_recovery(self):
+        """Simulate SQLite success but state.json failure, then verify retry repairs state.json without re-upload."""
+        vid_id = "vid_rec_repair"
+        cand_key = "reddit_post_repair_999"
+        video_record = {
+            "id": vid_id,
+            "candidate": {"key": cand_key},
+            "status": "upload_unknown",
+            "resumable_uri": "https://upload.youtube.com/repair_session",
+            "title": "Repair Test Video",
+            "headline": "Repair Headline",
+            "video": "out/test.mp4",
+        }
+        store.put("videos", vid_id, video_record)
+
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.json.return_value = {"id": "yt_repair_id_123"}
+
+        import requests
+        put_called = []
+        def tracking_put(*args, **kwargs):
+            put_called.append(True)
+            return mock_resp
+
+        # Step 1: Initial reconciliation where state.mark_posted fails
+        with patch.object(requests, "put", side_effect=tracking_put), \
+             patch("core.state.State.mark_posted", side_effect=IOError("Simulated disk error writing state.json")):
+            with self.assertRaises(IOError):
+                server.reconcile_video_upload(vid_id)
+
+        # Confirm SQLite updated to uploaded with youtube_id
+        db_rec = store.get("videos", vid_id)
+        self.assertEqual(db_rec["status"], "uploaded")
+        self.assertEqual(db_rec["youtube_id"], "yt_repair_id_123")
+
+        # Confirm state.json does NOT contain candidate yet
+        state_file = self.root / "state.json"
+        state = State(state_file)
+        self.assertEqual(len([p for p in state.posted if p.get("key") == cand_key]), 0)
+        self.assertEqual(len(put_called), 1)
+
+        # Step 2: Retry reconciliation. Must NOT call requests.put (no re-upload), must repair state.json
+        put_called.clear()
+        with patch.object(requests, "put", side_effect=tracking_put):
+            retry_res = server.reconcile_video_upload(vid_id)
+
+        self.assertEqual(retry_res["status"], "uploaded")
+        self.assertEqual(retry_res["youtube_id"], "yt_repair_id_123")
+        self.assertEqual(len(put_called), 0, "Retry must NOT perform network upload!")
+
+        # Verify state.json is now repaired
+        state = State(state_file)
+        matching = [p for p in state.posted if p.get("key") == cand_key]
+        self.assertEqual(len(matching), 1)
+        self.assertEqual(matching[0]["youtube_id"], "yt_repair_id_123")
+        self.assertIn(cand_key, state.seen)
+
+        # Step 3: Repeated reconciliation retry is idempotent (no duplicate entries)
+        repeat_res = server.reconcile_video_upload(vid_id)
+        self.assertEqual(repeat_res["status"], "uploaded")
+        state = State(state_file)
+        self.assertEqual(len([p for p in state.posted if p.get("key") == cand_key]), 1)
+
+        # Step 4: Conflicting YouTube ID on manual resolution is still rejected
+        with self.assertRaises(server.ConflictError):
+            server.resolve_manual_video(vid_id, "confirm_uploaded", "yt_conflicting_id")
+
+    def test_startup_recovery_repairs_missing_state_json(self):
+        """Simulate server restart when SQLite is uploaded but state.json was not synced."""
+        vid_id = "vid_restart_heal"
+        cand_key = "reddit_post_restart_888"
+        video_record = {
+            "id": vid_id,
+            "candidate": {"key": cand_key},
+            "status": "uploaded",
+            "youtube_id": "yt_restart_888",
+            "title": "Restart Healed Video",
+            "headline": "Restart Headline",
+            "video": "out/restart.mp4",
+        }
+        store.put("videos", vid_id, video_record)
+
+        state_file = self.root / "state.json"
+        state = State(state_file)
+        self.assertNotIn(cand_key, [p.get("key") for p in state.posted])
+
+        # Run startup recovery (simulating process restart)
+        server.recover_interrupted_jobs()
+
+        # Verify state.json was healed
+        state = State(state_file)
+        matching = [p for p in state.posted if p.get("key") == cand_key]
+        self.assertEqual(len(matching), 1)
+        self.assertEqual(matching[0]["youtube_id"], "yt_restart_888")
         self.assertIn(cand_key, state.seen)
 
     # -------------------------------------------------------------------------

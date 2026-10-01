@@ -12,6 +12,22 @@ what's actually on `origin/main`.
 
 ## Current state (update this section each handoff)
 
+- **Stage 7 Phase 1 Corrective Fix Completed (State Sync Recovery & Connectivity Unblocking)**:
+  - **Recoverable SQLite & `state.json` Synchronization (Fix 1)**:
+    - In `studio/server.py`, `reconcile_video_upload()` detects if the SQLite video record already has `status == "uploaded"`. When already uploaded, it bypasses outbound HTTP requests (no duplicate uploads or spurious session queries) and immediately invokes `_sync_candidate_posted(video, yt_id)` to ensure candidate state in `state.json` is synchronized with `state.posted` and `state.seen`.
+    - Preserves existing `youtube_id` and rejects conflicting IDs with `ConflictError` (HTTP 409).
+    - Failed candidate synchronization raises an exception rather than returning success, allowing callers to retry safely. Subsequent retries are idempotent and do not duplicate entries in `state.json`.
+    - Server startup recovery in `recover_interrupted_jobs()` automatically heals existing `uploaded` videos that have missing candidate records in `state.json`.
+  - **Decoupled Network Probing from Global Server Lock (Fix 2)**:
+    - In `studio/server.py`, `StudioHandler.do_GET()` for `/api/status` performs network connectivity checking outside `with GUARD:`, ensuring slow DNS/socket probes never block `GUARD` or Studio operations.
+    - Implemented `is_online(cached: bool = True)` with a 10-second TTL cache (`_ONLINE_CACHE`, `_ONLINE_LOCK`). Cache hits return instantly. Cache misses attempt non-blocking lock acquisition; concurrent callers receive cached status rather than blocking.
+    - Robust exception handling in `probe_network_connectivity()` catches socket errors, logs warnings, safely releases locks, and returns `online: False`.
+  - **Test Suite**:
+    - `tests/test_stage7_phase1.py`: 18/18 passed (1.7s) covering both Phase 1 and the corrective fixes.
+    - `tests/test_stage6_publishing.py`: 38/38 passed (11.0s).
+    - `tests/test_studio_server.py`: 11/11 passed (3.9s).
+    - `tests/test_studio_store.py`: 9/9 passed (0.5s).
+    - Full discovery suite: 191 tests total (184 passed, 0 failures, 7 known environment-specific errors: 6 NVENC, 1 macOS).
 - **Automatic Publishing Workflow Restored (Removal of Mandatory Approval Gate)**:
   - **Direct Automated Publishing**: Transitioned from manual approval-gated publishing to a fully automated publishing workflow: Discover → Check eligibility → Process/render → Validate readiness → Automatically queue → Upload to YouTube → Confirm outcome. Videos become eligible for automatic publishing upon becoming `ready` with a valid rendered file on disk without requiring manual human approval.
   - **Canonical Automation Mode (`publish`)**: `publish` is established as the canonical automatic publishing mode in backend, frontend, and settings. The legacy `publish_approved` mode is supported as a backward-compatible alias and automatically normalized to `publish` by `/api/settings`. In `publish` mode, the scheduler selects eligible ready videos in FIFO order (oldest first) and queues them for YouTube upload.
@@ -422,3 +438,49 @@ Stage 2 meets all single-instance operational requirements: process tracking, pr
 - **Combined Targeted Test Run**: 71/71 passed (17.2s).
 - **Full Discovery Test Suite** (`$env:PYTHONUTF8='1'; python -m unittest discover tests`):
   - 186 tests total: 179 passed, 0 failures, 7 known environment-specific errors (6 NVENC on non-CUDA host, 1 macOS test calling `os.getuid()` on Windows).
+
+---
+
+## Stage 7 Phase 1 Corrective Fix: State Sync Recovery & Connectivity Unblocking
+
+### Implementation Date
+2026-10-01
+
+### Baseline Commit
+`691ea35` (`feat(stage7): state consistency, server lock unblocking and sqlite wal`)
+
+### Addressed Issues & Architectural Changes
+
+1. **Recoverable SQLite and state.json Synchronization (Fix 1)**:
+   - **Problem**: In commit `691ea35`, `reconcile_video_upload()` could persist `status="uploaded"` in SQLite but fail during `_sync_candidate_posted()` due to transient I/O errors. On subsequent retry, the function returned early because SQLite already recorded `uploaded`, leaving `state.json` permanently out-of-sync and risking duplicate candidate discovery.
+   - **Resolution**:
+     - Updated `reconcile_video_upload()`: if the video is already marked `uploaded`, it bypasses any outbound HTTP PUT/query and invokes `_sync_candidate_posted(video, yt_id)`.
+     - Preserves the existing `youtube_id` and rejects conflicting IDs with `ConflictError` (HTTP 409).
+     - Exceptions during synchronization are logged and re-raised so callers know synchronization is incomplete.
+     - Thanks to idempotent `State.mark_posted()`, retries update existing candidate metadata in-place and refresh `seen` without duplicate entries.
+     - Updated `recover_interrupted_jobs()` on server startup to scan all videos in SQLite: any video marked `uploaded` with a valid `youtube_id` is passed through `_sync_candidate_posted()`, automatically healing missing `state.json` entries upon process restart.
+
+2. **Decoupled Network Probing from /api/status Lock (Fix 2)**:
+   - **Problem**: In `StudioHandler.do_GET()`, `is_online()` performed a raw blocking socket connection while holding `with GUARD:`. Under slow DNS resolution or poor network connectivity, every `/api/status` request froze the server-wide `GUARD` lock for several seconds, blocking all worker job updates and client queries.
+   - **Resolution**:
+     - Separated `is_online()` execution from `GUARD`: `/api/status` now evaluates connectivity before acquiring `with GUARD:` strictly for in-memory status reads.
+     - Introduced an in-memory cache: `_ONLINE_CACHE: dict[str, Any] = {"status": True, "checked_at": 0.0}` with `_ONLINE_LOCK = threading.Lock()` and a 10.0-second TTL (`ONLINE_CACHE_TTL = 10.0`).
+     - `is_online(cached: bool = True)` checks cache freshness. If older than 10 seconds, it uses non-blocking lock acquisition (`_ONLINE_LOCK.acquire(blocking=False)`). If another thread is actively probing, callers immediately receive the cached status rather than stacking probes or stalling.
+     - Extracted raw socket connection into `probe_network_connectivity() -> bool`, which catches all socket and OS errors safely, logs a warning, and returns `False`.
+     - Freshness trade-off: Network status changes may take up to 10 seconds to reflect in `/api/status`, but `/api/status` and `GUARD` remain completely unblocked and responsive during network degradation or DNS delays.
+     - Timing-sensitive tests mock `server.is_online` so pure lock contention can be benchmarked deterministically.
+
+### Test Evidence
+- **Stage 7 Phase 1 Suite** (`tests/test_stage7_phase1.py`): 18/18 passed (1.7s).
+  - 13 Phase 1 baseline tests.
+  - `test_reconcile_state_sync_failure_and_retry_recovery`: Verifies disk failure during state sync leaves SQLite as `uploaded`, retry repairs `state.json` with zero network calls, repeated retry does not duplicate entries, and conflicting IDs raise `ConflictError`.
+  - `test_startup_recovery_repairs_missing_state_json`: Verifies `recover_interrupted_jobs()` heals missing `state.json` records on startup.
+  - `test_status_slow_probe_does_not_block_guard`: Verifies 5-second slow network probe outside `GUARD` allows concurrent thread to acquire `GUARD` in <0.5s.
+  - `test_status_concurrent_requests_use_cached_probe`: Verifies 5 concurrent requests return 200 OK without triggering simultaneous probes.
+  - `test_status_probe_exception_does_not_break_status`: Verifies probe socket errors log warning, release probe lock, and return 200 OK with `online: False`.
+- **Targeted Test Suites**:
+  - `tests/test_stage6_publishing.py`: 38/38 passed (11.0s).
+  - `tests/test_studio_server.py`: 11/11 passed (3.9s).
+  - `tests/test_studio_store.py`: 9/9 passed (0.5s).
+- **Full Discovery Test Suite** (`$env:PYTHONUTF8='1'; python -m unittest discover tests`):
+  - 191 tests total: 184 passed, 0 failures, 7 known environment-specific errors (6 NVENC on non-CUDA Windows host, 1 macOS test calling `os.getuid()` on Windows).
