@@ -54,6 +54,9 @@ ACTIVE_PROC: subprocess.Popen | None = None
 QUEUE_EVENT = threading.Event()
 STOP_EVENT = threading.Event()
 QUEUE_WORKER_THREAD: threading.Thread | None = None
+_CONNECTION_TEST_LOCK = threading.Lock()
+_RECONCILING_VIDEOS: set[str] = set()
+_RECONCILE_LOCK = threading.Lock()
 
 DEFAULT_AUTOMATION = {
     "enabled": False,
@@ -775,6 +778,9 @@ def test_youtube_connection() -> dict[str, Any]:
             "error": "token.json not found. Connect YouTube channel to authorize.",
         }
 
+    if not _CONNECTION_TEST_LOCK.acquire(blocking=False):
+        return {"status": "busy", "message": "A connection test is already in progress."}
+
     try:
         from google.oauth2.credentials import Credentials
         from google.auth.transport.requests import Request
@@ -832,30 +838,62 @@ def test_youtube_connection() -> dict[str, Any]:
         }
     except Exception as e:
         return {"status": "error", "error": str(e)}
+    finally:
+        _CONNECTION_TEST_LOCK.release()
+
+def _sync_candidate_posted(record: dict[str, Any], youtube_id: str) -> None:
+    """Synchronize an uploaded video candidate into state.json for discovery deduplication."""
+    cand = record.get("candidate") or {}
+    cand_key = cand.get("key") or record.get("key") or record.get("id")
+    if not cand_key:
+        return
+    try:
+        from core.state import State
+        state_file = ROOT / "state.json"
+        state = State(state_file)
+        state.mark_posted({
+            "key": cand_key,
+            "headline": record.get("headline", ""),
+            "title": record.get("title", ""),
+            "video_path": record.get("video", ""),
+            "youtube_id": youtube_id,
+            "dry_run": False,
+            "at": time.time(),
+        })
+    except Exception as e:
+        LOG.error("Failed to synchronize state.json for %s: %s", cand_key, e)
+        raise
 
 def reconcile_video_upload(vid_id: str) -> dict[str, Any]:
     """
     Query Google Resumable Upload protocol to reconcile ambiguous upload state.
     Sends authorized HTTP PUT Content-Range: bytes */size to resumable_uri.
-    - 200/201: Completed -> uploaded, extract id.
+    - 200/201: Completed -> uploaded, extract id, synchronize state.json.
     - 308: Incomplete -> upload_unknown (ready to resume from Range).
     - 404/410: Expired session -> upload_unresolved (finite session expired; does NOT prove absent).
     - Other/Network: Transient error -> remain upload_unknown.
     """
-    with GUARD:
-        video = store.get("videos", vid_id)
-        if not video:
-            raise ValueError(f"Video '{vid_id}' not found")
+    with _RECONCILE_LOCK:
+        if vid_id in _RECONCILING_VIDEOS:
+            raise ConflictError(f"Reconciliation already in progress for video '{vid_id}'.")
+        _RECONCILING_VIDEOS.add(vid_id)
 
-        resumable_uri = video.get("resumable_uri")
-        if not resumable_uri:
-            return {
-                "status": video.get("status", "upload_unknown"),
-                "message": "No active resumable upload session found for this video. Use manual resolution.",
-                "has_resumable_session": False,
-            }
+    try:
+        with GUARD:
+            video = store.get("videos", vid_id)
+            if not video:
+                raise ValueError(f"Video '{vid_id}' not found")
 
-        file_path = video.get("video")
+            resumable_uri = video.get("resumable_uri")
+            if not resumable_uri:
+                return {
+                    "status": video.get("status", "upload_unknown"),
+                    "message": "No active resumable upload session found for this video. Use manual resolution.",
+                    "has_resumable_session": False,
+                }
+
+            file_path = video.get("video")
+
         total_size = "*"
         if file_path:
             p = (ROOT / file_path).resolve()
@@ -881,56 +919,76 @@ def reconcile_video_upload(vid_id: str) -> dict[str, Any]:
                 "has_resumable_session": True,
             }
 
-        if resp.status_code in (200, 201):
-            try:
-                data = resp.json()
-                yt_id = data.get("id", "")
-            except Exception:
-                yt_id = ""
-            video["status"] = "uploaded"
-            if yt_id:
-                video["youtube_id"] = yt_id
-                video["youtube_url"] = f"https://www.youtube.com/watch?v={yt_id}"
-            video["resumable_uri"] = None
-            video["upload_failure_reason"] = ""
-            video["error"] = ""
-            store.put("videos", vid_id, video)
-            return {
-                "status": "uploaded",
-                "youtube_id": video.get("youtube_id", ""),
-                "youtube_url": video.get("youtube_url", ""),
-                "message": "Upload completed successfully according to YouTube session.",
-                "has_resumable_session": False,
-            }
+        with GUARD:
+            latest_video = store.get("videos", vid_id)
+            if not latest_video:
+                raise ValueError(f"Video '{vid_id}' not found")
 
-        if resp.status_code == 308:
-            range_hdr = resp.headers.get("Range", "")
-            video["status"] = "upload_unknown"
-            video["upload_failure_reason"] = f"Upload incomplete at byte range: {range_hdr or '0'}. Resumable session active."
-            store.put("videos", vid_id, video)
+            if latest_video.get("status") == "uploaded":
+                return {
+                    "status": "uploaded",
+                    "youtube_id": latest_video.get("youtube_id", ""),
+                    "youtube_url": latest_video.get("youtube_url", ""),
+                    "message": "Upload completed successfully according to YouTube session.",
+                    "has_resumable_session": False,
+                }
+
+            if resp.status_code in (200, 201):
+                try:
+                    data = resp.json()
+                    yt_id = data.get("id", "")
+                except Exception:
+                    yt_id = ""
+                latest_video["status"] = "uploaded"
+                if yt_id:
+                    latest_video["youtube_id"] = yt_id
+                    latest_video["youtube_url"] = f"https://www.youtube.com/watch?v={yt_id}"
+                latest_video["resumable_uri"] = None
+                latest_video["upload_failure_reason"] = ""
+                latest_video["error"] = ""
+                store.put("videos", vid_id, latest_video)
+
+                _sync_candidate_posted(latest_video, yt_id)
+
+                return {
+                    "status": "uploaded",
+                    "youtube_id": latest_video.get("youtube_id", ""),
+                    "youtube_url": latest_video.get("youtube_url", ""),
+                    "message": "Upload completed successfully according to YouTube session.",
+                    "has_resumable_session": False,
+                }
+
+            if resp.status_code == 308:
+                range_hdr = resp.headers.get("Range", "")
+                latest_video["status"] = "upload_unknown"
+                latest_video["upload_failure_reason"] = f"Upload incomplete at byte range: {range_hdr or '0'}. Resumable session active."
+                store.put("videos", vid_id, latest_video)
+                return {
+                    "status": "resumable",
+                    "range": range_hdr,
+                    "message": f"Resumable session active ({range_hdr or '0 bytes received'}). You can resume uploading.",
+                    "has_resumable_session": True,
+                }
+
+            if resp.status_code in (404, 410):
+                latest_video["status"] = "upload_unresolved"
+                latest_video["resumable_uri"] = None
+                latest_video["upload_failure_reason"] = f"Resumable upload session expired (HTTP {resp.status_code}). Manual verification on YouTube Studio required."
+                store.put("videos", vid_id, latest_video)
+                return {
+                    "status": "upload_unresolved",
+                    "message": f"Resumable upload session has expired (HTTP {resp.status_code}). Manual verification on YouTube Studio is required.",
+                    "has_resumable_session": False,
+                }
+
             return {
-                "status": "resumable",
-                "range": range_hdr,
-                "message": f"Resumable session active ({range_hdr or '0 bytes received'}). You can resume uploading.",
+                "status": "upload_unknown",
+                "message": f"Unexpected response from upload session (HTTP {resp.status_code}). Status remains upload_unknown.",
                 "has_resumable_session": True,
             }
-
-        if resp.status_code in (404, 410):
-            video["status"] = "upload_unresolved"
-            video["resumable_uri"] = None
-            video["upload_failure_reason"] = f"Resumable upload session expired (HTTP {resp.status_code}). Manual verification on YouTube Studio required."
-            store.put("videos", vid_id, video)
-            return {
-                "status": "upload_unresolved",
-                "message": f"Resumable upload session has expired (HTTP {resp.status_code}). Manual verification on YouTube Studio is required.",
-                "has_resumable_session": False,
-            }
-
-        return {
-            "status": "upload_unknown",
-            "message": f"Unexpected response from upload session (HTTP {resp.status_code}). Status remains upload_unknown.",
-            "has_resumable_session": True,
-        }
+    finally:
+        with _RECONCILE_LOCK:
+            _RECONCILING_VIDEOS.discard(vid_id)
 
 def resolve_manual_video(vid_id: str, resolution: str, youtube_id: str = "") -> dict[str, Any]:
     """Manually resolve an ambiguous upload outcome (upload_unknown / upload_unresolved)."""
@@ -940,8 +998,6 @@ def resolve_manual_video(vid_id: str, resolution: str, youtube_id: str = "") -> 
             raise ValueError(f"Video '{vid_id}' not found")
 
         current_status = video.get("status")
-        if current_status not in ("upload_unknown", "upload_unresolved", "failed"):
-            raise ValueError(f"Video '{vid_id}' is in status '{current_status}'. Only upload_unknown, upload_unresolved, or failed videos can be manually resolved.")
 
         if resolution == "confirm_uploaded":
             yt_id = (youtube_id or "").strip()
@@ -955,6 +1011,21 @@ def resolve_manual_video(vid_id: str, resolution: str, youtube_id: str = "") -> 
             if not yt_id or len(yt_id) < 6:
                 raise ValueError("A valid YouTube Video ID or URL is required to confirm upload.")
 
+            # Idempotent re-confirmation: if already confirmed with this ID, sync state and return success
+            if current_status == "uploaded":
+                if video.get("youtube_id") == yt_id:
+                    _sync_candidate_posted(video, yt_id)
+                    return {
+                        "status": "uploaded",
+                        "youtube_id": yt_id,
+                        "youtube_url": video.get("youtube_url") or f"https://www.youtube.com/watch?v={yt_id}",
+                        "message": f"Video already confirmed as uploaded to YouTube ({yt_id}).",
+                    }
+                raise ConflictError(f"Video '{vid_id}' is already confirmed with different YouTube ID '{video.get('youtube_id')}'.")
+
+            if current_status not in ("upload_unknown", "upload_unresolved", "failed"):
+                raise ValueError(f"Video '{vid_id}' is in status '{current_status}'. Only upload_unknown, upload_unresolved, or failed videos can be manually resolved.")
+
             video["status"] = "uploaded"
             video["youtube_id"] = yt_id
             video["youtube_url"] = f"https://www.youtube.com/watch?v={yt_id}"
@@ -962,6 +1033,9 @@ def resolve_manual_video(vid_id: str, resolution: str, youtube_id: str = "") -> 
             video["upload_failure_reason"] = ""
             video["error"] = ""
             store.put("videos", vid_id, video)
+
+            _sync_candidate_posted(video, yt_id)
+
             return {
                 "status": "uploaded",
                 "youtube_id": yt_id,
@@ -970,6 +1044,9 @@ def resolve_manual_video(vid_id: str, resolution: str, youtube_id: str = "") -> 
             }
 
         elif resolution == "confirm_absent":
+            if current_status not in ("upload_unknown", "upload_unresolved", "failed"):
+                raise ValueError(f"Video '{vid_id}' is in status '{current_status}'. Only upload_unknown, upload_unresolved, or failed videos can be manually resolved.")
+
             video["status"] = "ready"
             video["youtube_id"] = ""
             video["youtube_url"] = ""
@@ -1688,8 +1765,7 @@ class StudioHandler(BaseHTTPRequestHandler):
             data = json.loads(body.decode("utf-8")) if body else {}
             if not isinstance(data, dict):
                 raise ValueError("Invalid request")
-            with GUARD:
-                result = self.mutate(path, data)
+            result = self.mutate(path, data)
             self.send_json(result if result is not None else {"status": "ok"})
         except ConflictError as e:
             self.send_json({"error": str(e)}, 409)
@@ -1720,68 +1796,69 @@ class StudioHandler(BaseHTTPRequestHandler):
             return start_job(data.get("action", ""), data.get("key", ""), extra=data)
             
         if path == "/api/video":
-            vid_id = data.get("id", "")
-            record = store.get("videos", vid_id)
-            if not record:
-                raise ValueError("Video not found")
+            with GUARD:
+                vid_id = data.get("id", "")
+                record = store.get("videos", vid_id)
+                if not record:
+                    raise ValueError("Video not found")
 
-            if data.get("action") == "delete":
-                all_jobs = store.records("jobs")
-                for j in all_jobs:
-                    if j.get("status") in ("pending", "running"):
-                        if job_matches_video(j, vid_id):
-                            raise ConflictError(
-                                f"Cannot delete video '{vid_id}': a pipeline job ({j.get('action')}) is currently {j.get('status')}."
-                            )
+                if data.get("action") == "delete":
+                    all_jobs = store.records("jobs")
+                    for j in all_jobs:
+                        if j.get("status") in ("pending", "running"):
+                            if job_matches_video(j, vid_id):
+                                raise ConflictError(
+                                    f"Cannot delete video '{vid_id}': a pipeline job ({j.get('action')}) is currently {j.get('status')}."
+                                )
 
-                for field in ("video", "poster"):
-                    file_path = record.get(field)
-                    if file_path:
-                        p = (ROOT / file_path).resolve()
-                        out_dir = (ROOT / "out").resolve()
-                        if p.is_relative_to(out_dir) and p.is_file():
-                            try:
-                                p.unlink()
-                            except OSError:
-                                pass
-                store.delete("videos", vid_id)
-                return {"status": "deleted", "id": vid_id}
+                    for field in ("video", "poster"):
+                        file_path = record.get(field)
+                        if file_path:
+                            p = (ROOT / file_path).resolve()
+                            out_dir = (ROOT / "out").resolve()
+                            if p.is_relative_to(out_dir) and p.is_file():
+                                try:
+                                    p.unlink()
+                                except OSError:
+                                    pass
+                    store.delete("videos", vid_id)
+                    return {"status": "deleted", "id": vid_id}
 
-            if "title" in data:
-                record["title"] = data["title"]
-            if "description" in data:
-                record["description"] = data["description"]
-            if "headline" in data:
-                record["headline"] = data["headline"]
-            if "style_preset" in data:
-                val = data["style_preset"]
-                if val is None:
-                    preset_val = ""
-                elif isinstance(val, str):
-                    preset_val = val.strip()
-                else:
-                    raise ValueError(f"Invalid style_preset: expected string, got {type(val).__name__}")
-                valid_names = {p["name"] for p in STYLE_PRESETS}
-                if preset_val and preset_val not in valid_names:
-                    raise ValueError(f"Invalid style_preset: '{preset_val}'. Must be one of {sorted(valid_names)} or empty string")
-                record["style_preset"] = preset_val
-            if "review_status" in data:
-                val = data["review_status"]
-                if not isinstance(val, str):
-                    raise ValueError(f"Invalid review_status: expected string, got {type(val).__name__}")
-                val = val.strip().lower()
-                valid_reviews = {"unreviewed", "approved", "rejected"}
-                if val not in valid_reviews:
-                    raise ValueError(f"Invalid review_status: '{val}'. Must be one of {sorted(valid_reviews)}")
-                record["review_status"] = val
-            if "privacy" in data:
-                p_val = data["privacy"]
-                if not isinstance(p_val, str) or p_val not in ("public", "unlisted", "private"):
-                    raise ValueError(f"Invalid privacy: '{p_val}'. Must be one of ('public', 'unlisted', 'private')")
-                record["privacy"] = p_val
-            record.setdefault("review_status", "unreviewed")
-            store.put("videos", vid_id, record)
-            return record
+                if "title" in data:
+                    record["title"] = data["title"]
+                if "description" in data:
+                    record["description"] = data["description"]
+                if "headline" in data:
+                    record["headline"] = data["headline"]
+                if "style_preset" in data:
+                    val = data["style_preset"]
+                    if val is None:
+                        preset_val = ""
+                    elif isinstance(val, str):
+                        preset_val = val.strip()
+                    else:
+                        raise ValueError(f"Invalid style_preset: expected string, got {type(val).__name__}")
+                    valid_names = {p["name"] for p in STYLE_PRESETS}
+                    if preset_val and preset_val not in valid_names:
+                        raise ValueError(f"Invalid style_preset: '{preset_val}'. Must be one of {sorted(valid_names)} or empty string")
+                    record["style_preset"] = preset_val
+                if "review_status" in data:
+                    val = data["review_status"]
+                    if not isinstance(val, str):
+                        raise ValueError(f"Invalid review_status: expected string, got {type(val).__name__}")
+                    val = val.strip().lower()
+                    valid_reviews = {"unreviewed", "approved", "rejected"}
+                    if val not in valid_reviews:
+                        raise ValueError(f"Invalid review_status: '{val}'. Must be one of {sorted(valid_reviews)}")
+                    record["review_status"] = val
+                if "privacy" in data:
+                    p_val = data["privacy"]
+                    if not isinstance(p_val, str) or p_val not in ("public", "unlisted", "private"):
+                        raise ValueError(f"Invalid privacy: '{p_val}'. Must be one of ('public', 'unlisted', 'private')")
+                    record["privacy"] = p_val
+                record.setdefault("review_status", "unreviewed")
+                store.put("videos", vid_id, record)
+                return record
 
         if path == "/api/video/reconcile":
             vid_id = data.get("id")
@@ -1802,108 +1879,112 @@ class StudioHandler(BaseHTTPRequestHandler):
             return test_youtube_connection()
 
         if path == "/api/connections":
-            secrets_path = ROOT / "studio-secrets.json"
-            existing = read_json(secrets_path, {})
-            allowed_keys = ("GEMINI_API_KEY", "ANTHROPIC_API_KEY", "OPENAI_API_KEY",
-                            "YOUTUBE_API_KEY", "REDDIT_CLIENT_ID", "REDDIT_CLIENT_SECRET")
-            for k, v in data.items():
-                if k in allowed_keys:
-                    if not isinstance(v, str) or len(v) > 4096:
-                        raise ValueError("Invalid API key")
-                    cleaned = v.strip()
-                    if cleaned:
-                        existing[k] = cleaned
-                    else:
-                        # An explicit empty value means "remove this key",
-                        # not "save a blank string".
-                        existing.pop(k, None)
-            write_json(secrets_path, existing, private=True)
-            store.load_secrets()
-            return {"status": "saved"}
+            with GUARD:
+                secrets_path = ROOT / "studio-secrets.json"
+                existing = read_json(secrets_path, {})
+                allowed_keys = ("GEMINI_API_KEY", "ANTHROPIC_API_KEY", "OPENAI_API_KEY",
+                                "YOUTUBE_API_KEY", "REDDIT_CLIENT_ID", "REDDIT_CLIENT_SECRET")
+                for k, v in data.items():
+                    if k in allowed_keys:
+                        if not isinstance(v, str) or len(v) > 4096:
+                            raise ValueError("Invalid API key")
+                        cleaned = v.strip()
+                        if cleaned:
+                            existing[k] = cleaned
+                        else:
+                            # An explicit empty value means "remove this key",
+                            # not "save a blank string".
+                            existing.pop(k, None)
+                write_json(secrets_path, existing, private=True)
+                store.load_secrets()
+                return {"status": "saved"}
 
         if path == "/api/subreddits":
-            cfg = get_config()
-            discovery = cfg.setdefault("discovery", {})
-            subreddits = discovery.setdefault("subreddits", [])
+            with GUARD:
+                cfg = get_config()
+                discovery = cfg.setdefault("discovery", {})
+                subreddits = discovery.setdefault("subreddits", [])
 
-            action = data.get("action", "add")
-            if action == "add":
-                sub_name = str(data.get("name", "")).strip().lower().replace("r/", "")
-                if not sub_name or len(sub_name) > 60:
-                    raise ValueError("Invalid subreddit name")
-                cat = str(data.get("category", "General"))[:60]
-                try:
-                    min_score = int(data.get("min_score", 200))
-                except (TypeError, ValueError):
-                    raise ValueError("Invalid min_score")
-                if not 0 <= min_score <= 100000:
-                    raise ValueError("Invalid min_score")
-                subreddits = [s for s in subreddits if (s.get("name") if isinstance(s, dict) else s) != sub_name]
-                if len(subreddits) >= 60:
-                    raise ValueError("Use up to 60 subreddits")
-                subreddits.append({"name": sub_name, "category": cat, "min_score": min_score})
-                discovery["subreddits"] = subreddits
-                save_config(cfg)
-                return {"status": "added", "subreddits": subreddits}
-            elif action == "delete":
-                sub_name = str(data.get("name", "")).strip().lower().replace("r/", "")
-                discovery["subreddits"] = [s for s in subreddits if (s.get("name") if isinstance(s, dict) else s) != sub_name]
-                save_config(cfg)
-                return {"status": "deleted", "subreddits": discovery["subreddits"]}
-            else:
-                raise ValueError("Unknown subreddit action")
+                action = data.get("action", "add")
+                if action == "add":
+                    sub_name = str(data.get("name", "")).strip().lower().replace("r/", "")
+                    if not sub_name or len(sub_name) > 60:
+                        raise ValueError("Invalid subreddit name")
+                    cat = str(data.get("category", "General"))[:60]
+                    try:
+                        min_score = int(data.get("min_score", 200))
+                    except (TypeError, ValueError):
+                        raise ValueError("Invalid min_score")
+                    if not 0 <= min_score <= 100000:
+                        raise ValueError("Invalid min_score")
+                    subreddits = [s for s in subreddits if (s.get("name") if isinstance(s, dict) else s) != sub_name]
+                    if len(subreddits) >= 60:
+                        raise ValueError("Use up to 60 subreddits")
+                    subreddits.append({"name": sub_name, "category": cat, "min_score": min_score})
+                    discovery["subreddits"] = subreddits
+                    save_config(cfg)
+                    return {"status": "added", "subreddits": subreddits}
+                elif action == "delete":
+                    sub_name = str(data.get("name", "")).strip().lower().replace("r/", "")
+                    discovery["subreddits"] = [s for s in subreddits if (s.get("name") if isinstance(s, dict) else s) != sub_name]
+                    save_config(cfg)
+                    return {"status": "deleted", "subreddits": discovery["subreddits"]}
+                else:
+                    raise ValueError("Unknown subreddit action")
 
         if path == "/api/youtube_channels":
-            cfg = get_config()
-            discovery = cfg.setdefault("discovery", {})
-            channels = discovery.setdefault("youtube_channels", [])
+            with GUARD:
+                cfg = get_config()
+                discovery = cfg.setdefault("discovery", {})
+                channels = discovery.setdefault("youtube_channels", [])
 
-            action = data.get("action", "add")
-            if action == "add":
-                name = str(data.get("name", "")).strip()[:100]
-                channel_id = str(data.get("channel", "")).strip()
-                if not name or not channel_id or len(channel_id) > 60:
-                    raise ValueError("Channel name and ID are required")
-                licence = str(data.get("licence", "unknown"))[:30]
-                channels = [c for c in channels if c.get("channel") != channel_id]
-                if len(channels) >= 60:
-                    raise ValueError("Use up to 60 channels")
-                channels.append({"name": name, "channel": channel_id, "licence": licence})
-                discovery["youtube_channels"] = channels
-                save_config(cfg)
-                return {"status": "added", "youtube_channels": channels}
-            elif action == "delete":
-                channel_id = str(data.get("channel", "")).strip()
-                discovery["youtube_channels"] = [c for c in channels if c.get("channel") != channel_id]
-                save_config(cfg)
-                return {"status": "deleted", "youtube_channels": discovery["youtube_channels"]}
-            else:
-                raise ValueError("Unknown channel action")
+                action = data.get("action", "add")
+                if action == "add":
+                    name = str(data.get("name", "")).strip()[:100]
+                    channel_id = str(data.get("channel", "")).strip()
+                    if not name or not channel_id or len(channel_id) > 60:
+                        raise ValueError("Channel name and ID are required")
+                    licence = str(data.get("licence", "unknown"))[:30]
+                    channels = [c for c in channels if c.get("channel") != channel_id]
+                    if len(channels) >= 60:
+                        raise ValueError("Use up to 60 channels")
+                    channels.append({"name": name, "channel": channel_id, "licence": licence})
+                    discovery["youtube_channels"] = channels
+                    save_config(cfg)
+                    return {"status": "added", "youtube_channels": channels}
+                elif action == "delete":
+                    channel_id = str(data.get("channel", "")).strip()
+                    discovery["youtube_channels"] = [c for c in channels if c.get("channel") != channel_id]
+                    save_config(cfg)
+                    return {"status": "deleted", "youtube_channels": discovery["youtube_channels"]}
+                else:
+                    raise ValueError("Unknown channel action")
 
         if path == "/api/youtube_queries":
-            cfg = get_config()
-            discovery = cfg.setdefault("discovery", {})
-            queries = discovery.setdefault("youtube_queries", [])
+            with GUARD:
+                cfg = get_config()
+                discovery = cfg.setdefault("discovery", {})
+                queries = discovery.setdefault("youtube_queries", [])
 
-            action = data.get("action", "add")
-            if action == "add":
-                q = str(data.get("query", "")).strip()
-                if not q or len(q) > 200:
-                    raise ValueError("Invalid search query")
-                if q not in queries:
-                    if len(queries) >= 40:
-                        raise ValueError("Use up to 40 search queries")
-                    queries.append(q)
-                discovery["youtube_queries"] = queries
-                save_config(cfg)
-                return {"status": "added", "youtube_queries": queries}
-            elif action == "delete":
-                q = str(data.get("query", "")).strip()
-                discovery["youtube_queries"] = [x for x in queries if x != q]
-                save_config(cfg)
-                return {"status": "deleted", "youtube_queries": discovery["youtube_queries"]}
-            else:
-                raise ValueError("Unknown query action")
+                action = data.get("action", "add")
+                if action == "add":
+                    q = str(data.get("query", "")).strip()
+                    if not q or len(q) > 200:
+                        raise ValueError("Invalid search query")
+                    if q not in queries:
+                        if len(queries) >= 40:
+                            raise ValueError("Use up to 40 search queries")
+                        queries.append(q)
+                    discovery["youtube_queries"] = queries
+                    save_config(cfg)
+                    return {"status": "added", "youtube_queries": queries}
+                elif action == "delete":
+                    q = str(data.get("query", "")).strip()
+                    discovery["youtube_queries"] = [x for x in queries if x != q]
+                    save_config(cfg)
+                    return {"status": "deleted", "youtube_queries": discovery["youtube_queries"]}
+                else:
+                    raise ValueError("Unknown query action")
 
         if path == "/api/subreddits/test":
             from core.scrape_reddit import fetch_subreddit_posts
@@ -1914,58 +1995,60 @@ class StudioHandler(BaseHTTPRequestHandler):
             return {"subreddit": sub_name, "count": len(posts), "sample": posts[:3]}
 
         if path == "/api/settings":
-            cfg_patch = data.get("config")
-            auto = data.get("automation")
-            if cfg_patch is not None:
-                save_config(validate_settings_config(cfg_patch))
-            if auto is not None:
-                if (not isinstance(auto, dict)
-                        or not isinstance(auto.get("enabled"), bool)
-                        or not _is_number(auto.get("interval_hours"))
-                        or not 1 <= auto["interval_hours"] <= 168
-                        or auto.get("mode") not in ("preview", "publish", "publish_approved")):
-                    raise ValueError("Choose an interval of 1-168 hours and a valid mode")
-                if auto.get("mode") == "publish_approved":
-                    auto["mode"] = "publish"
-                current_auto = get_automation_settings()
-                current_auto.update(auto)
-                write_json(ROOT / "studio-settings.json", current_auto)
-            return {"status": "updated"}
+            with GUARD:
+                cfg_patch = data.get("config")
+                auto = data.get("automation")
+                if cfg_patch is not None:
+                    save_config(validate_settings_config(cfg_patch))
+                if auto is not None:
+                    if (not isinstance(auto, dict)
+                            or not isinstance(auto.get("enabled"), bool)
+                            or not _is_number(auto.get("interval_hours"))
+                            or not 1 <= auto["interval_hours"] <= 168
+                            or auto.get("mode") not in ("preview", "publish", "publish_approved")):
+                        raise ValueError("Choose an interval of 1-168 hours and a valid mode")
+                    if auto.get("mode") == "publish_approved":
+                        auto["mode"] = "publish"
+                    current_auto = get_automation_settings()
+                    current_auto.update(auto)
+                    write_json(ROOT / "studio-settings.json", current_auto)
+                return {"status": "updated"}
 
         if path == "/api/wizard":
             # First-run onboarding wizard configuration
-            cfg = get_config()
-            account = cfg.setdefault("account", {})
-            if "name" in data:
-                if not isinstance(data["name"], str) or not data["name"].strip() or len(data["name"]) > 100:
-                    raise ValueError("Invalid channel name")
-                account["name"] = data["name"]
-            if "handle" in data:
-                if not isinstance(data["handle"], str) or len(data["handle"]) > 100:
-                    raise ValueError("Invalid channel handle")
-                account["handle"] = data["handle"]
-            if "subreddits" in data:
-                subs = data["subreddits"]
-                if not isinstance(subs, list) or len(subs) > 60:
-                    raise ValueError("Invalid subreddits list")
-                cfg.setdefault("discovery", {})["subreddits"] = subs
-            save_config(cfg)
+            with GUARD:
+                cfg = get_config()
+                account = cfg.setdefault("account", {})
+                if "name" in data:
+                    if not isinstance(data["name"], str) or not data["name"].strip() or len(data["name"]) > 100:
+                        raise ValueError("Invalid channel name")
+                    account["name"] = data["name"]
+                if "handle" in data:
+                    if not isinstance(data["handle"], str) or len(data["handle"]) > 100:
+                        raise ValueError("Invalid channel handle")
+                    account["handle"] = data["handle"]
+                if "subreddits" in data:
+                    subs = data["subreddits"]
+                    if not isinstance(subs, list) or len(subs) > 60:
+                        raise ValueError("Invalid subreddits list")
+                    cfg.setdefault("discovery", {})["subreddits"] = subs
+                save_config(cfg)
 
-            if "api_key" in data and "provider" in data:
-                prov = str(data["provider"]).lower()
-                if prov not in ("gemini", "anthropic", "openai"):
-                    raise ValueError("Invalid provider")
-                api_key = data["api_key"]
-                if not isinstance(api_key, str) or len(api_key) > 4096:
-                    raise ValueError("Invalid API key")
-                key_name = f"{prov.upper()}_API_KEY"
-                secrets_path = ROOT / "studio-secrets.json"
-                sec = read_json(secrets_path, {})
-                sec[key_name] = api_key.strip()
-                write_json(secrets_path, sec, private=True)
-                store.load_secrets()
+                if "api_key" in data and "provider" in data:
+                    prov = str(data["provider"]).lower()
+                    if prov not in ("gemini", "anthropic", "openai"):
+                        raise ValueError("Invalid provider")
+                    api_key = data["api_key"]
+                    if not isinstance(api_key, str) or len(api_key) > 4096:
+                        raise ValueError("Invalid API key")
+                    key_name = f"{prov.upper()}_API_KEY"
+                    secrets_path = ROOT / "studio-secrets.json"
+                    sec = read_json(secrets_path, {})
+                    sec[key_name] = api_key.strip()
+                    write_json(secrets_path, sec, private=True)
+                    store.load_secrets()
 
-            return {"status": "wizard_completed"}
+                return {"status": "wizard_completed"}
 
         raise ValueError("Unknown action")
 

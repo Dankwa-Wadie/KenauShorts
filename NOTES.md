@@ -362,4 +362,63 @@ Stage 2 meets all single-instance operational requirements: process tracking, pr
 - **Test E (Auto Mode & Chain Re-render)**: POSTed `""` (Auto mode) and re-rendered. Job completed successfully, generating `short_1790296060_yt_ctZOWjE_edit_00d01e.mp4` (7,842,513 bytes) with `raw_video` maintained across multiple re-renders.
 - **Test F (Multi-instance Collision)**: Executed `python -m studio.server` in a secondary process. Exited immediately with `.server.lock` permission denied error. Primary server remained alive and responsive.
 
+---
 
+## Stage 7 Phase 1: State Consistency, Server Lock Unblocking & SQLite Reliability
+
+### Implementation Date
+2026-10-01
+
+### Baseline Commit
+`46473dd` (`fix(stage6): remove approval gate and restore automatic publishing`)
+
+### Implemented Scope & Architectural Changes
+
+1. **Server Lock Unblocking (PERF-01)**:
+   - **Problem**: Outbound network I/O operations (`test_youtube_connection()`, `reconcile_video_upload()`, and `fetch_subreddit_posts()`) were executing while holding the server-wide `GUARD` lock. A slow external API call or network timeout froze Studio and blocked all unrelated endpoints such as `GET /api/status`.
+   - **Resolution**:
+     - Removed coarse `with GUARD:` in `StudioHandler.do_POST()`. Local in-memory state mutations inside `StudioHandler.mutate()` (`/api/video`, `/api/connections`, `/api/subreddits`, `/api/youtube_channels`, `/api/youtube_queries`, `/api/settings`, `/api/wizard`) are individually scoped under `with GUARD:`.
+     - In `test_youtube_connection()`, eliminated `GUARD` acquisition. Added `_CONNECTION_TEST_LOCK = threading.Lock()` with non-blocking acquisition (`_CONNECTION_TEST_LOCK.acquire(blocking=False)`), returning `{"status": "busy", "message": "A connection test is already in progress."}` if already running.
+     - In `reconcile_video_upload()`, fine-grained the locking: `GUARD` is acquired only to read the video record, HTTP PUT to Google resumable upload URI is executed outside `GUARD`, and `GUARD` is re-acquired to persist the updated record and synchronize `state.json`.
+     - Added process-level per-video lock set `_RECONCILING_VIDEOS: set[str]` protected by `_RECONCILE_LOCK = threading.Lock()` to prevent duplicate concurrent reconciliations on the same video, raising HTTP 409 `ConflictError`.
+     - `/api/subreddits/test` (`fetch_subreddit_posts`) executes network calls completely outside `GUARD`.
+
+2. **Manual Resolution State Synchronization (DATA-01)**:
+   - **Problem**: Confirming an ambiguous upload as successful via `resolve_manual_video()` with `confirm_uploaded` updated the SQLite database record to `uploaded` but did not synchronize `state.json`. This left candidate posts unmarked in `state.posted` and `state.seen`, allowing automated discovery loops to re-discover and re-process duplicate videos.
+   - **Resolution**:
+     - Added helper `_sync_candidate_posted(record, youtube_id)` in `studio/server.py` invoked both upon `confirm_uploaded` manual resolution and upon successful HTTP 200/201 reconciliation.
+     - Synchronizes candidate key (`record["candidate"]["key"]` fallback to `record["key"]` or `id`), title, headline, video path, confirmed `youtube_id`, and timestamp into `state.json` via `State.mark_posted()`.
+     - Ensured idempotency in `resolve_manual_video()`: if an already-`uploaded` video is re-confirmed with the same `youtube_id`, it re-syncs `state.json` and returns success without error. Attempting to re-confirm with a conflicting `youtube_id` raises `ConflictError` (HTTP 409).
+     - Enhanced `core/state.py` `State.mark_posted(entry)` to be fully idempotent: updates existing entry fields in-place and refreshes `self.seen[key]` without appending duplicate records to `self.posted`.
+
+3. **SQLite Concurrency & Schema Cleanup (DATA-02)**:
+   - **Problem**: SQLite was operating in default rollback journal mode with default busy timeout, risking contention. Additionally, `connect()` in `studio/store.py` executed `CREATE TABLE IF NOT EXISTS subreddits`, an unused and inconsistent table schema (all subreddits are stored in `config.json`).
+   - **Resolution**:
+     - In `studio/store.py` `connect()`, configured:
+       - `PRAGMA journal_mode=WAL;` (Write-Ahead Logging for high-concurrency readers & writers).
+       - `PRAGMA synchronous=NORMAL;` (safe durability with reduced disk sync overhead).
+       - `PRAGMA busy_timeout=15000;` (15s wait to gracefully handle transaction concurrency).
+     - Removed `CREATE TABLE IF NOT EXISTS subreddits` from `connect()`.
+     - Added strict table validation in `store.put()`, `store.get()`, `store.records()`, and `store.delete()`: raises `ValueError(f"Unsupported table: {table}")` if table is not in `("videos", "jobs")`.
+
+### Test Evidence
+- **Stage 7 Phase 1 Suite** (`tests/test_stage7_phase1.py`): 13/13 passed (2.1s).
+  - Tests non-blocking `/api/status` during slow YouTube connection test.
+  - Tests busy status on concurrent YouTube connection test.
+  - Tests non-blocking `/api/status` during slow upload reconciliation.
+  - Tests HTTP 409 ConflictError on concurrent duplicate video reconciliation.
+  - Tests `state.json` candidate synchronization on reconciliation completion.
+  - Tests manual `confirm_uploaded` synchronization to `state.json`.
+  - Tests idempotency and conflict prevention in `resolve_manual_video()`.
+  - Tests rejection of inappropriate video statuses.
+  - Tests SQLite WAL, synchronous=NORMAL, and busy_timeout pragmas.
+  - Tests table validation across all store CRUD operations.
+  - Tests absence of `subreddits` table creation on clean databases.
+  - Tests idempotent `State.mark_posted()`.
+- **Targeted Publishing & Server Test Suites**:
+  - `tests/test_stage6_publishing.py`: 38/38 passed (6.9s).
+  - `tests/test_studio_server.py`: 11/11 passed (3.8s).
+  - `tests/test_studio_store.py`: 9/9 passed (0.5s).
+- **Combined Targeted Test Run**: 71/71 passed (17.2s).
+- **Full Discovery Test Suite** (`$env:PYTHONUTF8='1'; python -m unittest discover tests`):
+  - 186 tests total: 179 passed, 0 failures, 7 known environment-specific errors (6 NVENC on non-CUDA host, 1 macOS test calling `os.getuid()` on Windows).

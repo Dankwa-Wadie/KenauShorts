@@ -68,8 +68,16 @@ class State:
         self.save()
 
     def mark_posted(self, entry: dict[str, Any]) -> None:
-        self.posted.append(entry)
         key = entry.get("key") or entry.get("url")
+        yt_id = entry.get("youtube_id")
+        if key and yt_id:
+            for p in self.posted:
+                if (p.get("key") == key or p.get("url") == key) and p.get("youtube_id") == yt_id:
+                    p.update(entry)
+                    self.seen[key] = time.time()
+                    self.save()
+                    return
+        self.posted.append(entry)
         if key:
             self.seen[key] = time.time()
         self.save()

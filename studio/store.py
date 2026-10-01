@@ -25,7 +25,9 @@ def connect():
     db.row_factory = sqlite3.Row
     db.execute("CREATE TABLE IF NOT EXISTS videos (id TEXT PRIMARY KEY, data TEXT NOT NULL)")
     db.execute("CREATE TABLE IF NOT EXISTS jobs (id TEXT PRIMARY KEY, data TEXT NOT NULL)")
-    db.execute("CREATE TABLE IF NOT EXISTS subreddits (name TEXT PRIMARY KEY, category TEXT, min_score INTEGER, enabled INTEGER)")
+    db.execute("PRAGMA journal_mode=WAL;")
+    db.execute("PRAGMA synchronous=NORMAL;")
+    db.execute("PRAGMA busy_timeout=15000;")
     try:
         with db:
             yield db
@@ -33,7 +35,8 @@ def connect():
         db.close()
 
 def put(table: str, key: str, data: dict[str, Any]) -> None:
-    assert table in ("videos", "jobs", "subreddits")
+    if table not in ("videos", "jobs"):
+        raise ValueError(f"Unsupported table: {table}")
     with connect() as db:
         db.execute(
             f"INSERT INTO {table} VALUES (?, ?) ON CONFLICT(id) DO UPDATE SET data=excluded.data",
@@ -41,7 +44,8 @@ def put(table: str, key: str, data: dict[str, Any]) -> None:
         )
 
 def get(table: str, key: str) -> dict[str, Any] | None:
-    assert table in ("videos", "jobs")
+    if table not in ("videos", "jobs"):
+        raise ValueError(f"Unsupported table: {table}")
     if not DB.exists():
         return None
     with contextlib.closing(sqlite3.connect(f"file:{DB}?mode=ro", uri=True, timeout=15)) as db:
@@ -50,7 +54,8 @@ def get(table: str, key: str) -> dict[str, Any] | None:
     return json.loads(row["data"]) if row else None
 
 def records(table: str) -> list[dict[str, Any]]:
-    assert table in ("videos", "jobs")
+    if table not in ("videos", "jobs"):
+        raise ValueError(f"Unsupported table: {table}")
     if not DB.exists():
         return []
     with contextlib.closing(sqlite3.connect(f"file:{DB}?mode=ro", uri=True, timeout=15)) as db:
@@ -59,7 +64,8 @@ def records(table: str) -> list[dict[str, Any]]:
     return [json.loads(r["data"]) for r in rows]
 
 def delete(table: str, key: str) -> None:
-    assert table in ("videos", "jobs")
+    if table not in ("videos", "jobs"):
+        raise ValueError(f"Unsupported table: {table}")
     if not DB.exists():
         return
     with connect() as db:
