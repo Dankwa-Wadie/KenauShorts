@@ -37,8 +37,6 @@ def work(action: str, key: str) -> None:
         config = json.loads(cfg_path.read_text(encoding="utf-8"))
 
         if action == "upload":
-            if record.get("review_status") != "approved":
-                raise ValueError("Worker refused upload: Video must be reviewed and marked 'approved' before publishing.")
             if record.get("status") == "uploaded":
                 raise ValueError("This video has already been uploaded.")
             if record.get("status") in ("upload_unknown", "upload_unresolved"):
@@ -134,8 +132,6 @@ def work(action: str, key: str) -> None:
                     isinstance(e, (FileNotFoundError, ValueError))
                     or "not found" in err_msg.lower()
                     or "invalid_grant" in err_msg.lower()
-                    or "unapproved" in err_msg.lower()
-                    or "must be reviewed" in err_msg.lower()
                 )
 
                 is_session_expired = (

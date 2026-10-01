@@ -164,43 +164,54 @@ class Stage6PublishingTests(unittest.TestCase):
         return res.status, json.loads(data) if data else {}
 
     # -------------------------------------------------------------------------
-    # 1. Multi-Layer Approval Enforcement
+    # 1. Automatic Publishing & No Mandatory Approval Gate
     # -------------------------------------------------------------------------
 
-    def test_start_job_rejects_unreviewed_video(self):
-        """start_job must reject unreviewed videos for upload."""
+    def test_start_job_allows_unreviewed_video(self):
+        """start_job must allow eligible ready unreviewed videos for upload without approval."""
         self._create_test_video("vid_unrev", review_status="unreviewed")
-        with self.assertRaises(ValueError) as ctx:
-            server.start_job("upload", key="vid_unrev")
-        self.assertIn("cannot be uploaded", str(ctx.exception))
-        self.assertIn("unreviewed", str(ctx.exception))
+        job = server.start_job("upload", key="vid_unrev")
+        self.assertEqual(job["status"], "pending")
+        self.assertEqual(job["action"], "upload")
+        self.assertEqual(job["key"], "vid_unrev")
 
-    def test_start_job_rejects_rejected_video(self):
-        """start_job must reject explicitly rejected videos for upload."""
-        self._create_test_video("vid_rej", review_status="rejected")
-        with self.assertRaises(ValueError) as ctx:
-            server.start_job("upload", key="vid_rej")
-        self.assertIn("rejected", str(ctx.exception))
+    def test_start_job_allows_video_without_review_status(self):
+        """start_job must allow eligible ready videos lacking review_status."""
+        rec = self._create_test_video("vid_no_rev", review_status="unreviewed")
+        del rec["review_status"]
+        store.put("videos", "vid_no_rev", rec)
+        job = server.start_job("upload", key="vid_no_rev")
+        self.assertEqual(job["status"], "pending")
+        self.assertEqual(job["action"], "upload")
+        self.assertEqual(job["key"], "vid_no_rev")
 
     def test_start_job_allows_approved_video(self):
-        """start_job must succeed when video is approved."""
+        """start_job must continue to succeed when video is approved."""
         self._create_test_video("vid_appr", review_status="approved")
         job = server.start_job("upload", key="vid_appr")
         self.assertEqual(job["status"], "pending")
         self.assertEqual(job["action"], "upload")
         self.assertEqual(job["key"], "vid_appr")
 
-    def test_worker_rejects_unapproved_video_pre_transfer(self):
-        """worker.work must abort before touching YouTube auth if review_status is not approved."""
-        self._create_test_video("vid_worker_unrev", review_status="unreviewed")
-        with self.assertRaises(ValueError) as ctx:
-            worker.work("upload", "vid_worker_unrev")
-        self.assertIn("approved", str(ctx.exception))
+    def test_start_job_allows_rejected_video_per_simple_policy(self):
+        """Hypothetical rejected videos do not block upload per simple non-authoritative policy."""
+        self._create_test_video("vid_rej", review_status="rejected")
+        job = server.start_job("upload", key="vid_rej")
+        self.assertEqual(job["status"], "pending")
+        self.assertEqual(job["action"], "upload")
+        self.assertEqual(job["key"], "vid_rej")
 
-    def test_retry_job_rejects_unapproved_video(self):
-        """retry_job must reject retrying an upload job if the video is not approved."""
+    def test_worker_allows_unreviewed_video(self):
+        """worker.work must accept unreviewed ready video without requiring approval."""
+        self._create_test_video("vid_worker_unrev", review_status="unreviewed")
+        # When token.json is not present, worker reaches YouTube upload step and raises FileNotFoundError,
+        # confirming it did NOT reject the video due to review_status.
+        with self.assertRaises(FileNotFoundError):
+            worker.work("upload", "vid_worker_unrev")
+
+    def test_retry_job_allows_unapproved_video(self):
+        """retry_job must allow retrying an upload job for an unreviewed ready video."""
         self._create_test_video("vid_retry_unrev", review_status="unreviewed")
-        # Manually create a failed upload job
         failed_job = {
             "id": "job_fail_1",
             "action": "upload",
@@ -209,10 +220,10 @@ class Stage6PublishingTests(unittest.TestCase):
             "created_at": store.now(),
         }
         store.put("jobs", "job_fail_1", failed_job)
-
-        with self.assertRaises(ValueError) as ctx:
-            server.retry_job("job_fail_1")
-        self.assertIn("review status is 'unreviewed'", str(ctx.exception))
+        new_job = server.retry_job("job_fail_1")
+        self.assertEqual(new_job["status"], "pending")
+        self.assertEqual(new_job["action"], "upload")
+        self.assertEqual(new_job["key"], "vid_retry_unrev")
 
     # -------------------------------------------------------------------------
     # 2. Duplicate Upload Guards & State Machine (HTTP 409 Conflict)
@@ -476,39 +487,58 @@ class Stage6PublishingTests(unittest.TestCase):
         self.assertEqual(updated["general_units"], 5)
 
     # -------------------------------------------------------------------------
-    # 9. Automation Publish-Approved Mode (FIFO)
+    # 9. Automatic Publishing Mode (FIFO)
     # -------------------------------------------------------------------------
 
-    def test_automation_loop_publish_approved_fifo(self):
-        """Automation publish_approved mode selects the oldest approved ready video."""
-        # Create unreviewed video (should be skipped)
+    def test_automation_loop_publish_fifo_without_approval(self):
+        """Automation publish mode selects the oldest eligible ready video without requiring approval."""
+        # Create unreviewed ready video (oldest)
         self._create_test_video("vid_auto_unrev", review_status="unreviewed", created_at="2026-09-01T00:00:00Z")
-        # Create second approved video (younger)
-        self._create_test_video("vid_auto_appr2", review_status="approved", created_at="2026-09-03T00:00:00Z")
-        # Create first approved video (older)
-        self._create_test_video("vid_auto_appr1", review_status="approved", created_at="2026-09-02T00:00:00Z")
+        # Create ready video without review_status (middle)
+        rec2 = self._create_test_video("vid_auto_norev", review_status="unreviewed", created_at="2026-09-02T00:00:00Z")
+        del rec2["review_status"]
+        store.put("videos", "vid_auto_norev", rec2)
+        # Create approved ready video (youngest)
+        self._create_test_video("vid_auto_appr", review_status="approved", created_at="2026-09-03T00:00:00Z")
 
-        # Configure settings for automation
+        # Configure settings for automation with canonical 'publish' mode
         settings = {
             "enabled": True,
             "interval_hours": 1,
-            "mode": "publish_approved",
+            "mode": "publish",
             "next_run": 0,
         }
         server.write_json(self.root / "studio-settings.json", settings)
 
         with patch.object(server, "is_online", return_value=True):
-            # Run one iteration of the automation check logic directly
+            # Run the automation check logic directly
             videos = store.records("videos")
             videos.sort(key=lambda v: v.get("created_at", ""))
             candidate = None
             for v in videos:
-                if v.get("review_status") == "approved" and v.get("status") == "ready":
-                    candidate = v
-                    break
+                if v.get("status") == "ready":
+                    v_file = v.get("video")
+                    if v_file and (self.root / v_file).is_file():
+                        candidate = v
+                        break
 
+            # Must select the oldest ready video (vid_auto_unrev), even though it is unreviewed
             self.assertIsNotNone(candidate)
-            self.assertEqual(candidate["id"], "vid_auto_appr1")
+            self.assertEqual(candidate["id"], "vid_auto_unrev")
+
+    def test_automation_normalizes_publish_approved_mode(self):
+        """Settings endpoint accepts 'publish_approved' for backward compatibility and normalizes to 'publish'."""
+        code, body = self._request("POST", "/api/settings", {
+            "automation": {
+                "enabled": True,
+                "interval_hours": 4,
+                "mode": "publish_approved",
+            }
+        })
+        self.assertEqual(code, 200)
+        saved = server.get_automation_settings()
+        self.assertEqual(saved["mode"], "publish")
+        self.assertEqual(saved["interval_hours"], 4)
 
     # -------------------------------------------------------------------------
     # 10. HTTP Endpoints

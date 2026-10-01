@@ -1009,11 +1009,6 @@ def start_job(action: str, key: str = "", automatic: bool = False, extra: dict |
         if not record:
             raise ValueError(f"Video '{key}' not found.")
 
-        # Multi-layer approval enforcement: must be explicitly approved
-        review_status = record.get("review_status", "unreviewed")
-        if review_status != "approved":
-            raise ValueError(f"Video '{key}' cannot be uploaded: review status is '{review_status}'. Only approved videos may be uploaded.")
-
         # State machine validations & duplicate guards
         vid_status = record.get("status")
         if vid_status == "uploaded":
@@ -1135,9 +1130,6 @@ def retry_job(source_id: str) -> dict:
             record = store.get("videos", key)
             if not record:
                 raise ValueError(f"Video '{key}' not found")
-            review_status = record.get("review_status", "unreviewed")
-            if review_status != "approved":
-                raise ValueError(f"Cannot retry upload for video '{key}': review status is '{review_status}'. Only approved videos may be uploaded.")
             vid_status = record.get("status")
             if vid_status == "uploaded":
                 raise ConflictError(f"Cannot retry upload: video '{key}' is already uploaded ({record.get('youtube_id')}).")
@@ -1229,7 +1221,7 @@ def automation_loop() -> None:
                     write_json(ROOT / "studio-settings.json", settings)
 
                     mode = settings.get("mode", "preview")
-                    if mode in ("publish_approved", "publish"):
+                    if mode in ("publish", "publish_approved"):
                         videos = store.records("videos")
                         videos.sort(key=lambda v: v.get("created_at", ""))
                         all_jobs = store.records("jobs")
@@ -1239,17 +1231,18 @@ def automation_loop() -> None:
                         }
                         candidate = None
                         for v in videos:
-                            if (v.get("review_status") == "approved"
-                                    and v.get("status") == "ready"
+                            if (v.get("status") == "ready"
                                     and v.get("id") not in active_upload_keys):
-                                candidate = v
-                                break
+                                v_file = v.get("video")
+                                if v_file and (ROOT / v_file).is_file():
+                                    candidate = v
+                                    break
 
                         if candidate:
-                            LOG.info("Automation: Selected approved video '%s' for publishing.", candidate["id"])
+                            LOG.info("Automation: Selected eligible ready video '%s' for publishing.", candidate["id"])
                             start_job("upload", key=candidate["id"], automatic=True)
                         else:
-                            LOG.info("Automation: publish_approved mode enabled, but no approved ready videos available.")
+                            LOG.info("Automation: publish mode enabled, but no eligible ready videos available.")
                     else:
                         start_job("preview", automatic=True)
         except Exception as e:
@@ -1932,6 +1925,8 @@ class StudioHandler(BaseHTTPRequestHandler):
                         or not 1 <= auto["interval_hours"] <= 168
                         or auto.get("mode") not in ("preview", "publish", "publish_approved")):
                     raise ValueError("Choose an interval of 1-168 hours and a valid mode")
+                if auto.get("mode") == "publish_approved":
+                    auto["mode"] = "publish"
                 current_auto = get_automation_settings()
                 current_auto.update(auto)
                 write_json(ROOT / "studio-settings.json", current_auto)

@@ -809,11 +809,12 @@ async function openVideoModal(id) {
             <div style="display: flex; gap: 12px; align-items: center;">
               <select class="form-input" id="edit-review-status" style="max-width: 220px; font-weight: 600;" onchange="updateReviewPill(this.value)">
                 <option value="unreviewed" ${rev === 'unreviewed' ? 'selected' : ''}>⏳ Unreviewed</option>
-                <option value="approved" ${rev === 'approved' ? 'selected' : ''}>✓ Approved for Publishing</option>
+                <option value="approved" ${rev === 'approved' ? 'selected' : ''}>✓ Approved</option>
                 <option value="rejected" ${rev === 'rejected' ? 'selected' : ''}>✕ Rejected</option>
               </select>
               <span id="review-pill-preview" class="badge-review-${rev}">${rev === 'approved' ? '✓ Approved' : rev === 'rejected' ? '✕ Rejected' : 'Unreviewed'}</span>
             </div>
+            <p class="form-help" style="margin-top: 6px; font-size: 11px;">Informational editorial rating. Eligible ready videos publish automatically without requiring approval.</p>
           </div>
 
           <!-- Ambiguous Publishing Diagnostics & Reconciliation -->
@@ -901,8 +902,6 @@ async function openVideoModal(id) {
               <span class="badge" style="color: var(--success); padding: 10px 16px; font-weight: 600;">✓ Uploaded (<a href="https://youtube.com/shorts/${escapeHtml(v.youtube_id || '')}" target="_blank" rel="noopener noreferrer" style="color: inherit; text-decoration: underline;">View Short ↗</a>)</span>
             ` : v.status === 'uploading' ? `
               <button class="btn btn-primary" disabled style="opacity: 0.6; cursor: not-allowed;">⏳ Uploading...</button>
-            ` : (rev !== 'approved') ? `
-              <button class="btn btn-primary" disabled style="opacity: 0.5; cursor: not-allowed;" title="Approve this video before uploading"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="vertical-align:-2px;margin-right:4px;"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path><polyline points="17 8 12 3 7 8"></polyline><line x1="12" y1="3" x2="12" y2="15"></line></svg>Upload to YouTube (Needs Approval)</button>
             ` : (v.status === 'upload_unknown' || v.status === 'upload_unresolved') ? `
               <button class="btn btn-primary" disabled style="opacity: 0.5; cursor: not-allowed;" title="Reconcile or resolve this video before uploading"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="vertical-align:-2px;margin-right:4px;"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path><polyline points="17 8 12 3 7 8"></polyline><line x1="12" y1="3" x2="12" y2="15"></line></svg>Upload to YouTube (Resolve First)</button>
             ` : `
@@ -1601,10 +1600,10 @@ async function loadAutomation(container) {
         <div class="form-group">
           <label>Automation Mode</label>
           <select class="form-input" id="auto-mode">
-            <option value="preview" ${(auto.mode === 'preview' || !auto.mode) ? 'selected' : ''}>Preview Only (Generate Drafts for Manual Review)</option>
-            <option value="publish_approved" ${(auto.mode === 'publish_approved' || auto.mode === 'publish') ? 'selected' : ''}>Publish Approved (Upload approved ready videos FIFO)</option>
+            <option value="preview" ${(auto.mode === 'preview' || !auto.mode) ? 'selected' : ''}>Preview Only (Generate Drafts)</option>
+            <option value="publish" ${(auto.mode === 'publish' || auto.mode === 'publish_approved') ? 'selected' : ''}>Automatic Publishing (Upload eligible ready videos FIFO)</option>
           </select>
-          <p class="form-help">Publish Approved strictly requires explicit human approval before any video is published. Unreviewed videos are never published automatically.</p>
+          <p class="form-help">Automatic Publishing automatically selects and uploads eligible ready videos in FIFO order without requiring manual approval.</p>
         </div>
 
         <button class="btn btn-primary" onclick="saveAutomationSettings()">Save Automation Settings</button>
