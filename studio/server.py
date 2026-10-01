@@ -182,7 +182,7 @@ def is_process_alive(pid: int) -> bool:
             return False
 
 def is_python_process(pid: int) -> bool:
-    """Validate that the process is python or ffmpeg before terminating."""
+    """Validate that the process is a recognized worker/tool process before terminating."""
     if not is_process_alive(pid):
         return False
     if sys.platform == "win32":
@@ -194,7 +194,7 @@ def is_python_process(pid: int) -> bool:
                 timeout=3,
             )
             out = res.stdout.lower()
-            return "python" in out or "ffmpeg" in out
+            return any(name in out for name in ("python", "ffmpeg", "ffprobe", "yt-dlp"))
         except Exception:
             return False
     return True
@@ -380,19 +380,34 @@ def extract_diagnostic_error(log_input: list[str] | str, returncode: int | None 
 
     return "Process terminated with error"
 
+DEFAULT_JOB_TIMEOUTS: dict[str, float] = {
+    "upload": 900.0,          # 15 minutes
+    "render": 600.0,          # 10 minutes
+    "preview": 300.0,         # 5 minutes
+    "run": 300.0,             # 5 minutes
+    "youtube_connect": 180.0, # 3 minutes
+    "manual": 300.0,          # 5 minutes
+}
+
 def run_job_process(job: dict, command: list[str]) -> None:
     global ACTIVE_JOB, ACTIVE_PROC
     log_lines = []
     log_path = LOGS_DIR / f"{job['id']}.log"
 
-    def write_full_log():
-        try:
-            log_path.write_text("\n".join(log_lines), encoding="utf-8")
-        except OSError:
-            pass  # A disk-full/permission hiccup here shouldn't crash the job.
-
+    log_file = None
     proc = None
+    proc_created_at = None
+    watchdog = None
+    timed_out = threading.Event()
+
+    job_timeout = float(job.get("timeout") or DEFAULT_JOB_TIMEOUTS.get(job.get("action", ""), 600.0))
+
     try:
+        try:
+            log_file = log_path.open("a", encoding="utf-8")
+        except OSError:
+            log_file = None
+
         proc = subprocess.Popen(
             command,
             cwd=ROOT,
@@ -401,26 +416,51 @@ def run_job_process(job: dict, command: list[str]) -> None:
             text=True,
             bufsize=1,
         )
+        proc_created_at = get_process_creation_time(proc.pid)
+
+        def on_timeout():
+            timed_out.set()
+            LOG.warning("Job %s (%s) exceeded timeout limit of %.0fs — terminating process tree", job["id"], job.get("action"), job_timeout)
+            if proc:
+                terminate_process_tree(proc.pid, expected_created_at=proc_created_at)
+                if proc.stdout:
+                    try:
+                        proc.stdout.close()
+                    except Exception:
+                        pass
+
+        watchdog = threading.Timer(job_timeout, on_timeout)
+        watchdog.daemon = True
+        watchdog.start()
 
         with GUARD:
             current = store.get("jobs", job["id"])
             if current and current.get("status") == "cancelled":
-                terminate_process_tree(proc.pid)
+                watchdog.cancel()
+                terminate_process_tree(proc.pid, expected_created_at=proc_created_at)
                 cleanup_job_artifacts(job)
                 ACTIVE_PROC = None
                 ACTIVE_JOB = None
                 return
             ACTIVE_PROC = proc
             job["pid"] = proc.pid
-            job["pid_created_at"] = get_process_creation_time(proc.pid)
+            job["pid_created_at"] = proc_created_at
             store.put("jobs", job["id"], job)
 
+        last_db_write = time.time()
+        last_cancel_check = time.time()
+
         for line in proc.stdout:
-            with GUARD:
-                current = store.get("jobs", job["id"])
-                if current and current.get("status") == "cancelled":
-                    terminate_process_tree(proc.pid)
-                    break
+            now_t = time.time()
+            if now_t - last_cancel_check >= 0.5:
+                last_cancel_check = now_t
+                with GUARD:
+                    current = store.get("jobs", job["id"])
+                    if current and current.get("status") == "cancelled":
+                        watchdog.cancel()
+                        terminate_process_tree(proc.pid, expected_created_at=proc_created_at)
+                        break
+
             line_str = line.strip()
             if line_str.startswith("KENAU_PROGRESS "):
                 try:
@@ -429,6 +469,8 @@ def run_job_process(job: dict, command: list[str]) -> None:
                     if new_stage:
                         job["stage"] = new_stage
                         append_job_stage(job, new_stage)
+                        store.put("jobs", job["id"], job)
+                        last_db_write = now_t
                 except Exception:
                     pass
             elif line_str.startswith("KENAU_SUMMARY "):
@@ -437,20 +479,38 @@ def run_job_process(job: dict, command: list[str]) -> None:
                     job["summary"] = summary
                     if "video" in summary:
                         job["target_file"] = summary["video"]
+                    store.put("jobs", job["id"], job)
+                    last_db_write = now_t
                 except Exception:
                     pass
             else:
-                log_lines.append(redact(line_str))
-                write_full_log()
-            job["log"] = "\n".join(log_lines[-200:])
-            store.put("jobs", job["id"], job)
+                redacted = redact(line_str)
+                log_lines.append(redacted)
+                if log_file:
+                    try:
+                        log_file.write(redacted + "\n")
+                        log_file.flush()
+                    except OSError:
+                        pass
+                if now_t - last_db_write >= 1.0:
+                    job["log"] = "\n".join(log_lines[-200:])
+                    store.put("jobs", job["id"], job)
+                    last_db_write = now_t
 
         code = proc.wait()
+        if watchdog:
+            watchdog.cancel()
 
         with GUARD:
             current = store.get("jobs", job["id"]) or job
             finished_at = store.now()
-            if current.get("status") == "cancelled":
+            if timed_out.is_set():
+                job["status"] = "failed"
+                job["stage"] = f"Failed: Timed out after {int(job_timeout)}s"
+                job["error"] = f"Process exceeded timeout limit ({int(job_timeout)}s) and was terminated."
+                append_job_stage(job, job["stage"], finished_at)
+                cleanup_job_artifacts(job)
+            elif current.get("status") == "cancelled":
                 job["status"] = "cancelled"
                 job["stage"] = current.get("stage", "Cancelled")
                 job["error"] = current.get("error") or "Cancelled by user"
@@ -489,12 +549,18 @@ def run_job_process(job: dict, command: list[str]) -> None:
 
             job["finished_at"] = finished_at
             job["duration_seconds"] = compute_duration_seconds(job.get("started_at"), finished_at)
+            job["log"] = "\n".join(log_lines[-200:])
             job["log_file"] = f"{job['id']}.log"
             store.put("jobs", job["id"], job)
             ACTIVE_JOB = None
             ACTIVE_PROC = None
 
     except Exception as e:
+        if watchdog:
+            watchdog.cancel()
+        if proc and is_process_alive(proc.pid):
+            terminate_process_tree(proc.pid, expected_created_at=proc_created_at)
+
         with GUARD:
             current = store.get("jobs", job["id"]) or job
             finished_at = store.now()
@@ -511,7 +577,12 @@ def run_job_process(job: dict, command: list[str]) -> None:
                 append_job_stage(job, "Failed", finished_at)
                 error_line = f"Error: {redact(str(e))}"
                 log_lines.append(error_line)
-                write_full_log()
+                if log_file:
+                    try:
+                        log_file.write(error_line + "\n")
+                        log_file.flush()
+                    except OSError:
+                        pass
                 job["log"] = "\n".join(log_lines[-200:])
             job["finished_at"] = finished_at
             job["duration_seconds"] = compute_duration_seconds(job.get("started_at"), finished_at)
@@ -521,6 +592,13 @@ def run_job_process(job: dict, command: list[str]) -> None:
             ACTIVE_PROC = None
 
     finally:
+        if watchdog:
+            watchdog.cancel()
+        if log_file:
+            try:
+                log_file.close()
+            except Exception:
+                pass
         if proc and proc.stdout:
             try:
                 proc.stdout.close()
@@ -567,6 +645,41 @@ def queue_worker_loop() -> None:
                             command_to_run = fresh.get("command")
 
             if job_to_run:
+                action = job_to_run.get("action", "")
+                key = job_to_run.get("key", "")
+                validation_error = None
+
+                if action == "upload":
+                    record = store.get("videos", key) if key else None
+                    if not record:
+                        validation_error = f"Video '{key}' not found"
+                    elif record.get("status") == "uploaded":
+                        validation_error = f"Video '{key}' has already been uploaded ({record.get('youtube_id')})"
+                    elif record.get("status") in ("upload_unknown", "upload_unresolved"):
+                        if not (job_to_run.get("extra", {}).get("resume") and record.get("resumable_uri")):
+                            validation_error = f"Video '{key}' is in '{record.get('status')}' state. Reconcile or resolve first."
+                    else:
+                        v_file = record.get("video")
+                        if not v_file or not (ROOT / v_file).is_file():
+                            validation_error = f"Rendered video file for '{key}' not found on disk"
+                elif action == "render":
+                    record = store.get("videos", key) if key else None
+                    if not record:
+                        validation_error = f"Video '{key}' not found"
+
+                if validation_error:
+                    with GUARD:
+                        finished_at = store.now()
+                        job_to_run["status"] = "failed"
+                        job_to_run["stage"] = f"Failed: {validation_error}"
+                        job_to_run["error"] = validation_error
+                        append_job_stage(job_to_run, job_to_run["stage"], finished_at)
+                        job_to_run["finished_at"] = finished_at
+                        job_to_run["duration_seconds"] = 0.0
+                        store.put("jobs", job_to_run["id"], job_to_run)
+                        ACTIVE_JOB = None
+                    continue
+
                 if not command_to_run:
                     python = sys.executable
                     action = job_to_run.get("action", "")
@@ -1340,12 +1453,10 @@ def automation_loop() -> None:
                 has_pending = bool(get_next_pending_job())
 
                 if now_ts >= next_ts and not ACTIVE_JOB and not store.busy() and not has_pending and is_online():
-                    # Set next slot before starting
                     interval = float(settings.get("interval_hours", 5))
-                    settings["next_run"] = now_ts + interval * 3600
-                    write_json(ROOT / "studio-settings.json", settings)
-
                     mode = settings.get("mode", "preview")
+                    job_started = False
+
                     if mode in ("publish", "publish_approved"):
                         videos = store.records("videos")
                         videos.sort(key=lambda v: v.get("created_at", ""))
@@ -1365,11 +1476,26 @@ def automation_loop() -> None:
 
                         if candidate:
                             LOG.info("Automation: Selected eligible ready video '%s' for publishing.", candidate["id"])
-                            start_job("upload", key=candidate["id"], automatic=True)
+                            try:
+                                start_job("upload", key=candidate["id"], automatic=True)
+                                job_started = True
+                            except Exception as start_err:
+                                LOG.error("Automation: Failed to queue upload for '%s': %s", candidate["id"], start_err)
                         else:
                             LOG.info("Automation: publish mode enabled, but no eligible ready videos available.")
                     else:
-                        start_job("preview", automatic=True)
+                        try:
+                            start_job("preview", automatic=True)
+                            job_started = True
+                        except Exception as start_err:
+                            LOG.error("Automation: Failed to start preview job: %s", start_err)
+
+                    if job_started:
+                        settings["next_run"] = now_ts + interval * 3600
+                    else:
+                        # Resilient check: check again in 60s when newly rendered videos may be ready
+                        settings["next_run"] = now_ts + 60.0
+                    write_json(ROOT / "studio-settings.json", settings)
         except Exception as e:
             LOG.error("Automation error: %s", e)
 
@@ -2162,6 +2288,7 @@ def recover_interrupted_jobs() -> None:
                 if is_python_process(pid):
                     LOG.info("Terminating orphan process tree for PID %d from interrupted job %s", pid, job["id"])
                     terminate_process_tree(pid, expected_created_at=pid_created_at)
+            cleanup_job_artifacts(job)
             finished_at = store.now()
             append_job_stage(job, "Interrupted by server restart", finished_at)
             job.update(

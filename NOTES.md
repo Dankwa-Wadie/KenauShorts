@@ -484,3 +484,69 @@ Stage 2 meets all single-instance operational requirements: process tracking, pr
   - `tests/test_studio_store.py`: 9/9 passed (0.5s).
 - **Full Discovery Test Suite** (`$env:PYTHONUTF8='1'; python -m unittest discover tests`):
   - 191 tests total: 184 passed, 0 failures, 7 known environment-specific errors (6 NVENC on non-CUDA Windows host, 1 macOS test calling `os.getuid()` on Windows).
+
+---
+
+## Stage 7 Phase 2: Worker Lifecycle & Automation Reliability
+
+### Implementation Date
+2026-10-01
+
+### Baseline Commit
+`dfb7004` (`fix(stage7): resolve state sync race and decouple network probe from guard`)
+
+### Implemented Objectives & Architectural Improvements
+
+1. **Subprocess Lifecycle & Watchdog Management**:
+   - **Command-Level Timeouts**:
+     - `core/render.py`: Configured explicit timeouts for media processing tools: `RENDER_TIMEOUT = 300.0` (5 minutes), `POSTER_TIMEOUT = 30.0`, `PROBE_TIMEOUT = 15.0`, `ENCODER_TIMEOUT = 10.0`. `composite()` and `render()` accept an optional `timeout: float` parameter. In case of timeout or non-zero exit, any partial output artifact is unlinked immediately.
+     - `core/style_presets.py`: Configured `timeout=15.0` in `get_source_aspect_ratio()`.
+     - `core/agent.py`: Hardened `download_clip()` with explicit handling for `subprocess.TimeoutExpired` and general errors, unlinking partial `.mp4`, `.part`, and `.ytdl` files upon failure.
+   - **Job-Level Process Watchdog**:
+     - `studio/server.py`: Introduced `DEFAULT_JOB_TIMEOUTS: dict[str, float] = {"upload": 900.0, "render": 600.0, "preview": 300.0, "run": 300.0, "youtube_connect": 180.0, "manual": 300.0}`.
+     - Added an asynchronous watchdog (`threading.Timer(job_timeout, on_timeout)`) in `run_job_process()`. If execution exceeds the allotted duration, the watchdog terminates the active process tree via `terminate_process_tree(proc.pid, expected_created_at=proc_created_at)`, shuts down standard streams, cleans up partial artifacts, and records terminal status `failed` with stage `"Failed: Timed out after Xs"`.
+     - Extended `is_python_process()` to recognize helper subprocess binaries including `yt-dlp` and `ffprobe`.
+     - Ensured `terminate_process_tree()` is called in the `except Exception` handler if an unexpected exception occurs while the subprocess is still running.
+
+2. **Worker Interruption & Queue Pre-Flight Validation**:
+   - **Startup Interruption Recovery**:
+     - Enhanced `recover_interrupted_jobs()`: whenever an active job is marked interrupted upon server startup, `cleanup_job_artifacts(job)` unlinks partial video or thumbnail files associated with the job before terminating any orphaned process tree.
+   - **Pre-Flight Queue Validation**:
+     - Hardened `queue_worker_loop()` before process spawning:
+       - For `upload` jobs: validates that the video record exists in SQLite, has not already been uploaded (`status == "uploaded"`), is not locked in an unresolved/ambiguous state without an active resumable session, and that the underlying rendered video file actually exists on disk.
+       - For `render` jobs: validates that the target record exists in SQLite.
+       - Invalid jobs fail immediately under `GUARD` with a clear explanatory stage and error string (e.g., `"Video 'xyz' has already been uploaded (abc123)"` or `"Rendered video file for 'xyz' not found on disk"`), preventing the worker from spawning doomed worker subprocesses.
+
+3. **Automation Queue Resilience**:
+   - **Elimination of Pipeline Stalls**:
+     - In `automation_loop()`, fixed the schedule update logic: previously, `settings["next_run"]` was immediately advanced by `interval_hours` (e.g. 5 hours) before checking for candidate readiness. If no ready candidates were available or if starting a job failed, the automation loop went dormant for 5 hours.
+     - New behavior: when in publish mode with no ready videos available (or if queuing fails), `settings["next_run"]` is scheduled with a resilient 60-second backoff (`now_ts + 60.0`). The full `interval_hours` advancement is applied exclusively after a candidate job has been successfully queued or started.
+     - FIFO candidate selection: candidate selection iterates through eligible ready videos ordered by `created_at`, safely skipping failed, errored, or non-ready videos without hanging the pipeline or requiring manual human intervention.
+
+4. **Log Streaming & SQLite Write Overhead Reduction**:
+   - **Append-Mode Log Streaming**:
+     - Refactored `run_job_process()` to eliminate $O(N^2)$ rewrite overhead: instead of rewriting the entire log file to disk on every single output line, opened `{job_id}.log` in append mode (`open(..., "a", encoding="utf-8")`) and flushed each stdout line sequentially.
+   - **Throttled SQLite Progress Updates**:
+     - High-frequency stdout lines (e.g., ffmpeg frame progress or encoder dumps) are throttled so that SQLite updates occur at most once per 1.0 second (`last_db_write`).
+     - State-change transitions (`KENAU_PROGRESS` and `KENAU_SUMMARY`) immediately bypass the throttle to update SQLite without delay.
+
+### Test Evidence
+- **Stage 7 Phase 2 Suite** (`tests/test_stage7_phase2.py`): 15/15 passed (5.0s).
+  - `test_has_encoder_timeout_handled_gracefully`: Verifies timeout handling in `has_encoder`.
+  - `test_probe_duration_and_audio_stream_timeouts`: Verifies timeout handling in ffprobe helpers.
+  - `test_render_composite_timeout_unlinks_partial_out_and_raises`: Verifies ffmpeg timeouts unlink partial outputs and raise `TimeoutError`.
+  - `test_download_clip_timeout_and_error_cleans_up_partial_files`: Verifies partial `.mp4`, `.part`, `.ytdl` files are cleaned up on download timeout or failure.
+  - `test_run_job_process_watchdog_kills_hung_process_and_cleans_up`: Verifies watchdog termination of hung jobs, artifact cleanup, and stage recording.
+  - `test_recover_interrupted_jobs_cleans_up_artifacts`: Verifies startup recovery cleans up partial artifacts.
+  - `test_queue_worker_rejects_missing_video_preflight`: Verifies upload job for non-existent video fails pre-flight.
+  - `test_queue_worker_rejects_already_uploaded_video_preflight`: Verifies upload job for already uploaded video fails pre-flight.
+  - `test_queue_worker_rejects_missing_file_on_disk_preflight`: Verifies upload job for missing file on disk fails pre-flight.
+  - `test_queue_worker_rejects_ambiguous_video_without_resume`: Verifies upload job for ambiguous state without resume fails pre-flight.
+  - `test_queue_worker_executes_valid_job_after_preflight_rejection`: Verifies queue processor advances cleanly to valid jobs after rejecting invalid jobs.
+  - `test_automation_loop_no_candidates_schedules_short_retry_not_interval`: Verifies 60s backoff when no candidates are ready.
+  - `test_automation_loop_advances_interval_when_candidate_queued`: Verifies interval advancement when a job is queued.
+  - `test_automation_loop_skips_failed_video_picks_next_ready_fifo`: Verifies FIFO ordering and skipping of failed videos.
+  - `test_run_job_process_throttles_sqlite_writes_for_high_frequency_logs`: Verifies throttling of SQLite progress updates while preserving append-mode file logging.
+- **Full Discovery Suite** (`python -X utf8 -m unittest discover tests`):
+  - 206 tests total: 199 passed, 0 failures, 7 known environment-specific errors (6 NVENC on non-CUDA host, 1 macOS `os.getuid()` test on Windows).
+

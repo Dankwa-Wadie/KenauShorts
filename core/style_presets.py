@@ -152,6 +152,7 @@ def get_source_aspect_ratio(video: Path | str) -> float | None:
             capture_output=True,
             text=True,
             check=True,
+            timeout=15.0,
         ).stdout.strip()
 
         if not out:

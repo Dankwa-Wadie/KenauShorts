@@ -803,8 +803,17 @@ def download_clip(url: str, out_path: Path, max_seconds: int = 35) -> bool:
     try:
         subprocess.run(cmd, check=True, timeout=90)
         return out_path.exists()
+    except subprocess.TimeoutExpired as e:
+        LOG.error("Download of clip %s timed out after 90s: %s", url, e)
+        out_path.unlink(missing_ok=True)
+        for ext in (".part", ".ytdl"):
+            out_path.with_suffix(ext).unlink(missing_ok=True)
+        return False
     except Exception as e:
         LOG.error("Failed to download clip %s: %s", url, e)
+        out_path.unlink(missing_ok=True)
+        for ext in (".part", ".ytdl"):
+            out_path.with_suffix(ext).unlink(missing_ok=True)
         return False
 
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".gif"}

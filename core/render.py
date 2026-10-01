@@ -403,6 +403,11 @@ def build_overlay(
     canvas.save(out_path)
     return frame_x, frame_y, frame_w, frame_h
 
+RENDER_TIMEOUT: float = 300.0  # 5 minutes max for short video composite
+POSTER_TIMEOUT: float = 30.0
+PROBE_TIMEOUT: float = 15.0
+ENCODER_TIMEOUT: float = 10.0
+
 _ENCODERS_CACHE: str | None = None
 
 def has_encoder(name: str) -> bool:
@@ -411,9 +416,9 @@ def has_encoder(name: str) -> bool:
         try:
             _ENCODERS_CACHE = subprocess.run(
                 ["ffmpeg", "-hide_banner", "-encoders"],
-                capture_output=True, text=True, check=False,
+                capture_output=True, text=True, check=False, timeout=ENCODER_TIMEOUT,
             ).stdout
-        except FileNotFoundError:
+        except (subprocess.TimeoutExpired, FileNotFoundError):
             _ENCODERS_CACHE = ""
     return name in (_ENCODERS_CACHE or "")
 
@@ -444,7 +449,7 @@ def probe_duration(video: Path) -> float:
     try:
         out = subprocess.run(
             ["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "default=nw=1:nk=1", str(video)],
-            capture_output=True, text=True, check=True,
+            capture_output=True, text=True, check=True, timeout=PROBE_TIMEOUT,
         ).stdout.strip()
         return float(out)
     except Exception:
@@ -456,10 +461,10 @@ def has_audio_stream(video: Path) -> bool:
         out = subprocess.run(
             ["ffprobe", "-v", "error", "-select_streams", "a",
              "-show_entries", "stream=index", "-of", "csv=p=0", str(video)],
-            capture_output=True, text=True, check=True,
+            capture_output=True, text=True, check=True, timeout=PROBE_TIMEOUT,
         ).stdout.strip()
         return bool(out)
-    except (subprocess.CalledProcessError, FileNotFoundError):
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired, FileNotFoundError):
         return False
 
 def composite(
@@ -474,6 +479,7 @@ def composite(
     config: dict[str, Any] | None = None,
     music: Path | None = None,
     loop_video: bool = False,
+    timeout: float = RENDER_TIMEOUT,
 ) -> float:
     if not shutil.which("ffmpeg"):
         raise RuntimeError("ffmpeg was not found on your PATH. Please install ffmpeg.")
@@ -556,16 +562,28 @@ def composite(
 
     LOG.info("Rendering short: %s", " ".join(cmd))
     out.parent.mkdir(parents=True, exist_ok=True)
-    subprocess.run(cmd, check=True)
+    try:
+        subprocess.run(cmd, check=True, timeout=timeout)
+    except subprocess.TimeoutExpired as e:
+        LOG.error("Rendering ffmpeg process timed out after %.1fs: %s", timeout, e)
+        out.unlink(missing_ok=True)
+        raise TimeoutError(f"Rendering ffmpeg process timed out after {timeout}s") from e
+    except subprocess.CalledProcessError:
+        out.unlink(missing_ok=True)
+        raise
 
     dur = probe_duration(out)
     if poster:
         poster.parent.mkdir(parents=True, exist_ok=True)
         mid = max(0.5, dur / 2)
-        subprocess.run(
-            ["ffmpeg", "-y", "-ss", str(mid), "-i", str(out), "-vframes", "1", "-q:v", "2", str(poster)],
-            check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-        )
+        try:
+            subprocess.run(
+                ["ffmpeg", "-y", "-ss", str(mid), "-i", str(out), "-vframes", "1", "-q:v", "2", str(poster)],
+                check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=POSTER_TIMEOUT,
+            )
+        except subprocess.TimeoutExpired:
+            LOG.warning("Poster generation timed out after %.1fs", POSTER_TIMEOUT)
+            poster.unlink(missing_ok=True)
 
     return dur
 
@@ -578,6 +596,7 @@ def render(
     max_seconds: float | None = None,
     poster: Path | None = None,
     music: Path | None = None,
+    timeout: float = RENDER_TIMEOUT,
 ) -> RenderResult:
     cfg = config or {}
     layout = {**DEFAULT_LAYOUT, **cfg.get("layout", {})}
@@ -585,6 +604,6 @@ def render(
 
     overlay_path = out.parent / f"{out.stem}_overlay.png"
     box = build_overlay(headline, acct, layout, overlay_path)
-    dur = composite(video, overlay_path, box, layout, out, max_seconds=max_seconds, poster=poster, config=cfg, music=music)
+    dur = composite(video, overlay_path, box, layout, out, max_seconds=max_seconds, poster=poster, config=cfg, music=music, timeout=timeout)
 
     return RenderResult(output=out, overlay=overlay_path, video_box=box, duration=dur, poster=poster)
