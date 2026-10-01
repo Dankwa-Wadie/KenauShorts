@@ -309,6 +309,38 @@ def cleanup_job_artifacts(job: dict) -> None:
             except Exception as e:
                 LOG.warning("Failed to clean up artifact %s: %s", path_str, e)
 
+def _handle_job_timeout_video_state(job: dict, timeout_seconds: float) -> None:
+    """Transition associated video record on confirmed job timeout while preserving terminal states."""
+    action = job.get("action")
+    key = job.get("key")
+    if not key or action not in ("render", "upload"):
+        return
+
+    video = store.get("videos", key)
+    if not video:
+        return
+
+    v_status = video.get("status")
+    # Never overwrite a video that has reached a terminal or successful state
+    if v_status in ("uploaded", "ready", "failed", "render_failed", "upload_unknown", "upload_unresolved"):
+        return
+
+    if action == "render" and v_status == "rendering":
+        video.update(
+            status="render_failed",
+            error=f"Render process timed out after {int(timeout_seconds)}s.",
+        )
+        store.put("videos", key, video)
+        LOG.warning("Video '%s' status transitioned from rendering to render_failed due to timeout", key)
+    elif action == "upload" and v_status == "uploading":
+        video.update(
+            status="upload_unknown",
+            upload_failure_reason=f"Upload process timed out after {int(timeout_seconds)}s. Resumable session or manual reconciliation required.",
+            error=f"Upload process timed out after {int(timeout_seconds)}s.",
+        )
+        store.put("videos", key, video)
+        LOG.warning("Video '%s' status transitioned from uploading to upload_unknown due to timeout", key)
+
 def append_job_stage(job: dict, stage: str, timestamp: str | None = None) -> None:
     """Append a new stage to job['stages'] if changed, capped at 50 entries."""
     if not stage:
@@ -510,6 +542,7 @@ def run_job_process(job: dict, command: list[str]) -> None:
                 job["error"] = f"Process exceeded timeout limit ({int(job_timeout)}s) and was terminated."
                 append_job_stage(job, job["stage"], finished_at)
                 cleanup_job_artifacts(job)
+                _handle_job_timeout_video_state(job, job_timeout)
             elif current.get("status") == "cancelled":
                 job["status"] = "cancelled"
                 job["stage"] = current.get("stage", "Cancelled")
@@ -564,7 +597,14 @@ def run_job_process(job: dict, command: list[str]) -> None:
         with GUARD:
             current = store.get("jobs", job["id"]) or job
             finished_at = store.now()
-            if current.get("status") == "cancelled":
+            if timed_out.is_set():
+                job["status"] = "failed"
+                job["stage"] = f"Failed: Timed out after {int(job_timeout)}s"
+                job["error"] = f"Process exceeded timeout limit ({int(job_timeout)}s) and was terminated."
+                append_job_stage(job, job["stage"], finished_at)
+                cleanup_job_artifacts(job)
+                _handle_job_timeout_video_state(job, job_timeout)
+            elif current.get("status") == "cancelled":
                 job["status"] = "cancelled"
                 job["stage"] = current.get("stage", "Cancelled")
                 job["error"] = current.get("error") or "Cancelled by user"

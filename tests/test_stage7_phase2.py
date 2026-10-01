@@ -679,6 +679,168 @@ class Stage7Phase2Tests(unittest.TestCase):
         stages = [s["stage"] for s in updated["stages"]]
         self.assertIn("Testing Step 1", stages)
 
+    # =========================================================================
+    # Task 6: Live Video-State Recovery on Job Timeout
+    # =========================================================================
+
+    def test_render_timeout_transitions_video_to_render_failed(self):
+        """When a render job times out, associated video transitions from rendering to render_failed."""
+        vid_id = "vid_to_render_failed"
+        store.put("videos", vid_id, {
+            "id": vid_id,
+            "status": "rendering",
+            "video": "out/test_render_to.mp4",
+            "headline": "Timeout Render Headline",
+        })
+
+        job_id = "job_to_render"
+        job = {
+            "id": job_id,
+            "action": "render",
+            "key": vid_id,
+            "status": "running",
+            "stage": "Rendering",
+            "stages": [{"stage": "Rendering", "at": store.now()}],
+            "created_at": store.now(),
+            "started_at": store.now(),
+            "timeout": 0.3,
+        }
+        store.put("jobs", job_id, job)
+
+        cmd = [sys.executable, "-c", "import time; time.sleep(10)"]
+        server.run_job_process(job, cmd)
+
+        updated_job = store.get("jobs", job_id)
+        self.assertEqual(updated_job["status"], "failed")
+        self.assertIn("timed out", updated_job["stage"].lower())
+
+        video = store.get("videos", vid_id)
+        self.assertEqual(video["status"], "render_failed")
+        self.assertIn("timed out", video.get("error", "").lower())
+
+    def test_upload_timeout_transitions_video_to_upload_unknown_and_preserves_metadata(self):
+        """When an upload job times out, associated video transitions from uploading to upload_unknown and preserves session."""
+        vid_id = "vid_to_upload_unknown"
+        resumable_uri = "https://upload.youtube.com/my_active_session_456"
+        store.put("videos", vid_id, {
+            "id": vid_id,
+            "status": "uploading",
+            "title": "Timeout Upload Test",
+            "video": "out/ready_to_upload.mp4",
+            "resumable_uri": resumable_uri,
+        })
+
+        job_id = "job_to_upload"
+        job = {
+            "id": job_id,
+            "action": "upload",
+            "key": vid_id,
+            "status": "running",
+            "stage": "Uploading to YouTube",
+            "stages": [{"stage": "Uploading to YouTube", "at": store.now()}],
+            "created_at": store.now(),
+            "started_at": store.now(),
+            "timeout": 0.3,
+        }
+        store.put("jobs", job_id, job)
+
+        cmd = [sys.executable, "-c", "import time; time.sleep(10)"]
+        server.run_job_process(job, cmd)
+
+        updated_job = store.get("jobs", job_id)
+        self.assertEqual(updated_job["status"], "failed")
+
+        video = store.get("videos", vid_id)
+        self.assertEqual(video["status"], "upload_unknown")
+        self.assertEqual(video["resumable_uri"], resumable_uri, "resumable_uri must be preserved")
+        self.assertEqual(video["title"], "Timeout Upload Test", "metadata must be preserved")
+        self.assertIn("timed out", video.get("upload_failure_reason", "").lower())
+
+    def test_timeout_does_not_overwrite_uploaded_video(self):
+        """Job timeout must NOT overwrite a video that is already marked uploaded."""
+        vid_id = "vid_already_uploaded_guard"
+        store.put("videos", vid_id, {
+            "id": vid_id,
+            "status": "uploaded",
+            "youtube_id": "yt_success_777",
+            "youtube_url": "https://youtube.com/shorts/yt_success_777",
+            "video": "out/done.mp4",
+        })
+
+        job_id = "job_to_uploaded_guard"
+        job = {
+            "id": job_id,
+            "action": "upload",
+            "key": vid_id,
+            "status": "running",
+            "created_at": store.now(),
+            "started_at": store.now(),
+            "timeout": 0.3,
+        }
+        store.put("jobs", job_id, job)
+
+        cmd = [sys.executable, "-c", "import time; time.sleep(10)"]
+        server.run_job_process(job, cmd)
+
+        video = store.get("videos", vid_id)
+        self.assertEqual(video["status"], "uploaded", "uploaded status must NEVER be overwritten by timeout")
+        self.assertEqual(video["youtube_id"], "yt_success_777")
+
+    def test_repeated_timeout_handling_is_safe_and_idempotent(self):
+        """Calling _handle_job_timeout_video_state repeatedly is idempotent and does not corrupt state."""
+        vid_id = "vid_idempotent_to"
+        store.put("videos", vid_id, {
+            "id": vid_id,
+            "status": "uploading",
+            "resumable_uri": "https://upload.youtube.com/session_idem",
+        })
+        job = {"action": "upload", "key": vid_id}
+
+        server._handle_job_timeout_video_state(job, 900.0)
+        v1 = store.get("videos", vid_id)
+        self.assertEqual(v1["status"], "upload_unknown")
+
+        # Second invocation
+        server._handle_job_timeout_video_state(job, 900.0)
+        v2 = store.get("videos", vid_id)
+        self.assertEqual(v2["status"], "upload_unknown")
+        self.assertEqual(v2["resumable_uri"], "https://upload.youtube.com/session_idem")
+
+    def test_timed_out_video_retry_without_server_restart(self):
+        """A video whose job timed out can be retried through safe workflows without restarting server."""
+        vid_file = self.root / "out" / "render_retry_test.mp4"
+        vid_file.write_bytes(b"rendered video bytes")
+        vid_id = "vid_retry_without_restart"
+        store.put("videos", vid_id, {
+            "id": vid_id,
+            "status": "render_failed",
+            "video": str(vid_file.relative_to(self.root)),
+            "headline": "Headline to Retry",
+            "title": "Title to Retry",
+        })
+
+        job_id = "job_timed_out_source"
+        store.put("jobs", job_id, {
+            "id": job_id,
+            "action": "render",
+            "key": vid_id,
+            "status": "failed",
+            "error": "Process exceeded timeout limit",
+            "created_at": store.now(),
+            "started_at": store.now(),
+            "finished_at": store.now(),
+        })
+
+        # Operator can retry the job immediately without restarting server
+        res = server.retry_job(job_id)
+        self.assertIn("id", res)
+        self.assertEqual(res["status"], "pending")
+        self.assertEqual(res["retry_of"], job_id)
+
+        new_job = store.get("jobs", res["id"])
+        self.assertIsNotNone(new_job)
+        self.assertEqual(new_job["status"], "pending")
+
 
 if __name__ == "__main__":
     unittest.main()

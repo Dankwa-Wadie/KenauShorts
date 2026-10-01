@@ -550,3 +550,46 @@ Stage 2 meets all single-instance operational requirements: process tracking, pr
 - **Full Discovery Suite** (`python -X utf8 -m unittest discover tests`):
   - 206 tests total: 199 passed, 0 failures, 7 known environment-specific errors (6 NVENC on non-CUDA host, 1 macOS `os.getuid()` test on Windows).
 
+---
+
+## Stage 7 Phase 2 Corrective Patch: Live Video-State Recovery on Job Timeout
+
+### Implementation Date
+2026-10-01
+
+### Baseline Commit
+`926ce32` (`feat(stage7): improve worker lifecycle and automation reliability`)
+
+### Addressed Issue & Architectural Improvements
+
+1. **Live Video-State Recovery on Subprocess Timeout**:
+   - **Problem**: In commit `926ce32`, when an upload or render job timed out and was killed by the watchdog in `run_job_process()`, the job record was marked `failed`, but the associated record in the SQLite `videos` table remained in `uploading` or `rendering`. This prevented immediate operator retry or reconciliation during continuous server execution until the server was restarted.
+   - **Resolution**:
+     - Introduced `_handle_job_timeout_video_state(job, timeout_seconds)` in `studio/server.py`.
+     - Executed under `with GUARD:` immediately upon confirmed timeout in `run_job_process()` (both normal post-wait branch and exception handler).
+     - **Render timeout**: transitions video from `rendering` to `render_failed` with error message `"Render process timed out after Xs."`.
+     - **Upload timeout**: transitions video from `uploading` to `upload_unknown` with failure reason `"Upload process timed out after Xs. Resumable session or manual reconciliation required."`, while preserving existing `resumable_uri`, `video`, `title`, and candidate metadata intact.
+     - **Terminal state protection**: strictly checks current video status and refuses to overwrite valid terminal or completed states (`uploaded`, `ready`, `failed`, `render_failed`, `upload_unknown`, `upload_unresolved`).
+     - **Safe retry workflow**: operator can immediately re-render a `render_failed` video or reconcile/resolve an `upload_unknown` video without server restart.
+     - **Duplicate publication guards preserved**: `automation_loop()` continues to strictly pick `ready` videos; `start_job()` and `queue_worker_loop()` continue to block duplicate or uncertain uploads.
+
+### Test Evidence
+- **Stage 7 Phase 2 Suite** (`tests/test_stage7_phase2.py`): 20/20 passed (8.3s).
+  - 15 Phase 2 baseline tests.
+  - `test_render_timeout_transitions_video_to_render_failed`: Verifies video transitions from `rendering` to `render_failed` on render timeout.
+  - `test_upload_timeout_transitions_video_to_upload_unknown_and_preserves_metadata`: Verifies video transitions from `uploading` to `upload_unknown` and preserves `resumable_uri` and title on upload timeout.
+  - `test_timeout_does_not_overwrite_uploaded_video`: Verifies timeout does not overwrite a video already marked `uploaded`.
+  - `test_repeated_timeout_handling_is_safe_and_idempotent`: Verifies repeated calls to timeout recovery are idempotent and non-destructive.
+  - `test_timed_out_video_retry_without_server_restart`: Verifies timed-out render jobs can be retried immediately through `retry_job()` without restarting the server.
+- **Targeted Regression Suites**:
+  - `tests/test_stage6_publishing.py`: 38/38 passed (6.6s).
+  - `tests/test_stage7_phase1.py`: 18/18 passed (1.5s).
+  - `tests/test_stage4_pipeline.py`: 14/14 passed (1.1s).
+  - `tests/test_stage3_reliability.py`: 12/12 passed (5.3s).
+  - `tests/test_stage2_queue_cancel.py`: 11/11 passed (6.3s).
+  - `tests/test_studio_server.py`: 11/11 passed (0.8s).
+  - `tests/test_studio_store.py`: 9/9 passed (0.6s).
+- **Full Discovery Suite** (`python -X utf8 -m unittest discover tests`):
+  - 211 tests total: 204 passed, 0 failures, 7 known environment-specific errors (6 NVENC on non-CUDA Windows host, 1 macOS `os.getuid()` test on Windows).
+
+
