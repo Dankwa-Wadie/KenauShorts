@@ -1213,7 +1213,7 @@ def reconcile_video_upload(vid_id: str) -> dict[str, Any]:
         with _RECONCILE_LOCK:
             _RECONCILING_VIDEOS.discard(vid_id)
 
-def resolve_manual_video(vid_id: str, resolution: str, youtube_id: str = "") -> dict[str, Any]:
+def resolve_manual_video(vid_id: str, resolution: str, youtube_id: str = "", confirmed: bool = True) -> dict[str, Any]:
     """Manually resolve an ambiguous upload outcome (upload_unknown / upload_unresolved)."""
     with GUARD:
         video = store.get("videos", vid_id)
@@ -1221,17 +1221,24 @@ def resolve_manual_video(vid_id: str, resolution: str, youtube_id: str = "") -> 
             raise ValueError(f"Video '{vid_id}' not found")
 
         current_status = video.get("status")
+        if current_status == "uploading":
+            raise ConflictError(f"Video '{vid_id}' is currently uploading and cannot be manually resolved.")
 
-        if resolution == "confirm_uploaded":
-            yt_id = (youtube_id or "").strip()
+        res = str(resolution or "").strip().lower()
+        if res == "mark_failed":
+            res = "confirm_absent"
+
+        if res == "confirm_uploaded":
+            yt_id = (youtube_id or video.get("youtube_id") or "").strip()
             if "v=" in yt_id:
-                yt_id = yt_id.split("v=")[1].split("&")[0].split("?")[0]
+                yt_id = yt_id.split("v=")[1].split("&")[0].split("?")[0].split("#")[0]
             elif "youtu.be/" in yt_id:
-                yt_id = yt_id.split("youtu.be/")[1].split("?")[0]
+                yt_id = yt_id.split("youtu.be/")[1].split("?")[0].split("#")[0]
             elif "/shorts/" in yt_id:
-                yt_id = yt_id.split("/shorts/")[1].split("?")[0]
+                yt_id = yt_id.split("/shorts/")[1].split("?")[0].split("#")[0]
+            yt_id = yt_id.strip()
 
-            if not yt_id or len(yt_id) < 6:
+            if not yt_id or len(yt_id) < 6 or not re.match(r'^[A-Za-z0-9_-]+$', yt_id):
                 raise ValueError("A valid YouTube Video ID or URL is required to confirm upload.")
 
             # Idempotent re-confirmation: if already confirmed with this ID, sync state and return success
@@ -1266,9 +1273,15 @@ def resolve_manual_video(vid_id: str, resolution: str, youtube_id: str = "") -> 
                 "message": f"Video manually confirmed as uploaded to YouTube ({yt_id}).",
             }
 
-        elif resolution == "confirm_absent":
+        elif res == "confirm_absent":
+            if current_status == "uploaded":
+                raise ConflictError(f"Video '{vid_id}' has already been confirmed as uploaded to YouTube ({video.get('youtube_id')}).")
+
             if current_status not in ("upload_unknown", "upload_unresolved", "failed"):
                 raise ValueError(f"Video '{vid_id}' is in status '{current_status}'. Only upload_unknown, upload_unresolved, or failed videos can be manually resolved.")
+
+            if confirmed is False:
+                raise ValueError("Confirmation was explicitly declined.")
 
             video["status"] = "ready"
             video["youtube_id"] = ""
@@ -1282,7 +1295,9 @@ def resolve_manual_video(vid_id: str, resolution: str, youtube_id: str = "") -> 
                 "message": "Video confirmed absent on YouTube and reset to ready for fresh upload.",
             }
 
-        elif resolution == "resume":
+        elif res == "resume":
+            if current_status == "uploaded":
+                raise ConflictError(f"Video '{vid_id}' has already been uploaded.")
             if not video.get("resumable_uri"):
                 raise ValueError("No resumable upload session exists for this video.")
             video["status"] = "ready"
@@ -2134,10 +2149,11 @@ class StudioHandler(BaseHTTPRequestHandler):
             vid_id = data.get("id")
             if not vid_id:
                 raise ValueError("Missing video id to resolve")
-            resolution = data.get("resolution")
+            resolution = data.get("action") or data.get("resolution")
             if not resolution:
                 raise ValueError("Missing resolution action ('confirm_uploaded' or 'confirm_absent')")
-            return resolve_manual_video(vid_id, resolution, data.get("youtube_id", ""))
+            confirmed = data.get("confirmed", data.get("confirm", True))
+            return resolve_manual_video(vid_id, resolution, data.get("youtube_id", ""), confirmed=confirmed)
 
         if path == "/api/connections/test":
             return test_youtube_connection()

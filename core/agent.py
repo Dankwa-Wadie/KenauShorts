@@ -417,20 +417,25 @@ def discover_youtube(queries: list[str], api_key: str, per_query: int = 8,
                 }
         return []
 
-    # Local pre-flight quota guard: enforce 100 search calls/day limit
+    # Local pre-flight quota guard: enforce 100 search calls/day limit and circuit breaker
     try:
         tracker = store.get_local_quota_tracker()
         search_limit = int(tracker.get("search_list_limit", 100))
         search_used = int(tracker.get("search_list_count", 0))
+        quota_exhausted = bool(tracker.get("google_quota_exhausted", False))
     except Exception:
         search_limit = 100
         search_used = 0
+        quota_exhausted = False
 
-    if search_used >= search_limit:
-        LOG.warning("YouTube search quota limit reached (%d/%d) — skipping search-based clip source.", search_used, search_limit)
+    if quota_exhausted or search_used >= search_limit:
+        LOG.warning("YouTube search quota blocked (exhausted=%s, %d/%d) — skipping search-based clip source.",
+                    quota_exhausted, search_used, search_limit)
         emit_progress("YouTube search quota limit reached — skipping search")
         if stats is not None:
             stats["search_quota_blocked"] = True
+            if quota_exhausted:
+                stats["google_quota_exhausted"] = True
             stats.setdefault("sources", {})["youtube_search"] = {
                 "attempted": 0, "configured": len(queries), "candidates": 0,
                 "failures": 0, "skipped_quota": len(queries),
@@ -444,15 +449,19 @@ def discover_youtube(queries: list[str], api_key: str, per_query: int = 8,
     }
 
     for q in queries:
-        # Check quota remaining before each query
+        # Atomically check quota availability and reserve 1 unit before making HTTP request
         try:
-            curr_tracker = store.get_local_quota_tracker()
-            if curr_tracker.get("search_list_count", 0) >= search_limit:
-                LOG.warning("YouTube search quota limit reached (%d/%d) while evaluating %r — stopping search.",
-                            curr_tracker.get("search_list_count", 0), search_limit, q)
+            can_proceed, curr_tracker = store.check_and_reserve_quota("search_list", 1)
+            if not can_proceed:
+                is_google_ex = bool(curr_tracker.get("google_quota_exhausted", False))
+                LOG.warning("YouTube search quota blocked (exhausted=%s, count=%d/%d) while evaluating %r — stopping search.",
+                            is_google_ex, curr_tracker.get("search_list_count", 0),
+                            curr_tracker.get("search_list_limit", search_limit), q)
                 if stats is not None:
                     stats["search_quota_blocked"] = True
-                yt_stats["skipped_quota"] += 1
+                    if is_google_ex:
+                        stats["google_quota_exhausted"] = True
+                yt_stats["skipped_quota"] += len(queries) - yt_stats["attempted"]
                 break
         except Exception:
             pass
@@ -476,17 +485,17 @@ def discover_youtube(queries: list[str], api_key: str, per_query: int = 8,
 
         try:
             resp = requests.get("https://www.googleapis.com/youtube/v3/search", params=params, timeout=15)
-            # Record local quota activity at request boundary
-            try:
-                store.record_local_quota_activity("search_list", 1)
-            except Exception as q_err:
-                LOG.warning("Failed to record local search quota: %s", q_err)
             yt_stats["attempted"] += 1
 
             if resp.status_code == 403 and "quotaExceeded" in resp.text:
                 LOG.warning("YouTube Data API reported quotaExceeded for query %r", q)
+                try:
+                    store.mark_google_quota_exhausted("search_list quotaExceeded")
+                except Exception as mark_err:
+                    LOG.warning("Failed to persist quota circuit breaker: %s", mark_err)
                 if stats is not None:
                     stats["search_quota_blocked"] = True
+                    stats["google_quota_exhausted"] = True
                 yt_stats["failures"] += 1
                 break
 
@@ -583,6 +592,17 @@ def verify_youtube_licenses(cands: list[Candidate], api_key: str, max_seconds: i
                 store.record_local_quota_activity("general", 1)
             except Exception as q_err:
                 LOG.warning("Failed to record general quota unit: %s", q_err)
+            if resp.status_code == 403 and "quotaExceeded" in resp.text:
+                LOG.warning("YouTube Data API reported quotaExceeded in videos.list")
+                try:
+                    store.mark_google_quota_exhausted("videos_list quotaExceeded")
+                except Exception:
+                    pass
+                if stats is not None:
+                    stats["search_quota_blocked"] = True
+                    stats["google_quota_exhausted"] = True
+                reasons["quota exceeded"] = reasons.get("quota exceeded", 0) + len(batch)
+                break
             resp.raise_for_status()
             data = resp.json()
         except Exception as e:
@@ -656,16 +676,26 @@ def generate_idle_explanation(stats: dict[str, Any]) -> str:
     if not stats:
         return "No new candidates to process"
 
-    quota_blocked = bool(stats.get("search_quota_blocked", False))
+    quota_blocked = bool(stats.get("search_quota_blocked", False) or stats.get("google_quota_exhausted", False))
     total_raw = int(stats.get("total_discovered_raw", 0))
     unique = int(stats.get("unique_candidates", 0))
     rejections = dict(stats.get("rejected_by_reason", {}))
-    seen = int(rejections.get("already_seen", 0))
+    seen = int(rejections.get("already_seen", stats.get("seen_candidates", 0)))
+
+    # Compute total upstream/network query failures across all configured sources
+    sources = stats.get("sources", {})
+    total_failures = 0
+    if isinstance(sources, dict):
+        for s_data in sources.values():
+            if isinstance(s_data, dict):
+                total_failures += int(s_data.get("failures", 0))
 
     if quota_blocked and total_raw == 0:
         return "YouTube search quota limit reached; 0 candidates from other sources"
 
     if total_raw == 0:
+        if total_failures > 0:
+            return f"Discovery queries failed due to network or upstream API errors ({total_failures} failure(s))"
         return "No candidates returned by configured discovery queries or channels"
 
     if unique > 0 and seen == unique:
@@ -750,6 +780,7 @@ def discover_all_candidates(config: dict[str, Any], state: State, stats: dict[st
         stats["unique_candidates"] = len(unique_by_key)
         stats["duplicates_within_run"] = dupes_within_run
         stats.setdefault("rejected_by_reason", {})["already_seen"] = seen_count
+        stats["seen_candidates"] = seen_count
         stats["eligible_candidates"] = len(fresh)
         stats["finished_at"] = time.time()
 
@@ -1211,6 +1242,7 @@ def upload_to_youtube(
     on_session_created: Any = None,
     resumable_uri: str | None = None,
     chunksize: int = 5 * 1024 * 1024,
+    record_quota: bool = True,
 ) -> str | None:
     """Upload completed video to YouTube Shorts with resumable recovery support."""
     emit_progress("Uploading to YouTube")
@@ -1231,6 +1263,12 @@ def upload_to_youtube(
             chunksize=chunksize,
             on_session_created=on_session_created,
         )
+
+    if record_quota:
+        try:
+            store.record_local_quota_activity("videos_insert", 1)
+        except Exception as q_err:
+            LOG.warning("Failed to record videos_insert quota unit: %s", q_err)
 
     from googleapiclient.discovery import build
     from googleapiclient.http import MediaFileUpload

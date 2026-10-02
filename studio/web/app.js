@@ -29,6 +29,14 @@ document.addEventListener('DOMContentLoaded', () => {
   renderPage(currentPage);
 });
 
+window.addEventListener('beforeunload', () => {
+  clearOverviewCountdown();
+  if (statusInterval) {
+    clearInterval(statusInterval);
+    statusInterval = null;
+  }
+});
+
 // --------------------------------------------------------------------------
 // Navigation & Router
 // --------------------------------------------------------------------------
@@ -312,9 +320,10 @@ async function reconcileIncident(vidId, btn) {
 
 async function resolveIncident(vidId, action, btn) {
   if (!vidId) return;
+  const isAbsent = (action === 'confirm_absent' || action === 'mark_failed');
   const actionText = action === 'confirm_uploaded'
     ? 'Confirm this video as uploaded to YouTube?'
-    : 'Mark this upload as failed?';
+    : 'Confirm this video is absent on YouTube and reset to ready?';
   if (!confirm(actionText)) return;
 
   if (btn) {
@@ -322,7 +331,13 @@ async function resolveIncident(vidId, action, btn) {
     btn.textContent = 'Saving...';
   }
   try {
-    const payload = { id: vidId, action };
+    const canonicalAction = isAbsent ? 'confirm_absent' : action;
+    const payload = {
+      id: vidId,
+      action: canonicalAction,
+      resolution: canonicalAction,
+      confirmed: true,
+    };
     if (action === 'confirm_uploaded') {
       const manualYtId = prompt('Enter YouTube Video ID (e.g. dQw4w9WgXcQ) or leave blank if unchanged:');
       if (manualYtId === null) {
@@ -462,12 +477,12 @@ async function loadOverview(container) {
                 actions = `
                   <button class="btn btn-secondary" style="padding: 6px 12px; font-size: 12px;" onclick="reconcileIncident('${escapeHtml(v.id)}', this)">⚡ Reconcile Upload</button>
                   <button class="btn btn-secondary" style="padding: 6px 12px; font-size: 12px;" onclick="resolveIncident('${escapeHtml(v.id)}', 'confirm_uploaded', this)">✓ Confirm</button>
-                  <button class="btn btn-danger" style="padding: 6px 12px; font-size: 12px;" onclick="resolveIncident('${escapeHtml(v.id)}', 'mark_failed', this)">✕ Fail</button>
+                  <button class="btn btn-danger" style="padding: 6px 12px; font-size: 12px;" onclick="resolveIncident('${escapeHtml(v.id)}', 'confirm_absent', this)">✕ Fail</button>
                 `;
               } else if (isUnresolved) {
                 actions = `
                   <button class="btn btn-secondary" style="padding: 6px 12px; font-size: 12px;" onclick="resolveIncident('${escapeHtml(v.id)}', 'confirm_uploaded', this)">✓ Confirm Uploaded</button>
-                  <button class="btn btn-danger" style="padding: 6px 12px; font-size: 12px;" onclick="resolveIncident('${escapeHtml(v.id)}', 'mark_failed', this)">✕ Mark Failed</button>
+                  <button class="btn btn-danger" style="padding: 6px 12px; font-size: 12px;" onclick="resolveIncident('${escapeHtml(v.id)}', 'confirm_absent', this)">✕ Mark Failed</button>
                 `;
               } else if (isRenderFailed) {
                 actions = `

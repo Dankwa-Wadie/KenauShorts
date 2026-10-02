@@ -328,7 +328,11 @@ def get_pacific_date(now_utc: dt.datetime | None = None) -> str:
 def get_pacific_reset_info(now_utc: dt.datetime | None = None) -> dict[str, Any]:
     """Return next midnight Pacific Time reset timestamp, ISO string, and seconds remaining."""
     pt_now = get_pacific_now(now_utc)
-    next_midnight_pt = (pt_now + dt.timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
+    target_date = pt_now.date() + dt.timedelta(days=1)
+    # Estimate UTC around 8 AM on the target date to evaluate target date's Pacific offset
+    est_utc = dt.datetime(target_date.year, target_date.month, target_date.day, 8, 0, tzinfo=dt.timezone.utc)
+    target_pt = get_pacific_now(est_utc)
+    next_midnight_pt = dt.datetime(target_date.year, target_date.month, target_date.day, 0, 0, 0, tzinfo=target_pt.tzinfo)
     reset_ts = next_midnight_pt.timestamp()
     current_utc = now_utc if now_utc is not None else dt.datetime.now(dt.timezone.utc)
     if current_utc.tzinfo is None:
@@ -339,8 +343,58 @@ def get_pacific_reset_info(now_utc: dt.datetime | None = None) -> dict[str, Any]
         "reset_at_iso": next_midnight_pt.isoformat(),
         "seconds_remaining": max(0.0, round(reset_ts - now_ts, 1)),
         "timezone": "America/Los_Angeles",
-        "is_dst": pt_now.tzname() == "PDT" or pt_now.utcoffset() == dt.timedelta(hours=-7),
+        "is_dst": target_pt.tzname() == "PDT" or target_pt.utcoffset() == dt.timedelta(hours=-7),
     }
+
+
+def _save_quota_data(quota_path: Path, data: dict[str, Any]) -> None:
+    """Safely persist quota data using atomic write."""
+    try:
+        tmp_path = quota_path.with_suffix(".tmp")
+        tmp_path.write_text(json.dumps(data, indent=2), encoding="utf-8")
+        tmp_path.replace(quota_path)
+    except Exception as e:
+        LOG.warning("Failed to atomically persist studio-quota.json: %s", e)
+
+
+def _load_and_sanitize_quota_data(quota_path: Path, today_pt: str) -> dict[str, Any]:
+    data: dict[str, Any] = {}
+    if quota_path.exists():
+        try:
+            data = json.loads(quota_path.read_text(encoding="utf-8"))
+        except Exception:
+            data = {}
+    if not isinstance(data, dict) or data.get("date_pt") != today_pt:
+        data = {
+            "date_pt": today_pt,
+            "videos_insert_count": 0,
+            "search_list_count": 0,
+            "general_units": 0,
+            "videos_insert_limit": data.get("videos_insert_limit", 100) if isinstance(data, dict) else 100,
+            "search_list_limit": data.get("search_list_limit", 100) if isinstance(data, dict) else 100,
+            "general_units_limit": data.get("general_units_limit", 10000) if isinstance(data, dict) else 10000,
+            "google_quota_exhausted": False,
+            "google_quota_exhausted_reason": "",
+            "google_quota_exhausted_at": "",
+            "disclaimer": "Local estimate only. Google Developer Console is the authoritative source of truth.",
+        }
+        _save_quota_data(quota_path, data)
+    else:
+        for k in ("videos_insert_count", "search_list_count", "general_units"):
+            try:
+                data[k] = max(0, int(data.get(k, 0)))
+            except (ValueError, TypeError):
+                data[k] = 0
+        for k in ("videos_insert_limit", "search_list_limit", "general_units_limit"):
+            try:
+                data[k] = max(1, int(data.get(k, 100 if "limit" in k and "general" not in k else 10000)))
+            except (ValueError, TypeError):
+                data[k] = 100 if "general" not in k else 10000
+        data["google_quota_exhausted"] = bool(data.get("google_quota_exhausted", False))
+        data.setdefault("google_quota_exhausted_reason", "")
+        data.setdefault("google_quota_exhausted_at", "")
+        data.setdefault("disclaimer", "Local estimate only. Google Developer Console is the authoritative source of truth.")
+    return data
 
 
 def get_local_quota_tracker(now_utc: dt.datetime | None = None) -> dict[str, Any]:
@@ -348,33 +402,90 @@ def get_local_quota_tracker(now_utc: dt.datetime | None = None) -> dict[str, Any
     today_pt = get_pacific_date(now_utc)
     reset_info = get_pacific_reset_info(now_utc)
     quota_path = ROOT / "studio-quota.json"
-    data: dict[str, Any] = {}
     with _QUOTA_LOCK:
-        if quota_path.exists():
-            try:
-                data = json.loads(quota_path.read_text(encoding="utf-8"))
-            except Exception:
-                data = {}
-        if not isinstance(data, dict) or data.get("date_pt") != today_pt:
-            data = {
-                "date_pt": today_pt,
-                "videos_insert_count": 0,
-                "search_list_count": 0,
-                "general_units": 0,
-                "videos_insert_limit": data.get("videos_insert_limit", 100) if isinstance(data, dict) else 100,
-                "search_list_limit": data.get("search_list_limit", 100) if isinstance(data, dict) else 100,
-                "general_units_limit": data.get("general_units_limit", 10000) if isinstance(data, dict) else 10000,
-                "disclaimer": "Local estimate only. Google Developer Console is the authoritative source of truth.",
-            }
-            try:
-                quota_path.write_text(json.dumps(data, indent=2), encoding="utf-8")
-            except Exception:
-                pass
+        data = _load_and_sanitize_quota_data(quota_path, today_pt)
 
     tracker = dict(data)
     tracker.update(reset_info)
-    tracker["search_limit_reached"] = bool(tracker.get("search_list_count", 0) >= tracker.get("search_list_limit", 100))
+    tracker["google_quota_exhausted"] = bool(tracker.get("google_quota_exhausted", False))
+    tracker["search_limit_reached"] = bool(
+        tracker.get("search_list_count", 0) >= tracker.get("search_list_limit", 100)
+        or tracker["google_quota_exhausted"]
+    )
     return tracker
+
+
+def mark_google_quota_exhausted(reason: str = "quotaExceeded", now_utc: dt.datetime | None = None) -> dict[str, Any]:
+    """Trip the persistent date-scoped Google quota circuit breaker for today's Pacific Time day."""
+    with _QUOTA_LOCK:
+        today_pt = get_pacific_date(now_utc)
+        quota_path = ROOT / "studio-quota.json"
+        data = _load_and_sanitize_quota_data(quota_path, today_pt)
+
+        data["google_quota_exhausted"] = True
+        data["google_quota_exhausted_reason"] = str(reason)
+        data["google_quota_exhausted_at"] = (now_utc or dt.datetime.now(dt.timezone.utc)).isoformat()
+
+        _save_quota_data(quota_path, data)
+
+        out = dict(data)
+        out.update(get_pacific_reset_info(now_utc))
+        out["search_limit_reached"] = True
+        return out
+
+
+def check_and_reserve_quota(action_type: str, units: int = 1, now_utc: dt.datetime | None = None) -> tuple[bool, dict[str, Any]]:
+    """
+    Atomically check whether quota is available and reserve units under lock.
+    Prevents race conditions where concurrent discovery runs exceed configured limits.
+    Returns (True, tracker) if admitted and reserved; (False, tracker) if limit reached or exhausted.
+    """
+    with _QUOTA_LOCK:
+        today_pt = get_pacific_date(now_utc)
+        quota_path = ROOT / "studio-quota.json"
+        data = _load_and_sanitize_quota_data(quota_path, today_pt)
+
+        # If persistent circuit breaker is tripped, reject admission
+        if data.get("google_quota_exhausted", False):
+            out = dict(data)
+            out.update(get_pacific_reset_info(now_utc))
+            out["search_limit_reached"] = True
+            return False, out
+
+        if action_type == "search_list":
+            limit = data.get("search_list_limit", 100)
+            current = data.get("search_list_count", 0)
+            if current + units > limit:
+                out = dict(data)
+                out.update(get_pacific_reset_info(now_utc))
+                out["search_limit_reached"] = True
+                return False, out
+            data["search_list_count"] = current + units
+        elif action_type == "videos_insert":
+            limit = data.get("videos_insert_limit", 100)
+            current = data.get("videos_insert_count", 0)
+            if current + units > limit:
+                out = dict(data)
+                out.update(get_pacific_reset_info(now_utc))
+                out["search_limit_reached"] = bool(data.get("search_list_count", 0) >= data.get("search_list_limit", 100))
+                return False, out
+            data["videos_insert_count"] = current + units
+        elif action_type == "general":
+            limit = data.get("general_units_limit", 10000)
+            current = data.get("general_units", 0)
+            if current + units > limit:
+                out = dict(data)
+                out.update(get_pacific_reset_info(now_utc))
+                out["search_limit_reached"] = bool(data.get("search_list_count", 0) >= data.get("search_list_limit", 100))
+                return False, out
+            data["general_units"] = current + units
+
+        _save_quota_data(quota_path, data)
+
+        out = dict(data)
+        out.update(get_pacific_reset_info(now_utc))
+        out["search_limit_reached"] = bool(out.get("search_list_count", 0) >= out.get("search_list_limit", 100))
+        return True, out
 
 
 def record_local_quota_activity(action_type: str, units: int = 1, now_utc: dt.datetime | None = None) -> dict[str, Any]:
@@ -382,23 +493,7 @@ def record_local_quota_activity(action_type: str, units: int = 1, now_utc: dt.da
     with _QUOTA_LOCK:
         today_pt = get_pacific_date(now_utc)
         quota_path = ROOT / "studio-quota.json"
-        data: dict[str, Any] = {}
-        if quota_path.exists():
-            try:
-                data = json.loads(quota_path.read_text(encoding="utf-8"))
-            except Exception:
-                data = {}
-        if not isinstance(data, dict) or data.get("date_pt") != today_pt:
-            data = {
-                "date_pt": today_pt,
-                "videos_insert_count": 0,
-                "search_list_count": 0,
-                "general_units": 0,
-                "videos_insert_limit": 100,
-                "search_list_limit": 100,
-                "general_units_limit": 10000,
-                "disclaimer": "Local estimate only. Google Developer Console is the authoritative source of truth.",
-            }
+        data = _load_and_sanitize_quota_data(quota_path, today_pt)
 
         if action_type == "videos_insert":
             data["videos_insert_count"] = max(0, data.get("videos_insert_count", 0) + units)
@@ -407,12 +502,13 @@ def record_local_quota_activity(action_type: str, units: int = 1, now_utc: dt.da
         elif action_type == "general":
             data["general_units"] = max(0, data.get("general_units", 0) + units)
 
-        try:
-            quota_path.write_text(json.dumps(data, indent=2), encoding="utf-8")
-        except Exception:
-            pass
+        _save_quota_data(quota_path, data)
 
         out = dict(data)
         out.update(get_pacific_reset_info(now_utc))
-        out["search_limit_reached"] = bool(out.get("search_list_count", 0) >= out.get("search_list_limit", 100))
+        out["google_quota_exhausted"] = bool(out.get("google_quota_exhausted", False))
+        out["search_limit_reached"] = bool(
+            out.get("search_list_count", 0) >= out.get("search_list_limit", 100)
+            or out["google_quota_exhausted"]
+        )
         return out

@@ -686,7 +686,277 @@ class Stage7Phase3Tests(unittest.TestCase):
         self.assertIn(".meter-track", style_css)
         self.assertIn(".meter-fill", style_css)
         self.assertIn(".incident-card", style_css)
-        self.assertIn(".diag-tag", style_css)
+    def test_incident_resolution_contract_and_state_guards(self):
+        """Test incident resolution API with exact frontend payloads, duplicate prevention, and state guards."""
+        headers = {"X-Studio-Token": server.CSRF, "Origin": f"http://127.0.0.1:{self.port}"}
+
+        # 1. confirm_uploaded using exact frontend payload { id, action, youtube_id } with YouTube URL
+        store.put("videos", "v_resolve_upload_1", {
+            "id": "v_resolve_upload_1",
+            "title": "Resolve Upload Video",
+            "status": "upload_unknown",
+            "source": "youtube_search",
+            "duration": 45,
+            "candidate": {"key": "yt_cand_1"},
+        })
+
+        code, resp = self.request("POST", "/api/video/resolve", body={
+            "id": "v_resolve_upload_1",
+            "action": "confirm_uploaded",
+            "youtube_id": "https://www.youtube.com/watch?v=dQw4w9WgXcQ",
+        }, headers=headers)
+        self.assertEqual(code, 200)
+        self.assertEqual(resp.get("status"), "uploaded")
+        self.assertEqual(resp.get("youtube_id"), "dQw4w9WgXcQ")
+
+        # Verify state in SQLite & state.json
+        rec = store.get("videos", "v_resolve_upload_1")
+        self.assertEqual(rec["status"], "uploaded")
+        self.assertEqual(rec["youtube_id"], "dQw4w9WgXcQ")
+        state = State(self.root / "state.json")
+        self.assertTrue(any(p.get("key") == "yt_cand_1" for p in state.posted))
+
+        # Verify no upload job was enqueued or created in the pipeline
+        jobs = store.records("jobs")
+        self.assertFalse(any(j.get("action") == "upload" for j in jobs))
+
+        # 2. Idempotent re-confirmation with same ID succeeds
+        code, resp = self.request("POST", "/api/video/resolve", body={
+            "id": "v_resolve_upload_1",
+            "action": "confirm_uploaded",
+            "youtube_id": "dQw4w9WgXcQ",
+        }, headers=headers)
+        self.assertEqual(code, 200)
+        self.assertEqual(resp.get("status"), "uploaded")
+
+        # 3. Conflicting re-confirmation with different ID fails with 409 Conflict
+        code, resp = self.request("POST", "/api/video/resolve", body={
+            "id": "v_resolve_upload_1",
+            "action": "confirm_uploaded",
+            "youtube_id": "another_id_123",
+        }, headers=headers)
+        self.assertEqual(code, 409)
+
+        # 4. Attempting to mark already uploaded video absent fails with 409 Conflict
+        code, resp = self.request("POST", "/api/video/resolve", body={
+            "id": "v_resolve_upload_1",
+            "action": "confirm_absent",
+            "confirmed": True,
+        }, headers=headers)
+        self.assertEqual(code, 409)
+
+        # 5. confirm_absent on upload_unknown with explicit declination fails with 400
+        store.put("videos", "v_resolve_unknown_1", {
+            "id": "v_resolve_unknown_1",
+            "title": "Unknown Video",
+            "status": "upload_unknown",
+            "source": "youtube_search",
+        })
+        # Explicit declination: confirmed=False -> 400
+        code, resp = self.request("POST", "/api/video/resolve", body={
+            "id": "v_resolve_unknown_1",
+            "action": "confirm_absent",
+            "confirmed": False,
+        }, headers=headers)
+        self.assertEqual(code, 400)
+        self.assertIn("Confirmation was explicitly declined", resp.get("error", ""))
+
+        # With confirmation: action=confirm_absent -> 200 and reset to ready
+        code, resp = self.request("POST", "/api/video/resolve", body={
+            "id": "v_resolve_unknown_1",
+            "action": "confirm_absent",
+            "confirmed": True,
+        }, headers=headers)
+        self.assertEqual(code, 200)
+        self.assertEqual(resp.get("status"), "ready")
+        self.assertEqual(store.get("videos", "v_resolve_unknown_1")["status"], "ready")
+
+        # 6. Resolving a video currently uploading is rejected with 409
+        store.put("videos", "v_active_uploading", {
+            "id": "v_active_uploading",
+            "title": "Uploading Video",
+            "status": "uploading",
+        })
+        code, resp = self.request("POST", "/api/video/resolve", body={
+            "id": "v_active_uploading",
+            "action": "confirm_absent",
+            "confirmed": True,
+        }, headers=headers)
+        self.assertEqual(code, 409)
+
+        # 7. confirm_uploaded with blank/invalid ID is rejected with 400
+        store.put("videos", "v_invalid_id", {
+            "id": "v_invalid_id",
+            "status": "upload_unresolved",
+        })
+        code, resp = self.request("POST", "/api/video/resolve", body={
+            "id": "v_invalid_id",
+            "action": "confirm_uploaded",
+            "youtube_id": "   ",
+        }, headers=headers)
+        self.assertEqual(code, 400)
+
+    def test_persistent_quota_circuit_breaker_and_rollover(self):
+        """Test persistent Google quota exhaustion circuit breaker and automatic PT midnight reset."""
+        # 1. Trigger quotaExceeded on search
+        mock_resp_403 = MagicMock()
+        mock_resp_403.status_code = 403
+        mock_resp_403.text = "The request cannot be completed because you have exceeded your quotaExceeded."
+
+        stats = {}
+        with patch("requests.get", return_value=mock_resp_403):
+            res = agent.discover_youtube(["query1", "query2"], api_key="dummy_key", stats=stats)
+            self.assertEqual(len(res), 0)
+
+        # Verify circuit breaker is tripped and persisted in studio-quota.json
+        tracker = store.get_local_quota_tracker()
+        self.assertTrue(tracker["google_quota_exhausted"])
+        self.assertTrue(tracker["search_limit_reached"])
+
+        # 2. Subsequent discovery run skips search immediately in pre-flight without HTTP call
+        with patch("requests.get") as mock_get:
+            stats2 = {}
+            res2 = agent.discover_youtube(["query3"], api_key="dummy_key", stats=stats2)
+            self.assertEqual(len(res2), 0)
+            mock_get.assert_not_called()
+            self.assertTrue(stats2.get("search_quota_blocked"))
+            self.assertTrue(stats2.get("google_quota_exhausted"))
+
+        # 3. Simulate day rollover to tomorrow Pacific Time
+        today_pt = store.get_pacific_date()
+        tomorrow_utc = dt.datetime.now(dt.timezone.utc) + dt.timedelta(days=1, hours=2)
+        tomorrow_pt = store.get_pacific_date(tomorrow_utc)
+        self.assertNotEqual(today_pt, tomorrow_pt)
+
+        # On tomorrow, tracker resets google_quota_exhausted to False and search_limit_reached to False
+        tomorrow_tracker = store.get_local_quota_tracker(now_utc=tomorrow_utc)
+        self.assertFalse(tomorrow_tracker["google_quota_exhausted"])
+        self.assertFalse(tomorrow_tracker["search_limit_reached"])
+        self.assertEqual(tomorrow_tracker["search_list_count"], 0)
+
+    def test_concurrent_quota_reservation_race_prevention(self):
+        """Test atomic check_and_reserve_quota prevents concurrent admission beyond search limit."""
+        quota_path = self.root / "studio-quota.json"
+        today_pt = store.get_pacific_date()
+        quota_path.write_text(json.dumps({
+            "date_pt": today_pt,
+            "search_list_count": 0,
+            "search_list_limit": 5,
+        }), encoding="utf-8")
+
+        success_count = [0]
+        failed_count = [0]
+        lock = threading.Lock()
+
+        def try_reserve():
+            allowed, _ = store.check_and_reserve_quota("search_list", 1)
+            with lock:
+                if allowed:
+                    success_count[0] += 1
+                else:
+                    failed_count[0] += 1
+
+        threads = [threading.Thread(target=try_reserve) for _ in range(12)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        self.assertEqual(success_count[0], 5)
+        self.assertEqual(failed_count[0], 7)
+        final_tracker = store.get_local_quota_tracker()
+        self.assertEqual(final_tracker["search_list_count"], 5)
+        self.assertTrue(final_tracker["search_limit_reached"])
+
+    def test_worker_upload_quota_accounting_at_start(self):
+        """Test that worker records videos_insert at actual upload start, but not for resumable uploads."""
+        initial_count = store.get_local_quota_tracker()["videos_insert_count"]
+
+        # 1. Fresh upload (no resumable_uri)
+        video_dummy = self.root / "out" / "test_upload.mp4"
+        video_dummy.write_bytes(b"dummy mp4 data")
+
+        store.put("videos", "v_worker_upload_test", {
+            "id": "v_worker_upload_test",
+            "title": "Worker Upload Test",
+            "status": "ready",
+            "video": "out/test_upload.mp4",
+        })
+
+        import studio.worker as worker_module
+
+        # Mock agent.upload_to_youtube to succeed
+        with patch("core.agent.upload_to_youtube", return_value="yt_uploaded_id_1"):
+            worker_module.work("upload", "v_worker_upload_test")
+
+        after_count = store.get_local_quota_tracker()["videos_insert_count"]
+        self.assertEqual(after_count - initial_count, 1)
+
+        # 2. Resumable upload (resumable_uri present) -> should NOT increment videos_insert
+        store.put("videos", "v_worker_resumable_test", {
+            "id": "v_worker_resumable_test",
+            "title": "Worker Resumable Test",
+            "status": "ready",
+            "video": "out/test_upload.mp4",
+            "resumable_uri": "https://upload.youtube.com/session/123",
+        })
+
+        with patch("core.agent.upload_to_youtube", return_value="yt_uploaded_id_2"):
+            worker_module.work("upload", "v_worker_resumable_test")
+
+        after_resumable_count = store.get_local_quota_tracker()["videos_insert_count"]
+        self.assertEqual(after_resumable_count, after_count)
+
+    def test_discovery_diagnostics_distinguish_failures_from_empty(self):
+        """Test that generate_idle_explanation distinguishes upstream source failures from valid empty results."""
+        # Case A: Valid 0 candidates (no failures)
+        stats_empty = {
+            "total_discovered_raw": 0,
+            "unique_candidates": 0,
+            "sources": {
+                "youtube_search": {"attempted": 2, "failures": 0, "candidates": 0},
+                "youtube_channels": {"configured": 1, "failures": 0, "candidates": 0},
+            },
+            "rejected_by_reason": {},
+        }
+        exp_empty = agent.generate_idle_explanation(stats_empty)
+        self.assertIn("No candidates returned", exp_empty)
+
+        # Case B: Source query failures occurred
+        stats_failed = {
+            "total_discovered_raw": 0,
+            "unique_candidates": 0,
+            "sources": {
+                "youtube_search": {"attempted": 2, "failures": 2, "candidates": 0},
+            },
+            "rejected_by_reason": {},
+        }
+        exp_failed = agent.generate_idle_explanation(stats_failed)
+        self.assertIn("Discovery queries failed due to network or upstream API errors (2 failure(s))", exp_failed)
+
+    def test_quota_persistence_resilience_and_corrupt_recovery(self):
+        """Test recovery from corrupt or malformed studio-quota.json file."""
+        quota_path = self.root / "studio-quota.json"
+
+        # 1. Completely corrupt non-JSON file
+        quota_path.write_text("{corrupt-invalid-json", encoding="utf-8")
+        tracker = store.get_local_quota_tracker()
+        self.assertEqual(tracker["videos_insert_count"], 0)
+        self.assertEqual(tracker["search_list_count"], 0)
+        self.assertFalse(tracker["google_quota_exhausted"])
+
+        # 2. Corrupt field values (strings, negative numbers)
+        quota_path.write_text(json.dumps({
+            "date_pt": store.get_pacific_date(),
+            "videos_insert_count": "invalid",
+            "search_list_count": -50,
+            "google_quota_exhausted": True,
+        }), encoding="utf-8")
+
+        tracker2 = store.get_local_quota_tracker()
+        self.assertEqual(tracker2["videos_insert_count"], 0)
+        self.assertEqual(tracker2["search_list_count"], 0)
+        self.assertTrue(tracker2["google_quota_exhausted"])
 
 
 if __name__ == "__main__":

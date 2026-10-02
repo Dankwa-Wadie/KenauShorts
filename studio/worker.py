@@ -75,6 +75,11 @@ def work(action: str, key: str) -> None:
 
             try:
                 agent.emit_progress("Preparing YouTube upload")
+                if not resumable_uri:
+                    try:
+                        store.record_local_quota_activity("videos_insert", 1)
+                    except Exception as q_err:
+                        LOG.warning("Failed to record videos_insert quota unit: %s", q_err)
                 vid_id = agent.upload_to_youtube(
                     video_path=video_file,
                     title=record["title"],
@@ -85,6 +90,7 @@ def work(action: str, key: str) -> None:
                     category_id=config.get("posting", {}).get("category_id", "28"),
                     on_session_created=on_session_created,
                     resumable_uri=resumable_uri,
+                    record_quota=False,
                 )
                 if not vid_id:
                     raise RuntimeError("No YouTube video ID returned.")
@@ -121,7 +127,6 @@ def work(action: str, key: str) -> None:
                         "dry_run": False,
                         "at": time.time(),
                     })
-                    store.record_local_quota_activity("videos_insert", 1)
 
             except Exception as e:
                 err_msg = str(e)

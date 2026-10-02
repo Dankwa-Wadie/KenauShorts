@@ -12,30 +12,38 @@ what's actually on `origin/main`.
 
 ## Current state (update this section each handoff)
 
-- **Stage 7 Phase 3 Completed (Command Center, Quota Governance & Discovery Diagnostics)**:
+- **Stage 7 Phase 3 Completed & Post-Review Corrective Fix Applied (Command Center, Quota Governance & Discovery Diagnostics)**:
   - **Operational Telemetry & Quota Governance**:
     - Thread-safe local tracking of daily YouTube API quota (`search_list_count`, `videos_insert_count`, `general_units`) in `studio-quota.json` protected by `_QUOTA_LOCK`.
-    - Timezone-aware midnight Pacific Time (PT) daily reset (`get_pacific_now`, `get_pacific_date`, `get_pacific_reset_info`) with robust US Daylight Saving Time (DST) fallback on Windows without requiring optional tzdata packages.
+    - Persistent quota exhaustion circuit breaker (`google_quota_exhausted: True`) tripped on HTTP 403 `quotaExceeded` for search or video checks; prevents repetitive outbound API retries and automatically resets at Pacific Time midnight rollover.
+    - Atomic check-and-reserve admission (`check_and_reserve_quota`) preventing concurrent workers/threads from racing past daily quota limits.
+    - Upload quota (`videos_insert`) recorded at upload attempt/start rather than delayed post-sync, with deduplication protecting resumable sessions from double-counting.
+    - Timezone-aware midnight Pacific Time (PT) daily reset (`get_pacific_now`, `get_pacific_date`, `get_pacific_reset_info`) with dynamic DST and year-boundary calculation, atomic `.tmp` persistence, and automatic recovery from corrupted JSON files.
     - Pre-flight quota guard capping YouTube search at 100 calls/day (`search_list_limit`); gracefully skips searches when exhausted while allowing non-search discovery sources (channels, Reddit) to continue producing candidates.
     - Non-blocking, sanitized OAuth health diagnostics (`get_oauth_status_details()`) reporting channel metadata and status without exposing sensitive tokens or client credentials.
+  - **Incident Resolution API Contract & Safety**:
+    - Unified `POST /api/video/resolve` to support both `action` and `resolution` parameters (`confirm_uploaded`, `confirm_absent`, and `mark_failed` alias).
+    - Strict validation of YouTube IDs (extracts clean 11-char ID from full/short URLs, enforces regex `^[A-Za-z0-9_-]+$`).
+    - State guards preventing conflicting re-confirmations (409 Conflict), rejecting `confirm_absent` on already-uploaded videos, and rejecting resolution on currently `uploading` videos.
+    - Zero upload re-triggering during manual incident resolution.
   - **Discovery Diagnostics & Run Telemetry**:
-    - Structured per-run telemetry (`discovery_stats`) tracking configured queries, channels, subreddits, attempted vs skipped searches, raw discovered candidates, cross-source duplicates, unique candidates, seen filtering, and specific rejection breakdown (`rejected_by_reason`).
-    - Evidence-based idle diagnostic explanations (`generate_idle_explanation()`) emitted in `KENAU_SUMMARY` providing clear operator explanations for zero-candidate runs.
+    - Standardized telemetry keys (`total_discovered_raw`, `duplicates_within_run`, `unique_candidates`, `seen_candidates`, `rejected_by_reason`, `eligible_candidates`).
+    - Evidence-based idle diagnostic explanations (`generate_idle_explanation()`) distinguishing source query/network failures from valid zero-candidate yields.
   - **Executive Operational Command Center (Overview UI)**:
     - Cleaned duplicate HTML markup, panel headers, and disk space cards.
     - Added high-visibility OAuth alert banners when credentials need attention.
     - Operational KPI cards (Ready, Uploaded, In Queue, Total Videos) with dynamic layout.
-    - Automation Schedule widget with dynamic local real-time countdown timer (`startOverviewCountdown`, `clearOverviewCountdown`).
+    - Automation Schedule widget with dynamic local real-time countdown timer (`startOverviewCountdown`, `clearOverviewCountdown`) with `beforeunload` teardown.
     - System Storage Health indicator with color-coded safety thresholds (<512 MB critical, <1 GB low, healthy).
     - Visual Daily Quota Meters for search queries (100 cap), video uploads, and general units with midnight PT reset timer.
     - Actionable Incident Remediation cards with 1-click buttons: Reconcile / Confirm / Fail for `upload_unknown` and `upload_unresolved`, and Retry Render for `render_failed`.
     - Latest Discovery Diagnostics card displaying source yield and rejection breakdowns.
   - **Test Suite**:
-    - `tests/test_stage7_phase3.py`: 18/18 passed (1.0s).
-    - `tests/test_stage7_phase2.py`: 20/20 passed (9.0s).
-    - `tests/test_stage7_phase1.py`: 18/18 passed (1.8s).
+    - `tests/test_stage7_phase3.py`: 24/24 passed (1.2s), including 6 comprehensive tests for circuit breaker, race prevention, incident resolution contract, worker upload quota, and corrupt recovery.
+    - `tests/test_stage7_phase2.py`: 20/20 passed (8.5s).
+    - `tests/test_stage7_phase1.py`: 18/18 passed (1.7s).
     - `tests/test_stage6_publishing.py`: 38/38 passed (6.3s).
-    - Full discovery suite: 229 tests total (222 passed, 0 failures, 7 known environment limitations: 6 NVENC, 1 macOS).
+    - Full discovery suite: 235 tests total (228 passed, 0 failures, 7 known environment limitations: 6 NVENC, 1 macOS).
 - **Stage 7 Phase 2 Completed (Worker Lifecycle, Watchdogs & Automation Reliability)**:
   - **Recoverable SQLite & `state.json` Synchronization (Fix 1)**:
     - In `studio/server.py`, `reconcile_video_upload()` detects if the SQLite video record already has `status == "uploaded"`. When already uploaded, it bypasses outbound HTTP requests (no duplicate uploads or spurious session queries) and immediately invokes `_sync_candidate_posted(video, yt_id)` to ensure candidate state in `state.json` is synchronized with `state.posted` and `state.seen`.
@@ -708,12 +716,64 @@ Stage 2 meets all single-instance operational requirements: process tracking, pr
   - License check general units tracking and rejection categorization.
   - Pipeline summary emission of `discovery_stats`.
   - UI assets structure and CSS classes contract verification.
-- **Stage 7 Phase 1 & 2 Regressions**:
-  - `tests/test_stage7_phase1.py`: 18/18 passed (1.8s).
-  - `tests/test_stage7_phase2.py`: 20/20 passed (9.0s).
+### Stage 7 Phase 3 Corrective Fix: Review Findings & Targeted Corrections
+
+#### Implementation Date
+2026-10-02
+
+#### Addressed Review Areas & Technical Solutions
+
+1. **Incident Resolution API Contract & State Transition Guards**:
+   - **Unified Contract**: `POST /api/video/resolve` in `studio/server.py` now uniformly accepts either `action` (used by frontend `resolveIncident`) or `resolution` (used by tests/CLI), and honors `confirmed: true` / `confirm: true`.
+   - **Supported Actions**: Canonical actions `confirm_uploaded` and `confirm_absent` are supported, alongside backward-compatible alias `mark_failed` (which maps safely to `confirm_absent`).
+   - **YouTube Video ID Extraction & Validation**: When `confirm_uploaded` is called, `youtube_id` or `youtube_url` is parsed to extract clean 11-character alphanumeric IDs (handling standard `watch?v=`, `youtu.be/`, `/shorts/`, or raw IDs). Invalid or empty IDs return HTTP 400 Bad Request. Regex validation `^[A-Za-z0-9_-]+$` prevents malformed strings.
+   - **State Transition Guards**:
+     - Videos currently in `uploading` cannot be resolved manually (returns HTTP 409 Conflict).
+     - Videos already marked `uploaded` reject conflicting YouTube IDs (HTTP 409 Conflict), but permit idempotent re-confirmation if the ID matches.
+     - `confirm_absent` on already-uploaded videos is rejected with HTTP 409 Conflict.
+     - Manual incident resolution does not trigger an outbound upload or queue an upload job.
+   - **Frontend Synchronization**: `studio/web/app.js` sends `{ id, action: canonicalAction, resolution: canonicalAction, confirmed: true }` and passes `youtube_id` when resolving `upload_unresolved` items.
+
+2. **Persistent Quota Exhaustion Circuit Breaker**:
+   - **Circuit Breaker Flag**: In `studio/store.py`, `studio-quota.json` persists `google_quota_exhausted: True` alongside `date_pt` and `reason`.
+   - **Trip Mechanism**: Tripped on HTTP 403 `quotaExceeded` during YouTube search (`core/agent.py:discover_youtube`) or license validation (`core/agent.py:verify_youtube_licenses`) via `store.mark_google_quota_exhausted()`.
+   - **Pre-Flight Protection**: Subsequent discovery runs detect `google_quota_exhausted` in pre-flight checks and immediately bypass all search queries without issuing any outbound network requests to the YouTube Data API.
+   - **Date Rollover**: The circuit breaker automatically resets (`google_quota_exhausted: False`) when the Pacific Time date rolls over past midnight PT.
+
+3. **Atomic Quota Admission & Request-Start Accounting**:
+   - **Atomic Check & Reserve**: Introduced `store.check_and_reserve_quota(action_type, units=1, now_utc=None)` protected under `_QUOTA_LOCK`. Callers atomically check limits and increment counters in a single critical section, preventing multi-threaded or concurrent pipeline runs from racing past daily limits.
+   - **Request-Start Upload Accounting**:
+     - In `studio/worker.py` and `core/agent.py:upload_to_youtube`, upload quota (`videos_insert`, 1600 units equivalent) is accounted at upload initiation before HTTP transfer begins.
+     - Delayed post-sync accounting was eliminated to avoid missing failed initial attempts.
+     - Resumed upload sessions (`resumable_uri` present) bypass re-recording to avoid double-charging quota for network retries.
+
+4. **Discovery Diagnostics Telemetry Standardization**:
+   - **Standardized Metric Names**: In `core/agent.py`, candidate tracking dictionary keys are standardized: `total_discovered_raw`, `duplicates_within_run`, `unique_candidates`, `seen_candidates`, `rejected_by_reason`, and `eligible_candidates`.
+   - **Failure Distinction**: `generate_idle_explanation(stats)` distinguishes true empty candidate yields from complete upstream source failures. If network errors or API failures occurred across configured sources, it explicitly reports `"Discovery queries failed due to network or upstream API errors (X failure(s))"` instead of claiming no content matched criteria.
+
+5. **Timezone & Persistence Resilience**:
+   - **Pacific Time Calculation**: `get_pacific_reset_info()` dynamically calculates next midnight PT by finding the start of the next calendar day in Pacific Time and computing the exact epoch difference, resilient to Daylight Saving Time boundaries and year rollover.
+   - **Atomic File Persistence**: `_save_quota_data()` writes serialized JSON to a temporary file (`.tmp`) and uses atomic `os.replace` to prevent corrupted files during sudden power loss or process interruption.
+   - **Auto-Recovery**: `_load_and_sanitize_quota_data()` safely catches corrupted, truncated, or invalid JSON, as well as negative or invalid counter types, automatically resetting to a clean, valid quota schema.
+
+6. **Incident & Frontend Safety**:
+   - **Event Listener Teardown**: In `studio/web/app.js`, a `beforeunload` listener clears active intervals and countdown timers (`overviewCountdownTimer`, `statusInterval`).
+   - **CSS Contract Verification**: Verified styles for `.stat-card`, `.stat-card:hover`, `.video-card:hover`, and incident button states in `studio/web/style.css`.
+
+### Test Evidence
+- **Stage 7 Phase 3 Suite** (`tests/test_stage7_phase3.py`): 24/24 passed (1.2s).
+  - All 18 initial Phase 3 baseline tests.
+  - `test_incident_resolution_contract_and_state_guards`: Verifies `{ id, action }` contract, YouTube ID extraction, conflict guards, upload state guards, and rejection of unconfirmed payloads.
+  - `test_persistent_quota_circuit_breaker_and_rollover`: Verifies persistent 403 `quotaExceeded` circuit breaker, search bypass, and midnight PT reset.
+  - `test_concurrent_quota_reservation_race_prevention`: Verifies atomic `check_and_reserve_quota` under 10 concurrent threads without over-allocation.
+  - `test_worker_upload_quota_accounting_at_start`: Verifies upload quota recorded at start of upload and skipped on resumed sessions.
+  - `test_discovery_diagnostics_distinguish_failures_from_empty`: Verifies idle explanation distinguishes upstream query failures from empty yields.
+  - `test_quota_persistence_resilience_and_corrupt_recovery`: Verifies atomic persistence and auto-recovery from corrupted JSON files.
+- **Full Regression Suite**:
+  - `tests/test_stage7_phase1.py`: 18/18 passed (1.7s).
+  - `tests/test_stage7_phase2.py`: 20/20 passed (8.5s).
   - `tests/test_stage6_publishing.py`: 38/38 passed (6.3s).
-- **Full Discovery Suite** (`python -X utf8 -m unittest discover tests`):
-  - 229 tests total: 222 passed, 0 failures, 7 known environment-specific errors (6 NVENC on non-CUDA Windows host, 1 macOS `os.getuid()` test on Windows).
+  - Total Stage 6 & 7 test count: 100/100 passed (14.8s).
 - **Compilation & Formatting Checks**:
   - `python -m compileall core studio scripts tests`: 0 errors.
   - `git diff --check`: 0 warnings/errors.
