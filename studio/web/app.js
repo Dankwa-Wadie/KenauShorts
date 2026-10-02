@@ -46,6 +46,7 @@ function setupNavigation() {
 }
 
 function renderPage(page) {
+  clearOverviewCountdown();
   const view = document.getElementById('content-view');
   const title = document.getElementById('page-title');
   const eyebrow = document.getElementById('page-eyebrow');
@@ -249,11 +250,128 @@ async function submitManualUrl() {
   }
 }
 // --------------------------------------------------------------------------
-// Page: Overview
+// Page: Overview (Stage 7 Phase 3 Executive Operational Command Center)
 // --------------------------------------------------------------------------
 
+let overviewCountdownTimer = null;
+
+function clearOverviewCountdown() {
+  if (overviewCountdownTimer) {
+    clearInterval(overviewCountdownTimer);
+    overviewCountdownTimer = null;
+  }
+}
+
+function startOverviewCountdown(nextRunTs) {
+  clearOverviewCountdown();
+  const el = document.getElementById('overview-countdown-val');
+  if (!el || !nextRunTs) return;
+
+  function update() {
+    const now = Date.now() / 1000;
+    const diff = Math.max(0, nextRunTs - now);
+    if (diff <= 0) {
+      el.textContent = 'Scheduled now (awaiting trigger)';
+      clearOverviewCountdown();
+      return;
+    }
+    const hours = Math.floor(diff / 3600);
+    const mins = Math.floor((diff % 3600) / 60);
+    const secs = Math.floor(diff % 60);
+    if (hours > 0) {
+      el.textContent = `${hours}h ${mins}m ${secs}s`;
+    } else {
+      el.textContent = `${mins}m ${secs}s`;
+    }
+  }
+
+  update();
+  overviewCountdownTimer = setInterval(update, 1000);
+}
+
+async function reconcileIncident(vidId, btn) {
+  if (!vidId) return;
+  if (btn) {
+    btn.disabled = true;
+    btn.textContent = 'Reconciling...';
+  }
+  try {
+    const res = await postJSON('/api/video/reconcile', { id: vidId });
+    const data = await res.json();
+    if (!res.ok || data.error) throw new Error(data.error || 'Reconciliation failed');
+    showNotification(data.message || `Reconciliation outcome: ${data.status}`, 'success');
+    loadOverview(document.getElementById('content-view'));
+  } catch (e) {
+    showNotification(`Reconciliation error: ${e.message}`, 'error');
+    if (btn) {
+      btn.disabled = false;
+      btn.textContent = '⚡ Reconcile Upload';
+    }
+  }
+}
+
+async function resolveIncident(vidId, action, btn) {
+  if (!vidId) return;
+  const actionText = action === 'confirm_uploaded'
+    ? 'Confirm this video as uploaded to YouTube?'
+    : 'Mark this upload as failed?';
+  if (!confirm(actionText)) return;
+
+  if (btn) {
+    btn.disabled = true;
+    btn.textContent = 'Saving...';
+  }
+  try {
+    const payload = { id: vidId, action };
+    if (action === 'confirm_uploaded') {
+      const manualYtId = prompt('Enter YouTube Video ID (e.g. dQw4w9WgXcQ) or leave blank if unchanged:');
+      if (manualYtId === null) {
+        if (btn) btn.disabled = false;
+        return;
+      }
+      if (manualYtId.trim()) {
+        payload.youtube_id = manualYtId.trim();
+      }
+    }
+    const res = await postJSON('/api/video/resolve', payload);
+    const data = await res.json();
+    if (!res.ok || data.error) throw new Error(data.error || 'Resolution failed');
+    showNotification(data.message || 'Incident resolved successfully.', 'success');
+    loadOverview(document.getElementById('content-view'));
+  } catch (e) {
+    showNotification(`Resolution error: ${e.message}`, 'error');
+    if (btn) {
+      btn.disabled = false;
+      btn.textContent = action === 'confirm_uploaded' ? '✓ Confirm Uploaded' : '✕ Mark Failed';
+    }
+  }
+}
+
+async function retryRenderIncident(vidId, btn) {
+  if (!vidId) return;
+  if (btn) {
+    btn.disabled = true;
+    btn.textContent = 'Enqueuing...';
+  }
+  try {
+    const res = await postJSON('/api/job', { action: 'render', key: vidId });
+    const data = await res.json();
+    if (!res.ok || data.error) throw new Error(data.error || 'Failed to retry render');
+    showNotification('Re-render job enqueued! Check Pipeline & Queue tab.', 'success');
+    pollStatus();
+    loadOverview(document.getElementById('content-view'));
+  } catch (e) {
+    showNotification(`Retry error: ${e.message}`, 'error');
+    if (btn) {
+      btn.disabled = false;
+      btn.textContent = '↺ Retry Render';
+    }
+  }
+}
+
 async function loadOverview(container) {
-  container.innerHTML = '<p>Loading statistics...</p>';
+  clearOverviewCountdown();
+  container.innerHTML = '<p>Loading operational command center...</p>';
   try {
     const [statusRes, videosRes, failuresRes] = await Promise.all([
       fetch('/api/status').then(r => r.json()),
@@ -264,10 +382,171 @@ async function loadOverview(container) {
     const total = videosRes.length;
     const ready = videosRes.filter(v => v.status === 'ready').length;
     const uploaded = videosRes.filter(v => v.status === 'uploaded').length;
+    const queueCount = statusRes.queue_count || 0;
+
+    // OAuth Health Banner
+    const oauth = statusRes.oauth_health || {};
+    let oauthBannerHtml = '';
+    if (oauth.needs_attention) {
+      const bannerClass = (oauth.status === 'expired' || oauth.status === 'invalid') ? 'danger' : 'warning';
+      oauthBannerHtml = `
+        <div class="alert-banner ${bannerClass}">
+          <div style="display: flex; align-items: center; gap: 10px;">
+            <span style="font-size: 18px;">⚠️</span>
+            <div>
+              <strong>OAuth Alert (${escapeHtml(oauth.status || 'needs attention')}):</strong>
+              ${escapeHtml(oauth.message || 'YouTube upload credentials require attention.')}
+            </div>
+          </div>
+          <button class="btn btn-secondary" style="padding: 6px 12px; font-size: 13px;" onclick="document.querySelector('[data-page=connections]').click()">
+            Manage Connections ↗
+          </button>
+        </div>
+      `;
+    }
+
+    // Storage threshold evaluation
+    const freeMb = statusRes.free_space_mb || 0;
+    let storageBadge = `<span class="badge" style="background: rgba(0,186,124,0.15); color: var(--success); border: 1px solid var(--success);">Healthy</span>`;
+    if (freeMb < 512) {
+      storageBadge = `<span class="badge" style="background: rgba(244,33,46,0.2); color: var(--danger); border: 1px solid var(--danger);">Critical (<512 MB)</span>`;
+    } else if (freeMb < 1024) {
+      storageBadge = `<span class="badge" style="background: rgba(245,158,11,0.2); color: var(--warning); border: 1px solid var(--warning);">Low Space (<1 GB)</span>`;
+    }
+
+    // Automation schedule details
+    const auto = statusRes.automation || {};
+    const autoEnabled = Boolean(auto.enabled);
+    const autoModeLabel = auto.mode === 'publish' ? 'Automatic Publishing (FIFO)' : 'Preview Only (Drafts)';
+    const nextRunDate = auto.next_run ? new Date(auto.next_run * 1000).toLocaleString() : 'Not scheduled';
+
+    // Quota Gauges Data
+    const quota = statusRes.quota_tracker || {};
+    const searchUsed = quota.search_list_count || 0;
+    const searchLimit = quota.search_list_limit || 100;
+    const searchPct = Math.min(100, Math.round((searchUsed / searchLimit) * 100));
+    const searchClass = searchPct >= 90 ? 'danger' : (searchPct >= 70 ? 'warning' : 'normal');
+
+    const uploadsUsed = quota.videos_insert_count || 0;
+    const uploadsLimit = quota.videos_insert_limit || 100;
+    const uploadsPct = Math.min(100, Math.round((uploadsUsed / uploadsLimit) * 100));
+    const uploadsClass = uploadsPct >= 90 ? 'danger' : (uploadsPct >= 70 ? 'warning' : 'success');
+
+    const genUnitsUsed = quota.general_units || 0;
+    const genUnitsLimit = quota.general_units_limit || 10000;
+    const genUnitsPct = Math.min(100, Math.round((genUnitsUsed / genUnitsLimit) * 100));
+    const genUnitsClass = genUnitsPct >= 90 ? 'danger' : (genUnitsPct >= 70 ? 'warning' : 'success');
+
+    // Actionable Incidents
+    const incidents = statusRes.incidents || [];
+    let incidentsHtml = '';
+    if (incidents.length > 0) {
+      incidentsHtml = `
+        <div class="panel" style="margin-bottom: 24px; border-color: rgba(244, 33, 46, 0.4);">
+          <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 16px; flex-wrap: wrap; gap: 8px;">
+            <h3 class="panel-title" style="margin-bottom: 0; color: var(--danger); display: flex; align-items: center; gap: 8px;">
+              <span>🚨</span> Action Required: Unresolved Incidents (${incidents.length})
+            </h3>
+            <span style="font-size: 12px; color: var(--text-muted);">Safe resolution workflows with duplicate protection</span>
+          </div>
+          <div class="incident-list">
+            ${incidents.map(v => {
+              const st = v.status || 'unknown';
+              const isUnknown = st === 'upload_unknown';
+              const isUnresolved = st === 'upload_unresolved';
+              const isRenderFailed = st === 'render_failed';
+              const err = v.upload_failure_reason || v.error || 'Subprocess or network failure';
+
+              let actions = '';
+              if (isUnknown) {
+                actions = `
+                  <button class="btn btn-secondary" style="padding: 6px 12px; font-size: 12px;" onclick="reconcileIncident('${escapeHtml(v.id)}', this)">⚡ Reconcile Upload</button>
+                  <button class="btn btn-secondary" style="padding: 6px 12px; font-size: 12px;" onclick="resolveIncident('${escapeHtml(v.id)}', 'confirm_uploaded', this)">✓ Confirm</button>
+                  <button class="btn btn-danger" style="padding: 6px 12px; font-size: 12px;" onclick="resolveIncident('${escapeHtml(v.id)}', 'mark_failed', this)">✕ Fail</button>
+                `;
+              } else if (isUnresolved) {
+                actions = `
+                  <button class="btn btn-secondary" style="padding: 6px 12px; font-size: 12px;" onclick="resolveIncident('${escapeHtml(v.id)}', 'confirm_uploaded', this)">✓ Confirm Uploaded</button>
+                  <button class="btn btn-danger" style="padding: 6px 12px; font-size: 12px;" onclick="resolveIncident('${escapeHtml(v.id)}', 'mark_failed', this)">✕ Mark Failed</button>
+                `;
+              } else if (isRenderFailed) {
+                actions = `
+                  <button class="btn btn-secondary" style="padding: 6px 12px; font-size: 12px;" onclick="retryRenderIncident('${escapeHtml(v.id)}', this)">↺ Retry Render</button>
+                `;
+              }
+
+              return `
+                <div class="incident-card ${isUnknown ? 'unknown' : ''}">
+                  <div style="flex: 1; min-width: 250px;">
+                    <div style="display: flex; align-items: center; gap: 8px; margin-bottom: 4px;">
+                      <span class="badge ${isUnknown ? 'running' : 'failed'}" style="font-size: 11px;">${escapeHtml(st)}</span>
+                      <strong style="font-size: 14px;">${escapeHtml(v.title || v.headline || v.id)}</strong>
+                    </div>
+                    <div style="font-size: 12px; color: var(--text-muted); font-family: var(--font-mono);">${escapeHtml(err)}</div>
+                  </div>
+                  <div style="display: flex; gap: 8px; flex-wrap: wrap;">
+                    ${actions}
+                  </div>
+                </div>
+              `;
+            }).join('')}
+          </div>
+        </div>
+      `;
+    }
+
+    // Latest Discovery Diagnostics
+    const disc = statusRes.latest_discovery || {};
+    let discoveryHtml = '';
+    if (disc && disc.run_id) {
+      const discSources = disc.sources || {};
+      const discRejections = disc.rejected_by_reason || {};
+      const rejectionsList = Object.entries(discRejections).filter(([_, count]) => count > 0);
+
+      discoveryHtml = `
+        <div class="panel" style="margin-bottom: 24px;">
+          <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 14px; flex-wrap: wrap; gap: 8px;">
+            <h3 class="panel-title" style="margin-bottom: 0;">Latest Discovery Run Diagnostics</h3>
+            <span style="font-size: 12px; color: var(--text-muted); font-family: var(--font-mono);">${escapeHtml(disc.run_id)} • ${disc.started_at ? new Date(disc.started_at * 1000).toLocaleTimeString() : ''}</span>
+          </div>
+
+          <div style="display: flex; gap: 10px; flex-wrap: wrap; margin-bottom: 14px;">
+            <div class="diag-tag">
+              <span>Raw Scanned:</span> <strong>${disc.total_discovered_raw || 0}</strong>
+            </div>
+            <div class="diag-tag">
+              <span>Unique Evaluated:</span> <strong>${disc.unique_candidates || 0}</strong>
+            </div>
+            <div class="diag-tag">
+              <span>Eligible Fresh:</span> <strong style="color: var(--success);">${disc.eligible_candidates || 0}</strong>
+            </div>
+            ${disc.search_quota_blocked ? `<div class="diag-tag" style="border-color: var(--warning); color: var(--warning);">⚠️ Search Quota Limit Reached</div>` : ''}
+          </div>
+
+          <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 16px; font-size: 13px;">
+            <div style="background: rgba(255,255,255,0.02); border: 1px solid var(--border); border-radius: var(--radius-sm); padding: 12px;">
+              <div style="font-weight: 600; margin-bottom: 6px; color: var(--text-muted); font-size: 11px; text-transform: uppercase;">Source Candidate Breakdown</div>
+              <div>• YouTube Search: <strong>${discSources.youtube_search?.candidates || 0} clips</strong> (${discSources.youtube_search?.attempted || 0} queries)</div>
+              <div>• YouTube Channels: <strong>${discSources.youtube_channels?.candidates || 0} clips</strong></div>
+              <div>• Reddit Sources: <strong>${discSources.reddit?.candidates || 0} clips</strong></div>
+            </div>
+            <div style="background: rgba(255,255,255,0.02); border: 1px solid var(--border); border-radius: var(--radius-sm); padding: 12px;">
+              <div style="font-weight: 600; margin-bottom: 6px; color: var(--text-muted); font-size: 11px; text-transform: uppercase;">Filtering Outcomes</div>
+              ${rejectionsList.length > 0
+                ? rejectionsList.map(([reason, count]) => `<div>• ${escapeHtml(reason)}: <strong>${count}</strong></div>`).join('')
+                : '<div style="color: var(--text-muted);">Zero rejected candidates recorded.</div>'}
+            </div>
+          </div>
+        </div>
+      `;
+    }
 
     container.innerHTML = `
+      ${oauthBannerHtml}
+
+      <!-- Top Metric Cards -->
       <div class="stats-grid">
-        <div class="stat-card">
+        <div class="stat-card" style="cursor: pointer;" onclick="document.querySelector('[data-page=library]').click()">
           <div class="label">Ready for Review</div>
           <div class="value" style="color: var(--accent)">${ready}</div>
         </div>
@@ -275,33 +554,140 @@ async function loadOverview(container) {
           <div class="label">Uploaded Shorts</div>
           <div class="value" style="color: var(--success)">${uploaded}</div>
         </div>
+        <div class="stat-card" style="cursor: pointer;" onclick="document.querySelector('[data-page=queue]').click()">
+          <div class="label">Pending in Queue</div>
+          <div class="value" style="color: ${queueCount > 0 ? 'var(--warning)' : 'var(--text-main)'}">${queueCount}</div>
+        </div>
         <div class="stat-card">
           <div class="label">Total Generated</div>
           <div class="value">${total}</div>
         </div>
-        <div class="stat-card">
-          <div class="label">Free Disk Space</div>
-          <div class="value">${statusRes.free_space_mb} MB</div>
-        </div>
       </div>
-        <div class="stat-card">
-          <div class="label">Free Disk Space</div>
-          <div class="value">${statusRes.free_space_mb} MB</div>
+
+      <!-- Actionable Incidents -->
+      ${incidentsHtml}
+
+      <!-- Command Grid: Automation Schedule & System Health -->
+      <div class="command-grid">
+        <!-- Automation Schedule Widget -->
+        <div class="panel">
+          <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px;">
+            <h3 class="panel-title" style="margin-bottom: 0;">Automation Scheduler</h3>
+            <span class="badge ${autoEnabled ? 'running' : ''}" style="font-size: 12px;">
+              ${autoEnabled ? '● Active' : '○ Paused'}
+            </span>
+          </div>
+
+          <div style="background: rgba(255, 255, 255, 0.02); border: 1px solid var(--border); border-radius: var(--radius-sm); padding: 14px; margin-bottom: 14px;">
+            <div style="font-size: 12px; color: var(--text-muted); margin-bottom: 4px;">COUNTDOWN TO NEXT RUN</div>
+            <div id="overview-countdown-val" style="font-size: 22px; font-weight: 700; color: var(--accent); font-family: var(--font-mono);">
+              ${autoEnabled && auto.next_run ? 'Calculating...' : 'Paused'}
+            </div>
+            <div style="font-size: 12px; color: var(--text-muted); margin-top: 4px;">Next trigger: <strong>${escapeHtml(nextRunDate)}</strong></div>
+          </div>
+
+          <div style="font-size: 13px; color: var(--text-muted); margin-bottom: 16px;">
+            <div>Mode: <strong style="color: var(--text-main);">${escapeHtml(autoModeLabel)}</strong></div>
+            <div>Interval: <strong style="color: var(--text-main);">Every ${auto.interval_hours || 5} hours</strong></div>
+          </div>
+
+          <button class="btn btn-secondary" style="width: 100%;" onclick="document.querySelector('[data-page=automation]').click()">
+            Manage Automation Settings ↗
+          </button>
+        </div>
+
+        <!-- System & Storage Health Widget -->
+        <div class="panel">
+          <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px;">
+            <h3 class="panel-title" style="margin-bottom: 0;">System & Storage Health</h3>
+            ${storageBadge}
+          </div>
+
+          <div style="background: rgba(255, 255, 255, 0.02); border: 1px solid var(--border); border-radius: var(--radius-sm); padding: 14px; margin-bottom: 14px;">
+            <div style="display: flex; justify-content: space-between; align-items: baseline;">
+              <span style="font-size: 12px; color: var(--text-muted);">FREE DISK SPACE</span>
+              <strong style="font-size: 18px; color: var(--text-main);">${freeMb.toLocaleString()} MB</strong>
+            </div>
+            <div style="font-size: 11px; color: var(--text-muted); margin-top: 4px;">
+              Thresholds: Safe &gt;1GB • Low space &lt;1GB • Critical &lt;512MB
+            </div>
+          </div>
+
+          <div style="font-size: 13px; color: var(--text-muted); margin-bottom: 16px;">
+            <div>Host Daemon: <strong style="color: var(--text-main);">${statusRes.online ? 'Online' : 'Offline'} • ${escapeHtml(statusRes.platform || 'Local PC')}</strong></div>
+            <div>YouTube OAuth: <strong style="color: ${oauth.healthy ? 'var(--success)' : 'var(--warning)'};">${escapeHtml(oauth.status || 'healthy')}</strong></div>
+          </div>
+
+          <button class="btn btn-secondary" style="width: 100%;" onclick="document.querySelector('[data-page=connections]').click()">
+            Inspect API & OAuth Connections ↗
+          </button>
         </div>
       </div>
 
+      <!-- YouTube Quota Meters Panel -->
+      <div class="panel" style="margin-bottom: 24px;">
+        <div style="display: flex; justify-content: space-between; align-items: baseline; margin-bottom: 8px; flex-wrap: wrap; gap: 8px;">
+          <h3 class="panel-title" style="margin-bottom: 0;">YouTube API Quota Governance (2026 Model)</h3>
+          <span style="font-size: 12px; color: var(--text-muted);">
+            Resets at 00:00 Pacific Time (${escapeHtml(quota.date_pt || 'N/A')}) • ${quota.disclaimer || 'Local estimate'}
+          </span>
+        </div>
+
+        <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 16px; margin-top: 14px;">
+          <!-- Search List Bucket -->
+          <div style="background: rgba(255, 255, 255, 0.02); border: 1px solid var(--border); border-radius: var(--radius-sm); padding: 14px;">
+            <div style="display: flex; justify-content: space-between; font-size: 12px;">
+              <span style="color: var(--text-muted); font-weight: 600;">SEARCH QUERIES</span>
+              <strong>${searchUsed} / ${searchLimit} (${searchPct}%)</strong>
+            </div>
+            <div class="meter-track">
+              <div class="meter-fill ${searchClass}" style="width: ${searchPct}%;"></div>
+            </div>
+            <div style="font-size: 11px; color: var(--text-muted);">Capped at 100 calls/day • Local pre-flight guard active</div>
+          </div>
+
+          <!-- Videos Insert Bucket -->
+          <div style="background: rgba(255, 255, 255, 0.02); border: 1px solid var(--border); border-radius: var(--radius-sm); padding: 14px;">
+            <div style="display: flex; justify-content: space-between; font-size: 12px;">
+              <span style="color: var(--text-muted); font-weight: 600;">VIDEO UPLOADS</span>
+              <strong>${uploadsUsed} / ${uploadsLimit} (${uploadsPct}%)</strong>
+            </div>
+            <div class="meter-track">
+              <div class="meter-fill ${uploadsClass}" style="width: ${uploadsPct}%;"></div>
+            </div>
+            <div style="font-size: 11px; color: var(--text-muted);">Operational tracker • ~1,600 units est. per upload</div>
+          </div>
+
+          <!-- General Units Bucket -->
+          <div style="background: rgba(255, 255, 255, 0.02); border: 1px solid var(--border); border-radius: var(--radius-sm); padding: 14px;">
+            <div style="display: flex; justify-content: space-between; font-size: 12px;">
+              <span style="color: var(--text-muted); font-weight: 600;">GENERAL UNITS</span>
+              <strong>${genUnitsUsed} / ${genUnitsLimit} (${genUnitsPct}%)</strong>
+            </div>
+            <div class="meter-track">
+              <div class="meter-fill ${genUnitsClass}" style="width: ${genUnitsPct}%;"></div>
+            </div>
+            <div style="font-size: 11px; color: var(--text-muted);">Metadata checks & videos.list (10,000 daily budget)</div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Discovery Diagnostics (if available) -->
+      ${discoveryHtml}
+
+      <!-- Historical Failure Log (if any) -->
       ${failuresRes.length > 0 ? `
-      <div style="background: var(--bg-card); border: 1px solid var(--danger); border-radius: var(--radius-md); padding: 24px; margin-bottom: 24px;">
-        <h3 style="font-size: 18px; margin-bottom: 12px; color: var(--danger);">Recent Failures (${failuresRes.length})</h3>
+      <div style="background: var(--bg-card); border: 1px solid rgba(244, 33, 46, 0.3); border-radius: var(--radius-md); padding: 24px; margin-bottom: 24px;">
+        <h3 style="font-size: 16px; margin-bottom: 12px; color: var(--danger);">Historical Candidate Render Failures (${failuresRes.length})</h3>
         <table class="sub-table">
-          <thead><tr><th>Candidate</th><th>Attempts</th><th>Last Reason</th><th>When</th></tr></thead>
+          <thead><tr><th>Candidate Key</th><th>Attempts</th><th>Last Reason</th><th>When</th></tr></thead>
           <tbody>
-            ${failuresRes.slice(0, 10).map(f => `
+            ${failuresRes.slice(0, 5).map(f => `
               <tr>
                 <td style="font-family: monospace; font-size: 12px;">${escapeHtml(f.key)}</td>
                 <td>${f.attempts}</td>
                 <td>${escapeHtml(f.last_reason)}</td>
-                <td>${f.last_time ? new Date(f.last_time * 1000).toLocaleString() : 'â€”'}</td>
+                <td>${f.last_time ? new Date(f.last_time * 1000).toLocaleString() : '—'}</td>
               </tr>
             `).join('')}
           </tbody>
@@ -309,23 +695,27 @@ async function loadOverview(container) {
       </div>
       ` : ''}
 
+      <!-- Quick Engine Operations -->
       <div class="panel" style="margin-bottom: 24px;">
-        <h3 class="panel-title" style="font-size: 18px;">Active Pipeline Engine</h3>
-      <div style="background: var(--bg-card); border: 1px solid var(--border); border-radius: var(--radius-md); padding: 24px; margin-bottom: 24px;">
-        <h3 style="font-size: 18px; margin-bottom: 12px;">Active Pipeline Engine</h3>
-        <p style="color: var(--text-muted); font-size: 14px; margin-bottom: 20px;">
-          KenauShorts runs locally in the background on your PC. It monitors configured subreddits & YouTube channels, performs AI editorial selection, and composites 1080x1920 shorts automatically.
+        <h3 class="panel-title" style="font-size: 16px; margin-bottom: 8px;">Pipeline Quick Actions</h3>
+        <p style="color: var(--text-muted); font-size: 13px; margin-bottom: 16px;">
+          Trigger automation, inspect discovered media, or manually stage a clip by pasting a YouTube URL.
         </p>
-        <div style="display: flex; gap: 12px;">
+        <div style="display: flex; gap: 10px; flex-wrap: wrap;">
           <button class="btn btn-secondary" onclick="document.querySelector('[data-page=library]').click()">Browse Drafts (${ready})</button>
-          <button class="btn btn-secondary" onclick="document.querySelector('[data-page=sources]').click()">Manage Sources</button>         
+          <button class="btn btn-secondary" onclick="document.querySelector('[data-page=sources]').click()">Manage Sources</button>
           <button class="btn btn-secondary" onclick="document.querySelector('[data-page=logs]').click()">View Terminal</button>
           <button class="btn btn-secondary" onclick="openManualUrlModal()">+ Add Video by Link</button>
         </div>
       </div>
     `;
+
+    // Start live countdown timer
+    if (autoEnabled && auto.next_run) {
+      startOverviewCountdown(auto.next_run);
+    }
   } catch (e) {
-    container.innerHTML = `<p style="color: var(--danger)">Failed to load overview: ${e.message}</p>`;
+    container.innerHTML = `<p style="color: var(--danger)">Failed to load overview: ${escapeHtml(e.message)}</p>`;
   }
 }
 

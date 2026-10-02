@@ -397,7 +397,8 @@ def _video_id(url: str) -> str:
     return m.group(1) if m else ""
 
 def discover_youtube(queries: list[str], api_key: str, per_query: int = 8,
-                     days_back: int = 0, cc_only: bool = True) -> list[Candidate]:
+                     days_back: int = 0, cc_only: bool = True,
+                     stats: dict[str, Any] | None = None) -> list[Candidate]:
     """
     YouTube Data API search — a clip source driven by topic rather than channel.
 
@@ -409,10 +410,53 @@ def discover_youtube(queries: list[str], api_key: str, per_query: int = 8,
         if queries and not api_key:
             LOG.warning("discovery.youtube_queries is set but YOUTUBE_API_KEY is not — "
                         "skipping the search-based clip source entirely")
+            if stats is not None:
+                stats.setdefault("sources", {})["youtube_search"] = {
+                    "attempted": 0, "configured": len(queries), "candidates": 0,
+                    "failures": 0, "skipped_no_key": len(queries),
+                }
         return []
+
+    # Local pre-flight quota guard: enforce 100 search calls/day limit
+    try:
+        tracker = store.get_local_quota_tracker()
+        search_limit = int(tracker.get("search_list_limit", 100))
+        search_used = int(tracker.get("search_list_count", 0))
+    except Exception:
+        search_limit = 100
+        search_used = 0
+
+    if search_used >= search_limit:
+        LOG.warning("YouTube search quota limit reached (%d/%d) — skipping search-based clip source.", search_used, search_limit)
+        emit_progress("YouTube search quota limit reached — skipping search")
+        if stats is not None:
+            stats["search_quota_blocked"] = True
+            stats.setdefault("sources", {})["youtube_search"] = {
+                "attempted": 0, "configured": len(queries), "candidates": 0,
+                "failures": 0, "skipped_quota": len(queries),
+            }
+        return []
+
     out: list[Candidate] = []
+    yt_stats = {
+        "attempted": 0, "configured": len(queries), "candidates": 0,
+        "failures": 0, "skipped_quota": 0,
+    }
 
     for q in queries:
+        # Check quota remaining before each query
+        try:
+            curr_tracker = store.get_local_quota_tracker()
+            if curr_tracker.get("search_list_count", 0) >= search_limit:
+                LOG.warning("YouTube search quota limit reached (%d/%d) while evaluating %r — stopping search.",
+                            curr_tracker.get("search_list_count", 0), search_limit, q)
+                if stats is not None:
+                    stats["search_quota_blocked"] = True
+                yt_stats["skipped_quota"] += 1
+                break
+        except Exception:
+            pass
+
         params: dict[str, Any] = {
             "part": "snippet", "q": q, "type": "video", "order": "viewCount",
             "maxResults": per_query,
@@ -429,12 +473,28 @@ def discover_youtube(queries: list[str], api_key: str, per_query: int = 8,
             params["publishedAfter"] = (
                 dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=days_back)
             ).strftime("%Y-%m-%dT%H:%M:%SZ")
+
         try:
             resp = requests.get("https://www.googleapis.com/youtube/v3/search", params=params, timeout=15)
+            # Record local quota activity at request boundary
+            try:
+                store.record_local_quota_activity("search_list", 1)
+            except Exception as q_err:
+                LOG.warning("Failed to record local search quota: %s", q_err)
+            yt_stats["attempted"] += 1
+
+            if resp.status_code == 403 and "quotaExceeded" in resp.text:
+                LOG.warning("YouTube Data API reported quotaExceeded for query %r", q)
+                if stats is not None:
+                    stats["search_quota_blocked"] = True
+                yt_stats["failures"] += 1
+                break
+
             resp.raise_for_status()
             data = resp.json()
         except Exception as e:
             LOG.warning("youtube search %r failed: %s", q, e)
+            yt_stats["failures"] += 1
             continue
 
         before = len(out)
@@ -460,11 +520,18 @@ def discover_youtube(queries: list[str], api_key: str, per_query: int = 8,
                 text=sn.get("description", "")[:400],
                 published_at=pub_ts,
             ))
-        LOG.info("youtube search %r -> %d clip(s)%s", q, len(out) - before,
+        new_count = len(out) - before
+        yt_stats["candidates"] += new_count
+        LOG.info("youtube search %r -> %d clip(s)%s", q, new_count,
                  " [CC only]" if cc_only else "")
+
+    if stats is not None:
+        stats.setdefault("sources", {})["youtube_search"] = yt_stats
+
     return out
 
-def verify_youtube_licenses(cands: list[Candidate], api_key: str, max_seconds: int = 0) -> list[Candidate]:
+def verify_youtube_licenses(cands: list[Candidate], api_key: str, max_seconds: int = 0,
+                            stats: dict[str, Any] | None = None) -> list[Candidate]:
     """
     Keep only YouTube clips we are actually allowed to repost.
 
@@ -493,6 +560,9 @@ def verify_youtube_licenses(cands: list[Candidate], api_key: str, max_seconds: i
             "clip(s) from channels marked public-domain/cc in config are "
             "usable (%d dropped). Set YOUTUBE_API_KEY to open this up.",
             len(trusted), len(yt) - len(trusted))
+        if stats is not None:
+            rej = stats.setdefault("rejected_by_reason", {})
+            rej["no_youtube_api_key"] = rej.get("no_youtube_api_key", 0) + (len(yt) - len(trusted))
         return other + trusted
 
     by_id = {_video_id(c.url): c for c in yt}
@@ -508,6 +578,11 @@ def verify_youtube_licenses(cands: list[Candidate], api_key: str, max_seconds: i
         }
         try:
             resp = requests.get("https://www.googleapis.com/youtube/v3/videos", params=params, timeout=15)
+            # Record general quota unit for videos.list
+            try:
+                store.record_local_quota_activity("general", 1)
+            except Exception as q_err:
+                LOG.warning("Failed to record general quota unit: %s", q_err)
             resp.raise_for_status()
             data = resp.json()
         except Exception as e:
@@ -561,6 +636,12 @@ def verify_youtube_licenses(cands: list[Candidate], api_key: str, max_seconds: i
                  ", ".join(f"{n}x {w}" for w, n in sorted(reasons.items(), key=lambda kv: -kv[1])))
     LOG.info("licence check kept %d of %d clip(s) (cost: %d quota unit(s))",
              len(kept), len(yt), (len(ids) + 49) // 50)
+
+    if stats is not None:
+        rej = stats.setdefault("rejected_by_reason", {})
+        for w, n in reasons.items():
+            rej[w] = rej.get(w, 0) + n
+
     return other + kept
 
 def _iso8601_seconds(dur: str) -> int:
@@ -570,35 +651,108 @@ def _iso8601_seconds(dur: str) -> int:
     h, mi, s = (int(x or 0) for x in m.groups())
     return h * 3600 + mi * 60 + s
 
-def discover_all_candidates(config: dict[str, Any], state: State) -> list[Candidate]:
+def generate_idle_explanation(stats: dict[str, Any]) -> str:
+    """Generate an evidence-based explanation for why discovery produced zero candidates."""
+    if not stats:
+        return "No new candidates to process"
+
+    quota_blocked = bool(stats.get("search_quota_blocked", False))
+    total_raw = int(stats.get("total_discovered_raw", 0))
+    unique = int(stats.get("unique_candidates", 0))
+    rejections = dict(stats.get("rejected_by_reason", {}))
+    seen = int(rejections.get("already_seen", 0))
+
+    if quota_blocked and total_raw == 0:
+        return "YouTube search quota limit reached; 0 candidates from other sources"
+
+    if total_raw == 0:
+        return "No candidates returned by configured discovery queries or channels"
+
+    if unique > 0 and seen == unique:
+        return f"{unique} candidates discovered; all were previously seen"
+
+    # Non-seen filter rejections
+    non_seen = {k: v for k, v in rejections.items() if k != "already_seen" and v > 0}
+    if non_seen:
+        breakdown = ", ".join(f"{v}x {k}" for k, v in sorted(non_seen.items(), key=lambda kv: -kv[1]))
+        if seen > 0:
+            breakdown += f", {seen}x already seen"
+        return f"{unique} unique candidates evaluated; all rejected ({breakdown})"
+
+    if quota_blocked:
+        return "YouTube search quota limit reached; other evaluated sources yielded no fresh candidates"
+
+    return "No new candidates to process"
+
+def discover_all_candidates(config: dict[str, Any], state: State, stats: dict[str, Any] | None = None) -> list[Candidate]:
     discovery = config.get("discovery", {})
     channels = discovery.get("youtube_channels", [])
     subreddits = discovery.get("subreddits", [])
     youtube_api_key = os.environ.get("YOUTUBE_API_KEY", "")
 
+    if stats is not None:
+        stats.setdefault("started_at", time.time())
+        stats.setdefault("sources", {})
+        stats.setdefault("rejected_by_reason", {})
+
     emit_progress("Discovering content")
     yt_candidates = discover_youtube_rss(channels, per_channel=int(discovery.get("per_channel", 6)))
     reddit_candidates = discover_reddit(subreddits)
+
+    if stats is not None:
+        stats["sources"]["youtube_channels"] = {"configured": len(channels), "candidates": len(yt_candidates)}
+        stats["sources"]["reddit"] = {"configured": len(subreddits), "candidates": len(reddit_candidates)}
 
     # Text/story-only sources (RSS, Wikimedia, Wikipedia search) are disabled —
     # this pipeline should only ever produce video candidates.
     yt_search_candidates = discover_youtube(
         discovery.get("youtube_queries", []), youtube_api_key,
         cc_only=bool(discovery.get("youtube_cc_only", True)),
+        stats=stats,
     )
     rss_candidates = []
     wikimedia_candidates = []
     wikipedia_candidates = []
+
+    raw_total = len(yt_candidates) + len(reddit_candidates) + len(yt_search_candidates)
+    if stats is not None:
+        stats["total_discovered_raw"] = raw_total
 
     # Only YouTube clips need a licence check — Reddit's own over_18/score
     # gate is separate, and the other sources are licensed at discovery time.
     max_clip_seconds = int(config.get("posting", {}).get("max_clip_seconds", 35))
     verified_yt = verify_youtube_licenses(
         yt_candidates + yt_search_candidates, youtube_api_key, max_seconds=max_clip_seconds,
+        stats=stats,
     )
 
     all_c = verified_yt + reddit_candidates + rss_candidates + wikimedia_candidates + wikipedia_candidates
-    fresh = [c for c in all_c if not state.is_seen(c.key)]
+
+    # Deduplicate within current run
+    unique_by_key: dict[str, Candidate] = {}
+    dupes_within_run = 0
+    for c in all_c:
+        if c.key in unique_by_key:
+            dupes_within_run += 1
+        else:
+            unique_by_key[c.key] = c
+
+    # Filter against seen history
+    fresh: list[Candidate] = []
+    seen_count = 0
+    for c in unique_by_key.values():
+        if state.is_seen(c.key):
+            seen_count += 1
+        else:
+            fresh.append(c)
+
+    if stats is not None:
+        stats["unique_candidates"] = len(unique_by_key)
+        stats["duplicates_within_run"] = dupes_within_run
+        stats.setdefault("rejected_by_reason", {})["already_seen"] = seen_count
+        stats["eligible_candidates"] = len(fresh)
+        stats["finished_at"] = time.time()
+
     LOG.info("Found %d fresh candidates out of %d total", len(fresh), len(all_c))
     return fresh
 
@@ -1294,10 +1448,20 @@ def run_pipeline(config_path: Path, dry_run: bool = False) -> None:
         config = json.loads(config_path.read_text(encoding="utf-8"))
         state = State(ROOT / "state.json")
 
-        candidates = discover_all_candidates(config, state)
+        discovery_stats: dict[str, Any] = {
+            "run_id": f"run_{int(time.time())}",
+            "started_at": time.time(),
+        }
+
+        candidates = discover_all_candidates(config, state, stats=discovery_stats)
         if not candidates:
-            LOG.info("No candidates found.")
-            emit_summary({"status": "idle", "message": "No new candidates"})
+            idle_msg = generate_idle_explanation(discovery_stats)
+            LOG.info("Discovery idle: %s", idle_msg)
+            emit_summary({
+                "status": "idle",
+                "message": idle_msg,
+                "discovery_stats": discovery_stats,
+            })
             return
 
         max_candidates = int(config.get("editorial", {}).get("max_candidates", 3))
@@ -1305,9 +1469,15 @@ def run_pipeline(config_path: Path, dry_run: bool = False) -> None:
         # what was posted most recently over older history.
         recent_posted = [p.get("headline", p.get("title", "")) for p in reversed(state.posted[-20:])]
         picks = pick_stories(candidates, config, n=max_candidates, recent_posted=recent_posted)
+        discovery_stats["picks_count"] = len(picks) if picks else 0
         if not picks:
             LOG.warning("Editorial could not make a pick.")
-            emit_summary({"status": "failed", "message": "No pick generated"})
+            discovery_stats["outcome"] = "no_picks"
+            emit_summary({
+                "status": "failed",
+                "message": "No pick generated",
+                "discovery_stats": discovery_stats,
+            })
             return
 
         work_dir = ROOT / "work"
@@ -1338,7 +1508,12 @@ def run_pipeline(config_path: Path, dry_run: bool = False) -> None:
             state.mark_failed(candidate_pick.candidate.key, "Download or render failed")
 
         if pick is None or final_mp4 is None:
-            emit_summary({"status": "failed", "message": "All picks failed to download or render"})
+            discovery_stats["outcome"] = "all_picks_failed"
+            emit_summary({
+                "status": "failed",
+                "message": "All picks failed to download or render",
+                "discovery_stats": discovery_stats,
+            })
             return
 
         poster_png = out_dir / f"{stem}.png"
@@ -1384,6 +1559,10 @@ def run_pipeline(config_path: Path, dry_run: bool = False) -> None:
             "at": time.time(),
         })
 
+        discovery_stats["outcome"] = "completed"
+        discovery_stats["selected_candidate"] = pick.candidate.key
+        discovery_stats["final_yield"] = 1
+
         emit_summary({
             "status": "completed",
             "video": str(final_mp4),
@@ -1391,6 +1570,7 @@ def run_pipeline(config_path: Path, dry_run: bool = False) -> None:
             "title": pick.title,
             "youtube_id": video_id,
             "dry_run": dry_run,
+            "discovery_stats": discovery_stats,
         })
 
 if __name__ == "__main__":

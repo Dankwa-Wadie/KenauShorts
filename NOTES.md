@@ -12,7 +12,31 @@ what's actually on `origin/main`.
 
 ## Current state (update this section each handoff)
 
-- **Stage 7 Phase 1 Corrective Fix Completed (State Sync Recovery & Connectivity Unblocking)**:
+- **Stage 7 Phase 3 Completed (Command Center, Quota Governance & Discovery Diagnostics)**:
+  - **Operational Telemetry & Quota Governance**:
+    - Thread-safe local tracking of daily YouTube API quota (`search_list_count`, `videos_insert_count`, `general_units`) in `studio-quota.json` protected by `_QUOTA_LOCK`.
+    - Timezone-aware midnight Pacific Time (PT) daily reset (`get_pacific_now`, `get_pacific_date`, `get_pacific_reset_info`) with robust US Daylight Saving Time (DST) fallback on Windows without requiring optional tzdata packages.
+    - Pre-flight quota guard capping YouTube search at 100 calls/day (`search_list_limit`); gracefully skips searches when exhausted while allowing non-search discovery sources (channels, Reddit) to continue producing candidates.
+    - Non-blocking, sanitized OAuth health diagnostics (`get_oauth_status_details()`) reporting channel metadata and status without exposing sensitive tokens or client credentials.
+  - **Discovery Diagnostics & Run Telemetry**:
+    - Structured per-run telemetry (`discovery_stats`) tracking configured queries, channels, subreddits, attempted vs skipped searches, raw discovered candidates, cross-source duplicates, unique candidates, seen filtering, and specific rejection breakdown (`rejected_by_reason`).
+    - Evidence-based idle diagnostic explanations (`generate_idle_explanation()`) emitted in `KENAU_SUMMARY` providing clear operator explanations for zero-candidate runs.
+  - **Executive Operational Command Center (Overview UI)**:
+    - Cleaned duplicate HTML markup, panel headers, and disk space cards.
+    - Added high-visibility OAuth alert banners when credentials need attention.
+    - Operational KPI cards (Ready, Uploaded, In Queue, Total Videos) with dynamic layout.
+    - Automation Schedule widget with dynamic local real-time countdown timer (`startOverviewCountdown`, `clearOverviewCountdown`).
+    - System Storage Health indicator with color-coded safety thresholds (<512 MB critical, <1 GB low, healthy).
+    - Visual Daily Quota Meters for search queries (100 cap), video uploads, and general units with midnight PT reset timer.
+    - Actionable Incident Remediation cards with 1-click buttons: Reconcile / Confirm / Fail for `upload_unknown` and `upload_unresolved`, and Retry Render for `render_failed`.
+    - Latest Discovery Diagnostics card displaying source yield and rejection breakdowns.
+  - **Test Suite**:
+    - `tests/test_stage7_phase3.py`: 18/18 passed (1.0s).
+    - `tests/test_stage7_phase2.py`: 20/20 passed (9.0s).
+    - `tests/test_stage7_phase1.py`: 18/18 passed (1.8s).
+    - `tests/test_stage6_publishing.py`: 38/38 passed (6.3s).
+    - Full discovery suite: 229 tests total (222 passed, 0 failures, 7 known environment limitations: 6 NVENC, 1 macOS).
+- **Stage 7 Phase 2 Completed (Worker Lifecycle, Watchdogs & Automation Reliability)**:
   - **Recoverable SQLite & `state.json` Synchronization (Fix 1)**:
     - In `studio/server.py`, `reconcile_video_upload()` detects if the SQLite video record already has `status == "uploaded"`. When already uploaded, it bypasses outbound HTTP requests (no duplicate uploads or spurious session queries) and immediately invokes `_sync_candidate_posted(video, yt_id)` to ensure candidate state in `state.json` is synchronized with `state.posted` and `state.seen`.
     - Preserves existing `youtube_id` and rejects conflicting IDs with `ConflictError` (HTTP 409).
@@ -592,4 +616,104 @@ Stage 2 meets all single-instance operational requirements: process tracking, pr
 - **Full Discovery Suite** (`python -X utf8 -m unittest discover tests`):
   - 211 tests total: 204 passed, 0 failures, 7 known environment-specific errors (6 NVENC on non-CUDA Windows host, 1 macOS `os.getuid()` test on Windows).
 
+---
 
+## Stage 7 Phase 3: Executive Operational Command Center, Quota Governance & Discovery Diagnostics
+
+### Implementation Date
+2026-10-02
+
+### Baseline Commit
+`d28c4ce` (`fix(stage7): recover video state on subprocess timeout`)
+
+### Addressed Areas & Architectural Enhancements
+
+1. **Operational Telemetry & YouTube Quota Governance**:
+   - **Thread-Safe Local Activity Tracking**:
+     - `studio/store.py` introduces `_QUOTA_LOCK = threading.Lock()` guarding reads and writes to `studio-quota.json`.
+     - Preserves all existing keys (`videos_insert_count`, `search_list_count`, `general_units`, `videos_insert_limit`, `search_list_limit`, `general_units_limit`, `date_pt`, `disclaimer`).
+     - Adds `search_limit_reached` boolean flag (`search_list_count >= search_list_limit`).
+   - **Timezone-Aware Pacific Time Midnight Reset**:
+     - YouTube Data API resets daily quotas at midnight US Pacific Time (PT).
+     - Implemented `get_pacific_now(now_utc)`: attempts standard library `zoneinfo.ZoneInfo("America/Los_Angeles")`, falling back gracefully to exact US Daylight Saving Time calculation (PDT UTC-7 from 2nd Sunday in March to 1st Sunday in November, PST UTC-8 otherwise) without requiring external packages on Windows.
+     - Implemented `get_pacific_date(now_utc)` and `get_pacific_reset_info(now_utc)` returning next midnight PT epoch timestamp (`reset_at`), ISO string (`reset_at_iso`), and exact seconds remaining (`seconds_remaining`).
+     - On date roll-over in Pacific Time, counters automatically reset to zero for the new day.
+   - **Discovery Pre-Flight Quota Guard**:
+     - In `core/agent.py`'s `discover_youtube()`: inspects `search_list_count` against `search_list_limit` (100) before issuing outbound requests. If limit reached, skips search queries gracefully without crashing or stopping the pipeline.
+     - Re-evaluates quota remaining before each individual query.
+     - Records quota usage at the request boundary (`store.record_local_quota_activity("search_list", 1)`).
+     - Handles HTTP 403 `quotaExceeded` by immediately setting search limit reached and recording diagnostic stats.
+     - Non-search discovery sources (`discover_youtube_rss`, `discover_reddit`) continue normal operation even when search quota is exhausted, ensuring the pipeline remains productive.
+   - **License Check Quota Tracking**:
+     - In `core/agent.py`'s `verify_youtube_licenses()`: records `general` quota units at batch boundaries (1 unit per 50 video IDs) and tallies rejection reasons (`not public`, `all rights reserved`, `longer than Xs`, etc.).
+   - **Proactive OAuth Health Reporting**:
+     - `studio/server.py` implements `get_oauth_status_details()` returning non-blocking structured health status (`status`, `healthy`, `needs_attention`, `message`, `channel_title`, `channel_id`, `channel_custom_url`).
+     - Strictly sanitized: never leaks access tokens, refresh tokens, client IDs, or client secrets.
+     - Handled missing token/secret configurations gracefully with operator guidance.
+
+2. **Discovery Diagnostics & Run Telemetry**:
+   - **Structured Discovery Telemetry**:
+     - `core/agent.py` passes `stats` dictionary through `discover_all_candidates`, `discover_youtube`, `verify_youtube_licenses`, and editorial curation.
+     - Tracks configured queries, channels, and subreddits; attempted searches vs skipped searches; raw discovered candidates per source; cross-source duplicates (`duplicates_within_run`); unique candidates; seen candidate filtering (`already_seen`); and eligible candidate yield (`eligible_candidates`).
+   - **Evidence-Based Idle Explanations**:
+     - Implemented `generate_idle_explanation(stats)` in `core/agent.py` providing specific, actionable explanations when discovery produces zero candidates:
+       - Search quota limit reached with zero candidates from other sources.
+       - Configured sources returned zero items.
+       - All discovered candidates were previously processed.
+       - Discovered candidates were rejected by licensing or duration filters (with specific breakdown).
+   - **Summary Telemetry Emission**:
+     - `core/agent.py` emits `discovery_stats` in structured `KENAU_SUMMARY` on `completed`, `idle`, and `failed` pipeline outcomes.
+
+3. **Executive Operational Command Center (Studio Overview UI)**:
+   - **Markup & Layout Cleanup**:
+     - In `studio/web/app.js` and `studio/web/style.css`, eliminated duplicate card markup, redundant panel headers, and repeated Free Disk Space cards.
+     - Structured layout using clean CSS Grid (`.command-grid`).
+   - **High-Visibility OAuth Alert Banners**:
+     - Prominent banner rendered at top of Overview whenever OAuth status requires attention (`not_configured`, `configured`, `expired`, `invalid`, `error`) with direct navigation link to Connections tab.
+   - **Operational KPI Cards**:
+     - Metric cards for Ready videos, Uploaded videos, In Queue count, and Total Library videos.
+   - **Live Automation Schedule & Countdown Timer**:
+     - Displays automation mode (FIFO publishing vs preview drafts), next run timestamp, and dynamic real-time JavaScript countdown timer (`startOverviewCountdown`, `clearOverviewCountdown`) with proper page lifecycle teardown.
+   - **System Storage Health Meter**:
+     - Explicit color-coded storage safety thresholds: Critical (<512 MB, danger), Low Space (<1 GB, warning), and Healthy (>1 GB, success) with visual capacity badge.
+   - **Visual Daily Quota Meters**:
+     - Clean progress meters (`.meter-track`, `.meter-fill`) for YouTube Search (100 daily query cap), Video Uploads (100 cap), and General API Units (10,000 cap), along with dynamic countdown to Pacific Time midnight reset.
+   - **Actionable Incident Remediation Cards**:
+     - Automatically surfaces videos in abnormal states (`upload_unknown`, `upload_unresolved`, `render_failed`).
+     - Provides safe 1-click remediation workflows directly in Overview:
+       - `upload_unknown`: ⚡ Reconcile Upload (queries Google Resumable Upload protocol), ✓ Confirm, ✕ Fail.
+       - `upload_unresolved`: ✓ Confirm Uploaded (prompts for YouTube Video ID), ✕ Mark Failed.
+       - `render_failed`: ↺ Retry Render (re-enqueues render job immediately without server restart).
+     - State transitions reuse existing backend endpoints (`POST /api/video/reconcile`, `POST /api/video/resolve`, `POST /api/job`) ensuring full validation, duplicate publication protection, and process tracking.
+   - **Latest Discovery Diagnostics Card**:
+     - Summarizes the most recent discovery run outcome, candidates yielded per source, duplicate counts, and rejected candidates with specific category tags (`.diag-tag`).
+
+### Test Evidence
+- **Stage 7 Phase 3 Suite** (`tests/test_stage7_phase3.py`): 18/18 passed (1.0s).
+  - Quota Pacific time calculation and DST transitions (PST vs PDT).
+  - Pacific reset timestamp, ISO string, and seconds remaining.
+  - Quota tracker initialization and thread-safe concurrent recording.
+  - Quota tracker midnight reset on Pacific day rollover.
+  - Search limit reached flag enforcement.
+  - Discovery pre-flight guard skips search when quota exhausted.
+  - Request-boundary quota tracking per query.
+  - 403 quotaExceeded handling and limit enforcement.
+  - Non-search sources continue when search quota exhausted.
+  - Cross-source candidate deduplication and seen tracking.
+  - Evidence-based idle diagnostic explanation generation.
+  - Non-blocking sanitized OAuth health check without secret leakage.
+  - Extended `/api/status` payload verification (incidents, quota, oauth_health, latest_discovery).
+  - Incident remediation resolve endpoint (`POST /api/video/resolve`).
+  - Incident remediation reconcile endpoint (`POST /api/video/reconcile`).
+  - License check general units tracking and rejection categorization.
+  - Pipeline summary emission of `discovery_stats`.
+  - UI assets structure and CSS classes contract verification.
+- **Stage 7 Phase 1 & 2 Regressions**:
+  - `tests/test_stage7_phase1.py`: 18/18 passed (1.8s).
+  - `tests/test_stage7_phase2.py`: 20/20 passed (9.0s).
+  - `tests/test_stage6_publishing.py`: 38/38 passed (6.3s).
+- **Full Discovery Suite** (`python -X utf8 -m unittest discover tests`):
+  - 229 tests total: 222 passed, 0 failures, 7 known environment-specific errors (6 NVENC on non-CUDA Windows host, 1 macOS `os.getuid()` test on Windows).
+- **Compilation & Formatting Checks**:
+  - `python -m compileall core studio scripts tests`: 0 errors.
+  - `git diff --check`: 0 warnings/errors.

@@ -948,6 +948,28 @@ def check_oauth_health() -> str:
             return "expired"
         return "error"
 
+def get_oauth_status_details() -> dict[str, Any]:
+    """Return sanitized, structured OAuth health dictionary with human-readable guidance."""
+    st = check_oauth_health()
+    channel_data = read_json(ROOT / "studio-channel.json", {})
+    messages = {
+        "healthy": "Connected & Authorized for YouTube uploads.",
+        "configured": "client_secret.json detected. Connect YouTube channel in Connections to authorize.",
+        "not_configured": "YouTube OAuth not configured. Place client_secret.json in project root.",
+        "expired": "OAuth token is expired and cannot be refreshed. Re-authorize in Connections.",
+        "invalid": "OAuth token revoked or invalid. Reconnect channel in Connections.",
+        "error": "OAuth credentials could not be loaded. Check Connections tab.",
+    }
+    return {
+        "status": st,
+        "healthy": st == "healthy",
+        "needs_attention": st in ("not_configured", "configured", "expired", "invalid", "error"),
+        "message": messages.get(st, "Unknown OAuth status"),
+        "channel_title": channel_data.get("channel_title", ""),
+        "channel_id": channel_data.get("channel_id", ""),
+        "channel_custom_url": channel_data.get("channel_custom_url", ""),
+    }
+
 def test_youtube_connection() -> dict[str, Any]:
     """Perform live test of YouTube OAuth credentials and fetch channel identity."""
     token_file = ROOT / "token.json"
@@ -1735,11 +1757,31 @@ class StudioHandler(BaseHTTPRequestHandler):
         # API Routes
         if path == "/api/status":
             online = is_online()
+            oauth_status = check_oauth_health()
+            oauth_health = get_oauth_status_details()
+            quota_tracker = store.get_local_quota_tracker()
+
             with GUARD:
                 cfg = get_automation_settings()
                 records = store.records("jobs")
                 pending = [j for j in records if j.get("status") == "pending"]
                 pending.sort(key=lambda j: j.get("created_at", ""))
+
+                # Extract discovery stats from the most recent run/preview job
+                latest_discovery = {}
+                for j in records:
+                    if j.get("action") in ("run", "preview") and j.get("summary", {}).get("discovery_stats"):
+                        latest_discovery = j["summary"]["discovery_stats"]
+                        break
+
+                # Surface videos requiring operator attention (incidents)
+                incident_videos = []
+                for v in store.records("videos"):
+                    if v.get("status") in ("upload_unknown", "upload_unresolved", "render_failed"):
+                        incident_videos.append(store.enrich_video_record(v))
+                        if len(incident_videos) >= 10:
+                            break
+
                 payload = {
                     "csrf": CSRF,
                     "online": online,
@@ -1750,6 +1792,11 @@ class StudioHandler(BaseHTTPRequestHandler):
                     "platform": platform.system(),
                     "queue_count": len(pending),
                     "queued_jobs": [j["id"] for j in pending],
+                    "oauth_status": oauth_status,
+                    "oauth_health": oauth_health,
+                    "quota_tracker": quota_tracker,
+                    "incidents": incident_videos,
+                    "latest_discovery": latest_discovery,
                 }
             self.send_json(payload)
             return
@@ -1890,6 +1937,7 @@ class StudioHandler(BaseHTTPRequestHandler):
                 "youtube_oauth_ready": token_file.exists(),
                 "youtube_client_secret_present": client_secret_file.exists(),
                 "oauth_status": check_oauth_health(),
+                "oauth_health": get_oauth_status_details(),
                 "channel_id": channel_data.get("channel_id", ""),
                 "channel_title": channel_data.get("channel_title", ""),
                 "channel_custom_url": channel_data.get("channel_custom_url", ""),

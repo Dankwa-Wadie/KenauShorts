@@ -10,11 +10,13 @@ import json
 import os
 import sqlite3
 import sys
+import threading
 from pathlib import Path
 from typing import Any
 
 ROOT = Path(__file__).resolve().parent.parent
 DB = ROOT / "studio.sqlite3"
+_QUOTA_LOCK = threading.Lock()
 
 def now() -> str:
     return dt.datetime.now(dt.timezone.utc).isoformat()
@@ -286,60 +288,131 @@ def import_legacy() -> None:
         })
 
 
-def get_pacific_date() -> str:
+def get_pacific_now(now_utc: dt.datetime | None = None) -> dt.datetime:
+    """
+    Return current datetime in US Pacific Time (America/Los_Angeles).
+    Attempts standard zoneinfo first, falling back to an exact US daylight
+    saving time calculation if tzdata is not installed on Windows.
+    """
+    if now_utc is None:
+        now_utc = dt.datetime.now(dt.timezone.utc)
+    elif now_utc.tzinfo is None:
+        now_utc = now_utc.replace(tzinfo=dt.timezone.utc)
+
+    try:
+        import zoneinfo
+        tz = zoneinfo.ZoneInfo("America/Los_Angeles")
+        return now_utc.astimezone(tz)
+    except Exception:
+        # Exact US Daylight Saving Time calculation fallback (2nd Sun March to 1st Sun Nov)
+        year = now_utc.year
+        mar1_w = dt.date(year, 3, 1).weekday()
+        dst_start_day = 1 + ((6 - mar1_w) % 7) + 7
+        dst_start = dt.datetime(year, 3, dst_start_day, 10, 0, tzinfo=dt.timezone.utc)
+
+        nov1_w = dt.date(year, 11, 1).weekday()
+        dst_end_day = 1 + ((6 - nov1_w) % 7)
+        dst_end = dt.datetime(year, 11, dst_end_day, 9, 0, tzinfo=dt.timezone.utc)
+
+        is_dst = dst_start <= now_utc < dst_end
+        offset_hours = -7 if is_dst else -8
+        pt_tz = dt.timezone(dt.timedelta(hours=offset_hours), name="PDT" if is_dst else "PST")
+        return now_utc.astimezone(pt_tz)
+
+
+def get_pacific_date(now_utc: dt.datetime | None = None) -> str:
     """Return today's date string (YYYY-MM-DD) in US Pacific Time (midnight reset boundary for YouTube quota)."""
-    now_utc = dt.datetime.now(dt.timezone.utc)
-    year = now_utc.year
-    mar1_weekday = dt.date(year, 3, 1).weekday()
-    dst_start_day = 1 + ((6 - mar1_weekday) % 7) + 7
-    dst_start = dt.datetime(year, 3, dst_start_day, 10, 0, tzinfo=dt.timezone.utc)
-    nov1_weekday = dt.date(year, 11, 1).weekday()
-    dst_end_day = 1 + ((6 - nov1_weekday) % 7)
-    dst_end = dt.datetime(year, 11, dst_end_day, 9, 0, tzinfo=dt.timezone.utc)
-    offset_hours = -7 if (dst_start <= now_utc < dst_end) else -8
-    pt_time = now_utc + dt.timedelta(hours=offset_hours)
-    return pt_time.strftime("%Y-%m-%d")
+    return get_pacific_now(now_utc).strftime("%Y-%m-%d")
 
 
-def get_local_quota_tracker() -> dict[str, Any]:
+def get_pacific_reset_info(now_utc: dt.datetime | None = None) -> dict[str, Any]:
+    """Return next midnight Pacific Time reset timestamp, ISO string, and seconds remaining."""
+    pt_now = get_pacific_now(now_utc)
+    next_midnight_pt = (pt_now + dt.timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
+    reset_ts = next_midnight_pt.timestamp()
+    current_utc = now_utc if now_utc is not None else dt.datetime.now(dt.timezone.utc)
+    if current_utc.tzinfo is None:
+        current_utc = current_utc.replace(tzinfo=dt.timezone.utc)
+    now_ts = current_utc.timestamp()
+    return {
+        "reset_at": round(reset_ts, 1),
+        "reset_at_iso": next_midnight_pt.isoformat(),
+        "seconds_remaining": max(0.0, round(reset_ts - now_ts, 1)),
+        "timezone": "America/Los_Angeles",
+        "is_dst": pt_now.tzname() == "PDT" or pt_now.utcoffset() == dt.timedelta(hours=-7),
+    }
+
+
+def get_local_quota_tracker(now_utc: dt.datetime | None = None) -> dict[str, Any]:
     """Retrieve local YouTube API quota usage estimate for the current Pacific Time day."""
-    today_pt = get_pacific_date()
+    today_pt = get_pacific_date(now_utc)
+    reset_info = get_pacific_reset_info(now_utc)
     quota_path = ROOT / "studio-quota.json"
     data: dict[str, Any] = {}
-    if quota_path.exists():
-        try:
-            data = json.loads(quota_path.read_text(encoding="utf-8"))
-        except Exception:
-            data = {}
-    if data.get("date_pt") != today_pt:
-        data = {
-            "date_pt": today_pt,
-            "videos_insert_count": 0,
-            "search_list_count": 0,
-            "general_units": 0,
-            "videos_insert_limit": 100,
-            "search_list_limit": 100,
-            "general_units_limit": 10000,
-            "disclaimer": "Local estimate only. Google Developer Console is the authoritative source of truth.",
-        }
+    with _QUOTA_LOCK:
+        if quota_path.exists():
+            try:
+                data = json.loads(quota_path.read_text(encoding="utf-8"))
+            except Exception:
+                data = {}
+        if not isinstance(data, dict) or data.get("date_pt") != today_pt:
+            data = {
+                "date_pt": today_pt,
+                "videos_insert_count": 0,
+                "search_list_count": 0,
+                "general_units": 0,
+                "videos_insert_limit": data.get("videos_insert_limit", 100) if isinstance(data, dict) else 100,
+                "search_list_limit": data.get("search_list_limit", 100) if isinstance(data, dict) else 100,
+                "general_units_limit": data.get("general_units_limit", 10000) if isinstance(data, dict) else 10000,
+                "disclaimer": "Local estimate only. Google Developer Console is the authoritative source of truth.",
+            }
+            try:
+                quota_path.write_text(json.dumps(data, indent=2), encoding="utf-8")
+            except Exception:
+                pass
+
+    tracker = dict(data)
+    tracker.update(reset_info)
+    tracker["search_limit_reached"] = bool(tracker.get("search_list_count", 0) >= tracker.get("search_list_limit", 100))
+    return tracker
+
+
+def record_local_quota_activity(action_type: str, units: int = 1, now_utc: dt.datetime | None = None) -> dict[str, Any]:
+    """Record YouTube API activity in the local daily tracker."""
+    with _QUOTA_LOCK:
+        today_pt = get_pacific_date(now_utc)
+        quota_path = ROOT / "studio-quota.json"
+        data: dict[str, Any] = {}
+        if quota_path.exists():
+            try:
+                data = json.loads(quota_path.read_text(encoding="utf-8"))
+            except Exception:
+                data = {}
+        if not isinstance(data, dict) or data.get("date_pt") != today_pt:
+            data = {
+                "date_pt": today_pt,
+                "videos_insert_count": 0,
+                "search_list_count": 0,
+                "general_units": 0,
+                "videos_insert_limit": 100,
+                "search_list_limit": 100,
+                "general_units_limit": 10000,
+                "disclaimer": "Local estimate only. Google Developer Console is the authoritative source of truth.",
+            }
+
+        if action_type == "videos_insert":
+            data["videos_insert_count"] = max(0, data.get("videos_insert_count", 0) + units)
+        elif action_type == "search_list":
+            data["search_list_count"] = max(0, data.get("search_list_count", 0) + units)
+        elif action_type == "general":
+            data["general_units"] = max(0, data.get("general_units", 0) + units)
+
         try:
             quota_path.write_text(json.dumps(data, indent=2), encoding="utf-8")
         except Exception:
             pass
-    return data
 
-
-def record_local_quota_activity(action_type: str, units: int = 1) -> dict[str, Any]:
-    """Record YouTube API activity in the local daily tracker."""
-    tracker = get_local_quota_tracker()
-    if action_type == "videos_insert":
-        tracker["videos_insert_count"] = tracker.get("videos_insert_count", 0) + units
-    elif action_type == "search_list":
-        tracker["search_list_count"] = tracker.get("search_list_count", 0) + units
-    elif action_type == "general":
-        tracker["general_units"] = tracker.get("general_units", 0) + units
-    try:
-        (ROOT / "studio-quota.json").write_text(json.dumps(tracker, indent=2), encoding="utf-8")
-    except Exception:
-        pass
-    return tracker
+        out = dict(data)
+        out.update(get_pacific_reset_info(now_utc))
+        out["search_limit_reached"] = bool(out.get("search_list_count", 0) >= out.get("search_list_limit", 100))
+        return out
