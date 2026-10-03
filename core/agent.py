@@ -41,6 +41,10 @@ from studio import store
 
 LOG = logging.getLogger("kenaushorts.agent")
 
+class UploadSessionExpiredError(RuntimeError):
+    """Raised when an upload session returns 404/410 indicating it has expired on YouTube's server."""
+    pass
+
 ROOT = Path(__file__).resolve().parent.parent
 
 @dataclass
@@ -1174,7 +1178,7 @@ def _resume_resumable_upload(
 
     # 404/410: Resumable session expired on server
     if resp.status_code in (404, 410):
-        raise RuntimeError(f"Resumable upload session expired (HTTP {resp.status_code}). Manual verification on YouTube Studio required.")
+        raise UploadSessionExpiredError(f"Resumable upload session expired (HTTP {resp.status_code}). Manual verification on YouTube Studio required.")
 
     # 308: Incomplete upload ready for resumption
     if resp.status_code != 308:
@@ -1248,7 +1252,7 @@ def _resume_resumable_upload(
                 emit_progress(f"Uploading ({progress_pct}%)")
 
             elif chunk_resp.status_code in (404, 410):
-                raise RuntimeError(f"Resumable upload session expired during transfer (HTTP {chunk_resp.status_code}).")
+                raise UploadSessionExpiredError(f"Resumable upload session expired during transfer (HTTP {chunk_resp.status_code}).")
 
             else:
                 raise RuntimeError(f"Upload chunk failed with HTTP {chunk_resp.status_code}: {chunk_resp.text[:200]}")
@@ -1269,7 +1273,7 @@ def upload_to_youtube(
     record_quota: bool = True,
 ) -> str | None:
     """Upload completed video to YouTube Shorts with resumable recovery support."""
-    emit_progress("Uploading to YouTube")
+    emit_progress("Preparing YouTube upload")
     if not token_path.exists():
         raise FileNotFoundError("YouTube token.json not found. Authorize YouTube via Studio first.")
 
@@ -1294,10 +1298,13 @@ def upload_to_youtube(
             if not can_proceed:
                 limit = q_tracker.get("videos_insert_limit", 100)
                 used = q_tracker.get("videos_insert_count", 0)
-                raise RuntimeError(f"YouTube upload quota limit reached ({used}/{limit}) — upload postponed.")
+                raise store.QuotaBlockedError(f"YouTube upload quota limit reached ({used}/{limit}) — upload postponed.")
+        except store.QuotaBlockedError:
+            raise
         except Exception as q_err:
             LOG.error("YouTube upload quota verification failed: %s — failing closed.", q_err)
-            raise
+            raise store.QuotaBlockedError(f"YouTube upload quota verification failed: {q_err} — failing closed.") from q_err
+
 
     from googleapiclient.discovery import build
     from googleapiclient.http import MediaFileUpload

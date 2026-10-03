@@ -12,6 +12,7 @@ import uuid
 from pathlib import Path
 
 from core import agent, render, render_story
+from core.agent import UploadSessionExpiredError
 from core.state import State
 from core.style_presets import (
     apply_style_preset,
@@ -24,9 +25,7 @@ from studio import store
 
 LOG = logging.getLogger("kenaushorts.worker")
 
-class QuotaBlockedError(RuntimeError):
-    """Raised when YouTube API quota is exceeded or unverified before upload."""
-    pass
+QuotaBlockedError = store.QuotaBlockedError
 
 def work(action: str, key: str) -> None:
     store.load_secrets()
@@ -149,13 +148,7 @@ def work(action: str, key: str) -> None:
                     or "invalid_grant" in err_msg.lower()
                 )
 
-                is_session_expired = (
-                    has_session
-                    and "oauth" not in err_msg.lower()
-                    and ("session expired" in err_msg.lower() or "404" in err_msg or "410" in err_msg)
-                )
-
-                if is_session_expired:
+                if isinstance(e, UploadSessionExpiredError) or (has_session and "oauth" not in err_msg.lower() and ("session expired" in err_msg.lower() or "404" in err_msg or "410" in err_msg)):
                     latest_rec.update(
                         status="upload_unresolved",
                         resumable_uri="",
@@ -168,6 +161,14 @@ def work(action: str, key: str) -> None:
                         "message": f"Upload session expired: {err_msg}",
                     })
                     LOG.warning("Upload session for %s expired; set to upload_unresolved", key)
+                elif isinstance(e, QuotaBlockedError):
+                    latest_rec.update(
+                        status="ready",
+                        error=err_msg,
+                    )
+                    store.put("videos", key, latest_rec)
+                    agent.emit_summary({"status": "blocked", "message": err_msg})
+                    LOG.warning("Upload for %s blocked by quota governance: %s", key, err_msg)
                 elif has_session:
                     latest_rec.update(
                         status="upload_unknown",
@@ -181,25 +182,12 @@ def work(action: str, key: str) -> None:
                     })
                     LOG.warning("Upload outcome for %s is ambiguous (%s); set to upload_unknown", key, e)
                 else:
-                    is_quota_blocked = (
-                        isinstance(e, QuotaBlockedError)
-                        or ("quota" in err_msg.lower() and ("limit reached" in err_msg.lower() or "verification failed" in err_msg.lower()))
+                    latest_rec.update(
+                        status="failed",
+                        error=err_msg,
                     )
-                    if is_quota_blocked:
-                        latest_rec.update(
-                            status="ready",
-                            error=err_msg,
-                        )
-                        store.put("videos", key, latest_rec)
-                        agent.emit_summary({"status": "blocked", "message": err_msg})
-                        LOG.warning("Upload for %s blocked by quota governance: %s", key, err_msg)
-                    else:
-                        latest_rec.update(
-                            status="failed",
-                            error=err_msg,
-                        )
-                        store.put("videos", key, latest_rec)
-                        agent.emit_summary({"status": "failed", "message": err_msg})
+                    store.put("videos", key, latest_rec)
+                    agent.emit_summary({"status": "failed", "message": err_msg})
                 raise
 
         elif action == "render":

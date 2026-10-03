@@ -36,6 +36,7 @@ from core import agent, render
 from core.state import State
 import studio.server as server
 import studio.store as store
+from studio import worker
 
 
 class Stage7Phase3Tests(unittest.TestCase):
@@ -1144,28 +1145,259 @@ class Stage7Phase3Tests(unittest.TestCase):
         self.assertEqual(exp_google, "YouTube search quota exhausted by upstream API; 0 candidates from other sources")
 
     def test_quota_persistence_resilience_and_corrupt_recovery(self):
-        """Test recovery from corrupt or malformed studio-quota.json file."""
+        """Test fail-closed behavior on corrupt/malformed studio-quota.json and recovery."""
         quota_path = self.root / "studio-quota.json"
 
-        # 1. Completely corrupt non-JSON file
+        # 1. Completely corrupt non-JSON file -> raises QuotaCorruptError
         quota_path.write_text("{corrupt-invalid-json", encoding="utf-8")
-        tracker = store.get_local_quota_tracker()
-        self.assertEqual(tracker["videos_insert_count"], 0)
-        self.assertEqual(tracker["search_list_count"], 0)
-        self.assertFalse(tracker["google_quota_exhausted"])
+        with self.assertRaises(store.QuotaCorruptError):
+            store.get_local_quota_tracker()
 
-        # 2. Corrupt field values (strings, negative numbers)
+        # 2. Corrupt string field values -> raises QuotaCorruptError
         quota_path.write_text(json.dumps({
             "date_pt": store.get_pacific_date(),
             "videos_insert_count": "invalid",
-            "search_list_count": -50,
-            "google_quota_exhausted": True,
+            "search_list_count": 0,
         }), encoding="utf-8")
+        with self.assertRaises(store.QuotaCorruptError):
+            store.get_local_quota_tracker()
 
-        tracker2 = store.get_local_quota_tracker()
-        self.assertEqual(tracker2["videos_insert_count"], 0)
-        self.assertEqual(tracker2["search_list_count"], 0)
-        self.assertTrue(tracker2["google_quota_exhausted"])
+        # 3. Negative counter -> raises QuotaCorruptError
+        quota_path.write_text(json.dumps({
+            "date_pt": store.get_pacific_date(),
+            "videos_insert_count": 0,
+            "search_list_count": -50,
+        }), encoding="utf-8")
+        with self.assertRaises(store.QuotaCorruptError):
+            store.get_local_quota_tracker()
+
+        # 4. Invalid data type (boolean for count) -> raises QuotaCorruptError
+        quota_path.write_text(json.dumps({
+            "date_pt": store.get_pacific_date(),
+            "videos_insert_count": True,
+        }), encoding="utf-8")
+        with self.assertRaises(store.QuotaCorruptError):
+            store.get_local_quota_tracker()
+
+        # 5. Invalid root type (list instead of dict) -> raises QuotaCorruptError
+        quota_path.write_text(json.dumps([1, 2, 3]), encoding="utf-8")
+        with self.assertRaises(store.QuotaCorruptError):
+            store.get_local_quota_tracker()
+
+        # 6. Missing date_pt field -> raises QuotaCorruptError
+        quota_path.write_text(json.dumps({"videos_insert_count": 5}), encoding="utf-8")
+        with self.assertRaises(store.QuotaCorruptError):
+            store.get_local_quota_tracker()
+
+        # 7. Unreadable file (simulated read error) -> raises QuotaCorruptError
+        with patch.object(Path, "read_text", side_effect=PermissionError("File locked")):
+            with self.assertRaises(store.QuotaCorruptError):
+                store.get_local_quota_tracker()
+
+        # 8. Recovery procedure: delete corrupted file -> cleanly initializes fresh tracker
+        quota_path.unlink(missing_ok=True)
+        recovered_tracker = store.get_local_quota_tracker()
+        self.assertEqual(recovered_tracker["videos_insert_count"], 0)
+        self.assertEqual(recovered_tracker["search_list_count"], 0)
+        self.assertFalse(recovered_tracker["google_quota_exhausted"])
+        self.assertTrue(quota_path.exists())
+
+    def test_lock_acquisition_failure_blocks_quota_and_requests(self):
+        """OS file-lock acquisition failure raises QuotaLockError and blocks outbound requests."""
+        # 1. Lock guard raises QuotaLockError directly
+        with patch("studio.store._quota_lock_guard", side_effect=store.QuotaLockError("Lock busy")):
+            with self.assertRaises(store.QuotaLockError):
+                store.check_and_reserve_quota("search_list", 1)
+
+            # 2. Outbound search fails closed when lock fails
+            stats = {}
+            with patch("requests.get") as mock_get:
+                results = agent.discover_youtube(["test_query"], api_key="test_api_key", stats=stats)
+                self.assertEqual(results, [])
+                self.assertEqual(mock_get.call_count, 0, "No outbound search requests allowed on lock failure")
+                self.assertTrue(stats.get("quota_tracker_failed"))
+
+            # 3. Outbound upload fails closed when lock fails
+            vid_id = "v_lock_fail_test"
+            vid_file = self.root / "out" / "lock_test.mp4"
+            vid_file.write_bytes(b"data")
+            store.put("videos", vid_id, {
+                "id": vid_id,
+                "title": "Lock Fail Test",
+                "status": "ready",
+                "video": "out/lock_test.mp4",
+            })
+            with patch("core.agent.upload_to_youtube") as mock_upload:
+                with self.assertRaises(store.QuotaBlockedError):
+                    worker.work("upload", vid_id)
+                self.assertEqual(mock_upload.call_count, 0, "No outbound upload allowed on lock failure")
+                rec = store.get("videos", vid_id)
+                self.assertEqual(rec["status"], "ready")
+
+    def test_quota_persistence_failure_fails_closed(self):
+        """Temporary-file write and atomic replacement failures raise QuotaPersistenceError and block operations."""
+        quota_path = self.root / "studio-quota.json"
+
+        # 1. Temp file write error
+        with patch.object(Path, "write_text", side_effect=OSError("Disk full")):
+            with self.assertRaises(store.QuotaPersistenceError):
+                store._save_quota_data(quota_path, {"test": 1})
+
+        # 2. Atomic replacement error
+        with patch.object(Path, "replace", side_effect=OSError("Access denied")):
+            with self.assertRaises(store.QuotaPersistenceError):
+                store._save_quota_data(quota_path, {"test": 1})
+
+        # 3. check_and_reserve_quota fails closed on persistence failure
+        with patch.object(store, "_save_quota_data", side_effect=store.QuotaPersistenceError("Cannot save")):
+            with self.assertRaises(store.QuotaPersistenceError):
+                store.check_and_reserve_quota("search_list", 1)
+
+            # 4. Outbound search fails closed on reservation persistence failure
+            stats = {}
+            with patch("requests.get") as mock_get:
+                results = agent.discover_youtube(["q_save_fail"], api_key="dummy_key", stats=stats)
+                self.assertEqual(results, [])
+                self.assertEqual(mock_get.call_count, 0, "Outbound search blocked on persistence failure")
+                self.assertTrue(stats.get("quota_tracker_failed"))
+
+            # 5. Outbound upload fails closed and resets to ready on persistence failure
+            vid_id = "v_persist_fail_test"
+            vid_file = self.root / "out" / "persist_test.mp4"
+            vid_file.write_bytes(b"data")
+            store.put("videos", vid_id, {
+                "id": vid_id,
+                "title": "Persist Fail Test",
+                "status": "ready",
+                "video": "out/persist_test.mp4",
+            })
+            with patch("core.agent.upload_to_youtube") as mock_upload:
+                with self.assertRaises(store.QuotaBlockedError):
+                    worker.work("upload", vid_id)
+                self.assertEqual(mock_upload.call_count, 0, "Outbound upload blocked on persistence failure")
+                rec = store.get("videos", vid_id)
+                self.assertEqual(rec["status"], "ready")
+                self.assertIn("failing closed", rec.get("error", "").lower())
+
+    def test_upload_lifecycle_exactly_once_reservation(self):
+        """Fresh upload reserves quota exactly once; resumables and reconciliation do not re-reserve."""
+        # Baseline count
+        initial_tracker = store.get_local_quota_tracker()
+        base_count = initial_tracker["videos_insert_count"]
+
+        vid_file = self.root / "out" / "lifecycle_test.mp4"
+        vid_file.write_bytes(b"video data")
+
+        # 1. Fresh upload: increment count by exactly 1
+        v1_id = "v_fresh_upload_1"
+        store.put("videos", v1_id, {
+            "id": v1_id,
+            "title": "Lifecycle Fresh",
+            "status": "ready",
+            "video": "out/lifecycle_test.mp4",
+        })
+
+        with patch("core.agent.upload_to_youtube", return_value="yt_fresh_001"):
+            worker.work("upload", v1_id)
+
+        t1 = store.get_local_quota_tracker()
+        self.assertEqual(t1["videos_insert_count"], base_count + 1)
+        rec1 = store.get("videos", v1_id)
+        self.assertEqual(rec1["status"], "uploaded")
+        self.assertEqual(rec1["youtube_id"], "yt_fresh_001")
+
+        # 2. Resumable continuation: should NOT increment count
+        v2_id = "v_resumable_upload_2"
+        store.put("videos", v2_id, {
+            "id": v2_id,
+            "title": "Lifecycle Resumable",
+            "status": "ready",
+            "video": "out/lifecycle_test.mp4",
+            "resumable_uri": "https://upload.youtube.com/session/active123",
+        })
+
+        with patch("core.agent.upload_to_youtube", return_value="yt_resume_002"):
+            worker.work("upload", v2_id)
+
+        t2 = store.get_local_quota_tracker()
+        self.assertEqual(t2["videos_insert_count"], base_count + 1, "Resumable continuation must not increment quota")
+        rec2 = store.get("videos", v2_id)
+        self.assertEqual(rec2["status"], "uploaded")
+
+        # 3. Reconciliation / manual resolution: should NOT increment count
+        v3_id = "v_reconcile_upload_3"
+        store.put("videos", v3_id, {
+            "id": v3_id,
+            "title": "Lifecycle Reconcile",
+            "status": "upload_unknown",
+            "video": "out/lifecycle_test.mp4",
+        })
+
+        server.resolve_manual_video(v3_id, "confirm_uploaded", "dQw4w9WgXcQ", strict_id=True)
+        t3 = store.get_local_quota_tracker()
+        self.assertEqual(t3["videos_insert_count"], base_count + 1, "Reconciliation must not increment quota")
+        rec3 = store.get("videos", v3_id)
+        self.assertEqual(rec3["status"], "uploaded")
+        self.assertEqual(rec3["youtube_id"], "dQw4w9WgXcQ")
+
+    def test_youtube_id_strict_validation_and_url_handling(self):
+        """Strict full-string validation accepts canonical 11-char IDs/URLs and rejects invalid patterns."""
+        # 1. Canonical raw 11-char ID
+        self.assertEqual(server.extract_youtube_video_id("dQw4w9WgXcQ"), "dQw4w9WgXcQ")
+        self.assertEqual(server.extract_youtube_video_id("  dQw4w9WgXcQ  "), "dQw4w9WgXcQ")
+
+        # 2. Supported URL patterns
+        self.assertEqual(
+            server.extract_youtube_video_id("https://www.youtube.com/watch?v=dQw4w9WgXcQ"),
+            "dQw4w9WgXcQ"
+        )
+        self.assertEqual(
+            server.extract_youtube_video_id("https://youtu.be/dQw4w9WgXcQ?si=test123"),
+            "dQw4w9WgXcQ"
+        )
+        self.assertEqual(
+            server.extract_youtube_video_id("https://www.youtube.com/shorts/dQw4w9WgXcQ#top"),
+            "dQw4w9WgXcQ"
+        )
+        self.assertEqual(
+            server.extract_youtube_video_id("https://www.youtube.com/watch?v=dQw4w9WgXcQ&feature=shared"),
+            "dQw4w9WgXcQ"
+        )
+
+        # 3. Validation in resolve_manual_video
+        vid_id = "v_strict_val_test"
+        store.put("videos", vid_id, {
+            "id": vid_id,
+            "status": "upload_unknown",
+        })
+
+        # Valid resolution
+        res = server.resolve_manual_video(vid_id, "confirm_uploaded", "https://youtu.be/dQw4w9WgXcQ", strict_id=True)
+        self.assertEqual(res["status"], "uploaded")
+        self.assertEqual(res["youtube_id"], "dQw4w9WgXcQ")
+
+        # Reset to upload_unknown for invalid tests
+        store.put("videos", vid_id, {"id": vid_id, "status": "upload_unknown"})
+
+        # Invalid: too short (<11)
+        with self.assertRaises(ValueError):
+            server.resolve_manual_video(vid_id, "confirm_uploaded", "short_id", strict_id=True)
+
+        # Invalid: too long (>11)
+        with self.assertRaises(ValueError):
+            server.resolve_manual_video(vid_id, "confirm_uploaded", "too_long_youtube_id_123", strict_id=True)
+
+        # Invalid: internal spaces
+        with self.assertRaises(ValueError):
+            server.resolve_manual_video(vid_id, "confirm_uploaded", "dQw4w 9WgXc", strict_id=True)
+
+        # Invalid: non-permitted characters
+        with self.assertRaises(ValueError):
+            server.resolve_manual_video(vid_id, "confirm_uploaded", "dQw4w@9WgXc", strict_id=True)
+
+        # Invalid: empty string or whitespace only
+        with self.assertRaises(ValueError):
+            server.resolve_manual_video(vid_id, "confirm_uploaded", "   ", strict_id=True)
 
 
 if __name__ == "__main__":

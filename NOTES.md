@@ -798,22 +798,82 @@ Stage 2 meets all single-instance operational requirements: process tracking, pr
    - **Hardware Encoder Probe (`core/render.py`)**: `has_encoder()` previously relied solely on `ffmpeg -encoders` output (which lists all compiled encoders, including `h264_nvenc`). On Windows systems lacking NVIDIA CUDA hardware/drivers (`nvcuda.dll`), this caused ffmpeg crashes. `has_encoder()` now probes whether hardware encoders can actually initialize (`_WORKING_ENCODERS`), falling back cleanly to `libx264`.
    - **Cross-Platform Service Uninstall (`scripts/uninstall_service.py`)**: `uninstall_macos()` used `os.getuid()`, which does not exist on Windows. Updated to `getattr(os, "getuid", lambda: 501)()` to prevent `AttributeError` when running tests or scripts on Windows.
 
+---
+
+## Stage 7 Phase 3 Quota Safety Corrections
+
+### Implementation Date
+2026-10-03
+
+### Baseline Commit
+`d571c27` (`test(stage7): harden test_timed_out_video_retry_without_server_restart against queue worker race`)
+
+### Addressed Vulnerabilities & Architectural Improvements
+
+1. **Fail-Closed Multi-Process Lock Guard (`studio/store.py`)**:
+   - `_quota_lock_guard()` now raises `QuotaLockError` if OS-level file locking on `studio-quota.lock` fails or times out after 5.0 seconds. It no longer proceeds under only the in-process thread lock.
+   - OS lock acquisition status is tracked via `acquired_os_lock`; lock release is attempted only when acquisition succeeded, and the file descriptor is always closed in `finally`.
+   - Callers (`discover_youtube`, worker uploads) fail closed on `QuotaLockError`, preventing uncontrolled outbound API requests.
+
+2. **Fail-Closed Quota Persistence (`studio/store.py`)**:
+   - `_save_quota_data()` propagates `QuotaPersistenceError` if temporary file creation or atomic `replace()` fails.
+   - Reservations are never treated as successful unless safely persisted to disk.
+   - Discovery and worker uploads catch persistence exceptions and fail closed without making outbound requests. Blocked videos remain in `status="ready"` with summary `blocked`.
+
+3. **Safe Handling of Corrupt Quota Files (`studio/store.py`)**:
+   - `_load_and_sanitize_quota_data()` distinguishes between missing quota files and corrupt/unreadable files:
+     - Missing file: Initializes a fresh default tracker for today (`today_pt`).
+     - Malformed JSON, unreadable file, non-dict root, missing `date_pt`, or invalid field data types (e.g. non-numeric strings, negative counts, booleans in integer fields): Raises `QuotaCorruptError` to fail closed instead of silently resetting counts to zero.
+     - Legitimate rollover: If `date_pt != today_pt` on a valid file, preserves configured limits and resets counts to 0.
+
+4. **Quota Recovery Procedure**:
+   - In the event of disk corruption or `QuotaCorruptError`:
+     1. Review the Google Developer Console for the project's authoritative quota consumption for the current Pacific Time day.
+     2. Stop background workers and the Studio server (`python -m studio.server --stop` or terminate process).
+     3. If manual recovery is desired, create/repair `studio-quota.json` with valid JSON:
+        ```json
+        {
+          "date_pt": "YYYY-MM-DD",
+          "videos_insert_count": <ACTUAL_UPLOADS_TODAY>,
+          "search_list_count": <ACTUAL_SEARCHES_TODAY>,
+          "general_units": 0,
+          "videos_insert_limit": 100,
+          "search_list_limit": 100,
+          "general_units_limit": 10000,
+          "google_quota_exhausted": false,
+          "google_quota_exhausted_reason": "",
+          "google_quota_exhausted_at": "",
+          "disclaimer": "Local estimate only. Google Developer Console is the authoritative source of truth."
+        }
+        ```
+     4. Alternatively, if no uploads or searches have been performed today, delete `studio-quota.json`; the system will automatically re-initialize default safe state.
+     5. Restart the Studio server.
+
+5. **Exactly-Once Upload Reservation (`studio/worker.py` & `core/agent.py`)**:
+   - Fresh uploads invoke `check_and_reserve_quota("videos_insert", 1)` exactly once before upload initiation.
+   - Resumable continuations (`resumable_uri` present) bypass reservation to prevent double-charging.
+   - Reconciliations (`confirm_uploaded`, `confirm_absent`) do not invoke `videos_insert`.
+   - Replaced error-string matching with typed exceptions (`QuotaBlockedError`, `UploadSessionExpiredError`).
+
+6. **Strict Video ID Validation & URL Extraction (`studio/server.py`)**:
+   - `extract_youtube_video_id()` extracts canonical 11-char IDs from `watch?v=`, `youtu.be/`, `/shorts/`, stripping whitespace, query parameters, and fragments.
+   - In strict mode (`strict_id=True`), strictly validates full string against `^[A-Za-z0-9_-]{11}$`, rejecting short, long, whitespace, or invalid character inputs with HTTP 400.
+
+7. **Deterministic Phase 2 Retry Test (`tests/test_stage7_phase2.py`)**:
+   - `test_timed_out_video_retry_without_server_restart` uses `threading.Event` synchronization inside patched `run_job_process` to confirm the retried job is picked up and transitioned to `completed` without timing-dependent sleeps.
+
 ### Test Evidence
-- **Stage 7 Phase 3 Suite** (`tests/test_stage7_phase3.py`): 27/27 passed (1.9s).
-  - Strict 11-char ID validation and resolution state transitions.
-  - Fail-closed discovery on preflight and query-level quota exceptions.
-  - Pre-upload `videos_insert` enforcement and ready-status preservation.
-  - Concurrent upload quota reservation race prevention.
-  - Multi-process file lock coordination (`studio-quota.lock`).
-  - Evidence-based idle diagnostic explanations distinguishing tracker failures, quota exhaustion, network errors, and valid empty results.
-- **Combined Stage 6 & 7 Regression Suite**:
-  - `tests/test_stage7_phase3.py`: 27/27 passed.
-  - `tests/test_stage7_phase2.py`: 20/20 passed.
-  - `tests/test_stage7_phase1.py`: 18/18 passed.
-  - `tests/test_stage6_publishing.py`: 38/38 passed.
-  - Combined suite total: **103/103 passed** (17.7s).
+- **Stage 7 Phase 3 Suite** (`tests/test_stage7_phase3.py`): **31/31 passed** (2.4s).
+- **Stage 7 Phase 2 Suite** (`tests/test_stage7_phase2.py`): **20/20 passed** (8.0s).
+- **Stage 7 Phase 1 Suite** (`tests/test_stage7_phase1.py`): **18/18 passed** (2.3s).
+- **Stage 6 Publishing Suite** (`tests/test_stage6_publishing.py`): **38/38 passed** (6.2s).
+- **Combined Targeted Regression Suite**: **107/107 passed** (16.2s).
 - **Full Discovery Suite** (`python -X utf8 -m unittest discover tests`):
-  - **238 tests total: 238 passed, 0 failures, 0 errors** (35.5s)!
+  - **242 tests total: 242 passed, 0 failures, 0 errors** (45.5s)!
 - **Compilation & Formatting Checks**:
   - `python -m compileall core studio scripts tests`: 0 errors.
   - `git diff --check`: 0 warnings/errors.
+
+### Remaining Limitations
+- Local quota counters remain estimates; Google Developer Console is the authoritative source of truth.
+- Stage 7 Phase 4 has not been started.

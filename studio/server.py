@@ -1215,6 +1215,27 @@ def reconcile_video_upload(vid_id: str) -> dict[str, Any]:
 
 YOUTUBE_ID_RE = re.compile(r"^[A-Za-z0-9_-]{11}$")
 
+def extract_youtube_video_id(input_str: str) -> str:
+    """
+    Extract canonical YouTube video ID from a raw string or supported YouTube URL.
+    Handles leading/trailing whitespace, query parameters, and fragments.
+    Supported URL forms:
+      - https://www.youtube.com/watch?v=VIDEO_ID
+      - https://youtu.be/VIDEO_ID
+      - https://www.youtube.com/shorts/VIDEO_ID
+      - Variations with http/https, www., and additional query parameters/hashes.
+    """
+    yt_id = str(input_str or "").strip()
+    if not yt_id:
+        return ""
+    if "v=" in yt_id:
+        yt_id = yt_id.split("v=")[1].split("&")[0].split("?")[0].split("#")[0]
+    elif "youtu.be/" in yt_id:
+        yt_id = yt_id.split("youtu.be/")[1].split("?")[0].split("#")[0]
+    elif "/shorts/" in yt_id:
+        yt_id = yt_id.split("/shorts/")[1].split("?")[0].split("#")[0]
+    return yt_id.strip()
+
 def resolve_manual_video(vid_id: str, resolution: str, youtube_id: str = "", confirmed: bool = True, strict_id: bool = False) -> dict[str, Any]:
     """Manually resolve an ambiguous upload outcome (upload_unknown / upload_unresolved)."""
     with GUARD:
@@ -1231,14 +1252,7 @@ def resolve_manual_video(vid_id: str, resolution: str, youtube_id: str = "", con
             res = "confirm_absent"
 
         if res == "confirm_uploaded":
-            yt_id = (youtube_id or video.get("youtube_id") or "").strip()
-            if "v=" in yt_id:
-                yt_id = yt_id.split("v=")[1].split("&")[0].split("?")[0].split("#")[0]
-            elif "youtu.be/" in yt_id:
-                yt_id = yt_id.split("youtu.be/")[1].split("?")[0].split("#")[0]
-            elif "/shorts/" in yt_id:
-                yt_id = yt_id.split("/shorts/")[1].split("?")[0].split("#")[0]
-            yt_id = yt_id.strip()
+            yt_id = extract_youtube_video_id(youtube_id or video.get("youtube_id") or "")
 
             if strict_id:
                 if not yt_id or not YOUTUBE_ID_RE.match(yt_id):
@@ -1780,7 +1794,15 @@ class StudioHandler(BaseHTTPRequestHandler):
             online = is_online()
             oauth_status = check_oauth_health()
             oauth_health = get_oauth_status_details()
-            quota_tracker = store.get_local_quota_tracker()
+            try:
+                quota_tracker = store.get_local_quota_tracker()
+            except Exception as q_err:
+                quota_tracker = {
+                    "error": str(q_err),
+                    "search_limit_reached": True,
+                    "google_quota_exhausted": False,
+                    "disclaimer": "Local estimate unavailable — quota governance failed closed.",
+                }
 
             with GUARD:
                 cfg = get_automation_settings()

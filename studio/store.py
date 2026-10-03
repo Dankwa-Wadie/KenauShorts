@@ -7,6 +7,7 @@ from __future__ import annotations
 import contextlib
 import datetime as dt
 import json
+import logging
 import os
 import sqlite3
 import sys
@@ -15,9 +16,30 @@ import time
 from pathlib import Path
 from typing import Any
 
+LOG = logging.getLogger("kenaushorts.store")
 ROOT = Path(__file__).resolve().parent.parent
 DB = ROOT / "studio.sqlite3"
 _QUOTA_LOCK = threading.RLock()
+
+class QuotaError(RuntimeError):
+    """Base exception for YouTube quota governance errors."""
+    pass
+
+class QuotaLockError(QuotaError):
+    """Raised when multi-process quota file lock acquisition fails or times out."""
+    pass
+
+class QuotaPersistenceError(QuotaError):
+    """Raised when quota tracker data cannot be safely persisted to disk."""
+    pass
+
+class QuotaCorruptError(QuotaError):
+    """Raised when existing quota tracker data is corrupt, unreadable, or invalid."""
+    pass
+
+class QuotaBlockedError(QuotaError):
+    """Raised when YouTube API quota is exceeded or unverified before upload."""
+    pass
 
 def now() -> str:
     return dt.datetime.now(dt.timezone.utc).isoformat()
@@ -349,52 +371,139 @@ def get_pacific_reset_info(now_utc: dt.datetime | None = None) -> dict[str, Any]
 
 
 def _save_quota_data(quota_path: Path, data: dict[str, Any]) -> None:
-    """Safely persist quota data using atomic write."""
+    """Safely persist quota data using atomic write. Fails closed on any write or replacement error."""
     try:
         tmp_path = quota_path.with_suffix(".tmp")
         tmp_path.write_text(json.dumps(data, indent=2), encoding="utf-8")
         tmp_path.replace(quota_path)
     except Exception as e:
-        LOG.warning("Failed to atomically persist studio-quota.json: %s", e)
+        LOG.error("Failed to atomically persist %s: %s", quota_path, e)
+        raise QuotaPersistenceError(f"Failed to persist quota data to '{quota_path}': {e}") from e
 
 
 def _load_and_sanitize_quota_data(quota_path: Path, today_pt: str) -> dict[str, Any]:
-    data: dict[str, Any] = {}
-    if quota_path.exists():
-        try:
-            data = json.loads(quota_path.read_text(encoding="utf-8"))
-        except Exception:
-            data = {}
-    if not isinstance(data, dict) or data.get("date_pt") != today_pt:
+    """
+    Load and validate existing quota tracker data.
+    - If the quota file does NOT exist, initializes a default tracker for today.
+    - If the quota file exists but is corrupt, unreadable, or contains invalid types,
+      raises QuotaCorruptError to fail closed.
+    - If the quota file belongs to a previous Pacific date, resets counts for the new day
+      while preserving configured limits.
+    """
+    if not quota_path.exists():
         data = {
             "date_pt": today_pt,
             "videos_insert_count": 0,
             "search_list_count": 0,
             "general_units": 0,
-            "videos_insert_limit": data.get("videos_insert_limit", 100) if isinstance(data, dict) else 100,
-            "search_list_limit": data.get("search_list_limit", 100) if isinstance(data, dict) else 100,
-            "general_units_limit": data.get("general_units_limit", 10000) if isinstance(data, dict) else 10000,
+            "videos_insert_limit": 100,
+            "search_list_limit": 100,
+            "general_units_limit": 10000,
             "google_quota_exhausted": False,
             "google_quota_exhausted_reason": "",
             "google_quota_exhausted_at": "",
             "disclaimer": "Local estimate only. Google Developer Console is the authoritative source of truth.",
         }
         _save_quota_data(quota_path, data)
-    else:
-        for k in ("videos_insert_count", "search_list_count", "general_units"):
-            try:
-                data[k] = max(0, int(data.get(k, 0)))
-            except (ValueError, TypeError):
-                data[k] = 0
-        for k in ("videos_insert_limit", "search_list_limit", "general_units_limit"):
-            try:
-                data[k] = max(1, int(data.get(k, 100 if "limit" in k and "general" not in k else 10000)))
-            except (ValueError, TypeError):
-                data[k] = 100 if "general" not in k else 10000
-        data["google_quota_exhausted"] = bool(data.get("google_quota_exhausted", False))
-        data.setdefault("google_quota_exhausted_reason", "")
-        data.setdefault("google_quota_exhausted_at", "")
-        data.setdefault("disclaimer", "Local estimate only. Google Developer Console is the authoritative source of truth.")
+        return data
+
+    try:
+        raw_text = quota_path.read_text(encoding="utf-8")
+    except Exception as read_err:
+        raise QuotaCorruptError(
+            f"YouTube quota file '{quota_path}' is unreadable: {read_err}. "
+            "Quota governance failed closed. Review Google Developer Console or follow recovery procedure in NOTES.md."
+        ) from read_err
+
+    try:
+        data = json.loads(raw_text)
+    except Exception as parse_err:
+        raise QuotaCorruptError(
+            f"YouTube quota file '{quota_path}' contains malformed JSON: {parse_err}. "
+            "Quota governance failed closed. Review Google Developer Console or follow recovery procedure in NOTES.md."
+        ) from parse_err
+
+    if not isinstance(data, dict):
+        raise QuotaCorruptError(
+            f"YouTube quota file '{quota_path}' has invalid structure (expected JSON object, got {type(data).__name__}). "
+            "Quota governance failed closed. Review Google Developer Console or follow recovery procedure in NOTES.md."
+        )
+
+    # Validate date_pt field
+    date_pt = data.get("date_pt")
+    if not isinstance(date_pt, str) or not date_pt.strip():
+        raise QuotaCorruptError(
+            f"YouTube quota file '{quota_path}' is missing valid 'date_pt'. "
+            "Quota governance failed closed. Review Google Developer Console or follow recovery procedure in NOTES.md."
+        )
+
+    # Validate integer count fields (must not be booleans, dicts, lists, or non-integer strings)
+    for k in ("videos_insert_count", "search_list_count", "general_units"):
+        if k not in data:
+            data[k] = 0
+            continue
+        val = data[k]
+        if isinstance(val, bool) or not isinstance(val, (int, str)):
+            raise QuotaCorruptError(
+                f"YouTube quota file '{quota_path}' has invalid data type for '{k}' ({type(val).__name__}). "
+                "Quota governance failed closed."
+            )
+        try:
+            int_val = int(val)
+            if int_val < 0:
+                raise ValueError("negative value")
+            data[k] = int_val
+        except (ValueError, TypeError) as type_err:
+            raise QuotaCorruptError(
+                f"YouTube quota file '{quota_path}' has invalid integer value for '{k}' ({val!r}). "
+                "Quota governance failed closed."
+            ) from type_err
+
+    # Validate integer limit fields
+    for k in ("videos_insert_limit", "search_list_limit", "general_units_limit"):
+        if k not in data:
+            data[k] = 100 if "general" not in k else 10000
+            continue
+        val = data[k]
+        if isinstance(val, bool) or not isinstance(val, (int, str)):
+            raise QuotaCorruptError(
+                f"YouTube quota file '{quota_path}' has invalid data type for '{k}' ({type(val).__name__}). "
+                "Quota governance failed closed."
+            )
+        try:
+            int_val = int(val)
+            if int_val < 1:
+                raise ValueError("limit must be >= 1")
+            data[k] = int_val
+        except (ValueError, TypeError) as type_err:
+            raise QuotaCorruptError(
+                f"YouTube quota file '{quota_path}' has invalid limit value for '{k}' ({val!r}). "
+                "Quota governance failed closed."
+            ) from type_err
+
+
+    # Validate boolean flag
+    ex = data.get("google_quota_exhausted", False)
+    if not isinstance(ex, bool):
+        raise QuotaCorruptError(
+            f"YouTube quota file '{quota_path}' has invalid type for 'google_quota_exhausted' ({type(ex).__name__}). "
+            "Quota governance failed closed."
+        )
+
+    # Legitimate date rollover: if the file belongs to a prior Pacific date, roll over safely
+    if date_pt != today_pt:
+        data["date_pt"] = today_pt
+        data["videos_insert_count"] = 0
+        data["search_list_count"] = 0
+        data["general_units"] = 0
+        data["google_quota_exhausted"] = False
+        data["google_quota_exhausted_reason"] = ""
+        data["google_quota_exhausted_at"] = ""
+        _save_quota_data(quota_path, data)
+
+    data.setdefault("google_quota_exhausted_reason", "")
+    data.setdefault("google_quota_exhausted_at", "")
+    data.setdefault("disclaimer", "Local estimate only. Google Developer Console is the authoritative source of truth.")
     return data
 
 
@@ -404,12 +513,18 @@ def _quota_lock_guard():
     Thread-safe and process-safe lock guard for studio-quota.json.
     Combines threading.RLock (for intra-process thread coordination) with
     OS-level file locking on studio-quota.lock (msvcrt on Windows, fcntl on Unix).
+    Fails closed by raising QuotaLockError if the OS file lock cannot be acquired.
     """
     with _QUOTA_LOCK:
         lock_file = ROOT / "studio-quota.lock"
         fd = None
+        acquired_os_lock = False
         try:
-            fd = os.open(lock_file, os.O_RDWR | os.O_CREAT)
+            try:
+                fd = os.open(lock_file, os.O_RDWR | os.O_CREAT)
+            except Exception as open_err:
+                raise QuotaLockError(f"Failed to open quota lock file '{lock_file}': {open_err}") from open_err
+
             if sys.platform == "win32":
                 import msvcrt
                 start = time.time()
@@ -417,11 +532,11 @@ def _quota_lock_guard():
                     try:
                         os.lseek(fd, 0, os.SEEK_SET)
                         msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+                        acquired_os_lock = True
                         break
-                    except (OSError, IOError):
+                    except (OSError, IOError) as lock_err:
                         if time.time() - start > 5.0:
-                            LOG.warning("Could not acquire multi-process quota file lock within 5s; proceeding under thread lock.")
-                            break
+                            raise QuotaLockError(f"Could not acquire multi-process quota file lock within 5s: {lock_err}") from lock_err
                         time.sleep(0.01)
             else:
                 import fcntl
@@ -429,32 +544,34 @@ def _quota_lock_guard():
                 while True:
                     try:
                         fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                        acquired_os_lock = True
                         break
-                    except (OSError, IOError):
+                    except (OSError, IOError) as lock_err:
                         if time.time() - start > 5.0:
-                            LOG.warning("Could not acquire multi-process quota file lock within 5s; proceeding under thread lock.")
-                            break
+                            raise QuotaLockError(f"Could not acquire multi-process quota file lock within 5s: {lock_err}") from lock_err
                         time.sleep(0.01)
             yield
         finally:
             if fd is not None:
-                if sys.platform == "win32":
-                    try:
-                        os.lseek(fd, 0, os.SEEK_SET)
-                        import msvcrt
-                        msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
-                    except Exception:
-                        pass
-                else:
-                    try:
-                        import fcntl
-                        fcntl.flock(fd, fcntl.LOCK_UN)
-                    except Exception:
-                        pass
+                if acquired_os_lock:
+                    if sys.platform == "win32":
+                        try:
+                            os.lseek(fd, 0, os.SEEK_SET)
+                            import msvcrt
+                            msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
+                        except Exception:
+                            pass
+                    else:
+                        try:
+                            import fcntl
+                            fcntl.flock(fd, fcntl.LOCK_UN)
+                        except Exception:
+                            pass
                 try:
                     os.close(fd)
                 except Exception:
                     pass
+
 
 
 def get_local_quota_tracker(now_utc: dt.datetime | None = None) -> dict[str, Any]:

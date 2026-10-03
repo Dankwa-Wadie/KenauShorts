@@ -831,15 +831,30 @@ class Stage7Phase2Tests(unittest.TestCase):
             "finished_at": store.now(),
         })
 
-        # Operator can retry the job immediately without restarting server
-        res = server.retry_job(job_id)
-        self.assertIn("id", res)
-        self.assertEqual(res["status"], "pending")
-        self.assertEqual(res["retry_of"], job_id)
+        executed_event = threading.Event()
+        def fake_run(job, cmd):
+            with server.GUARD:
+                now_ts = store.now()
+                job["status"] = "completed"
+                job["stage"] = "Completed"
+                job["finished_at"] = now_ts
+                store.put("jobs", job["id"], job)
+                server.ACTIVE_JOB = None
+            executed_event.set()
 
-        new_job = store.get("jobs", res["id"])
-        self.assertIsNotNone(new_job)
-        self.assertIn(new_job["status"], ("pending", "running"))
+        with patch.object(server, "run_job_process", side_effect=fake_run):
+            # Operator can retry the job immediately without restarting server
+            res = server.retry_job(job_id)
+            self.assertIn("id", res)
+            self.assertEqual(res["status"], "pending")
+            self.assertEqual(res["retry_of"], job_id)
+
+            # Deterministic queue worker verification: wait on event without timing-dependent sleeps
+            self.assertTrue(executed_event.wait(timeout=5.0), "Queue worker did not pick up and process retried job")
+            new_job = store.get("jobs", res["id"])
+            self.assertIsNotNone(new_job)
+            self.assertEqual(new_job["status"], "completed")
+            self.assertEqual(new_job["retry_of"], job_id)
 
 
 if __name__ == "__main__":
