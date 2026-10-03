@@ -26,7 +26,7 @@ def uninstall_macos() -> bool:
         print("ℹ️  No macOS background service found — nothing to remove.")
         return True
 
-    uid = os.getuid()
+    uid = getattr(os, "getuid", lambda: 501)()
     subprocess.run(
         ["launchctl", "bootout", f"gui/{uid}", str(plist_path)],
         check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,

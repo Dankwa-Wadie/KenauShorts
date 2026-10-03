@@ -11,12 +11,13 @@ import os
 import sqlite3
 import sys
 import threading
+import time
 from pathlib import Path
 from typing import Any
 
 ROOT = Path(__file__).resolve().parent.parent
 DB = ROOT / "studio.sqlite3"
-_QUOTA_LOCK = threading.Lock()
+_QUOTA_LOCK = threading.RLock()
 
 def now() -> str:
     return dt.datetime.now(dt.timezone.utc).isoformat()
@@ -397,12 +398,71 @@ def _load_and_sanitize_quota_data(quota_path: Path, today_pt: str) -> dict[str, 
     return data
 
 
+@contextlib.contextmanager
+def _quota_lock_guard():
+    """
+    Thread-safe and process-safe lock guard for studio-quota.json.
+    Combines threading.RLock (for intra-process thread coordination) with
+    OS-level file locking on studio-quota.lock (msvcrt on Windows, fcntl on Unix).
+    """
+    with _QUOTA_LOCK:
+        lock_file = ROOT / "studio-quota.lock"
+        fd = None
+        try:
+            fd = os.open(lock_file, os.O_RDWR | os.O_CREAT)
+            if sys.platform == "win32":
+                import msvcrt
+                start = time.time()
+                while True:
+                    try:
+                        os.lseek(fd, 0, os.SEEK_SET)
+                        msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+                        break
+                    except (OSError, IOError):
+                        if time.time() - start > 5.0:
+                            LOG.warning("Could not acquire multi-process quota file lock within 5s; proceeding under thread lock.")
+                            break
+                        time.sleep(0.01)
+            else:
+                import fcntl
+                start = time.time()
+                while True:
+                    try:
+                        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                        break
+                    except (OSError, IOError):
+                        if time.time() - start > 5.0:
+                            LOG.warning("Could not acquire multi-process quota file lock within 5s; proceeding under thread lock.")
+                            break
+                        time.sleep(0.01)
+            yield
+        finally:
+            if fd is not None:
+                if sys.platform == "win32":
+                    try:
+                        os.lseek(fd, 0, os.SEEK_SET)
+                        import msvcrt
+                        msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
+                    except Exception:
+                        pass
+                else:
+                    try:
+                        import fcntl
+                        fcntl.flock(fd, fcntl.LOCK_UN)
+                    except Exception:
+                        pass
+                try:
+                    os.close(fd)
+                except Exception:
+                    pass
+
+
 def get_local_quota_tracker(now_utc: dt.datetime | None = None) -> dict[str, Any]:
     """Retrieve local YouTube API quota usage estimate for the current Pacific Time day."""
     today_pt = get_pacific_date(now_utc)
     reset_info = get_pacific_reset_info(now_utc)
     quota_path = ROOT / "studio-quota.json"
-    with _QUOTA_LOCK:
+    with _quota_lock_guard():
         data = _load_and_sanitize_quota_data(quota_path, today_pt)
 
     tracker = dict(data)
@@ -417,7 +477,7 @@ def get_local_quota_tracker(now_utc: dt.datetime | None = None) -> dict[str, Any
 
 def mark_google_quota_exhausted(reason: str = "quotaExceeded", now_utc: dt.datetime | None = None) -> dict[str, Any]:
     """Trip the persistent date-scoped Google quota circuit breaker for today's Pacific Time day."""
-    with _QUOTA_LOCK:
+    with _quota_lock_guard():
         today_pt = get_pacific_date(now_utc)
         quota_path = ROOT / "studio-quota.json"
         data = _load_and_sanitize_quota_data(quota_path, today_pt)
@@ -437,10 +497,10 @@ def mark_google_quota_exhausted(reason: str = "quotaExceeded", now_utc: dt.datet
 def check_and_reserve_quota(action_type: str, units: int = 1, now_utc: dt.datetime | None = None) -> tuple[bool, dict[str, Any]]:
     """
     Atomically check whether quota is available and reserve units under lock.
-    Prevents race conditions where concurrent discovery runs exceed configured limits.
+    Prevents race conditions where concurrent discovery runs or workers exceed configured limits.
     Returns (True, tracker) if admitted and reserved; (False, tracker) if limit reached or exhausted.
     """
-    with _QUOTA_LOCK:
+    with _quota_lock_guard():
         today_pt = get_pacific_date(now_utc)
         quota_path = ROOT / "studio-quota.json"
         data = _load_and_sanitize_quota_data(quota_path, today_pt)
@@ -484,13 +544,17 @@ def check_and_reserve_quota(action_type: str, units: int = 1, now_utc: dt.dateti
 
         out = dict(data)
         out.update(get_pacific_reset_info(now_utc))
-        out["search_limit_reached"] = bool(out.get("search_list_count", 0) >= out.get("search_list_limit", 100))
+        out["google_quota_exhausted"] = bool(out.get("google_quota_exhausted", False))
+        out["search_limit_reached"] = bool(
+            out.get("search_list_count", 0) >= out.get("search_list_limit", 100)
+            or out["google_quota_exhausted"]
+        )
         return True, out
 
 
 def record_local_quota_activity(action_type: str, units: int = 1, now_utc: dt.datetime | None = None) -> dict[str, Any]:
     """Record YouTube API activity in the local daily tracker."""
-    with _QUOTA_LOCK:
+    with _quota_lock_guard():
         today_pt = get_pacific_date(now_utc)
         quota_path = ROOT / "studio-quota.json"
         data = _load_and_sanitize_quota_data(quota_path, today_pt)

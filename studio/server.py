@@ -1213,7 +1213,9 @@ def reconcile_video_upload(vid_id: str) -> dict[str, Any]:
         with _RECONCILE_LOCK:
             _RECONCILING_VIDEOS.discard(vid_id)
 
-def resolve_manual_video(vid_id: str, resolution: str, youtube_id: str = "", confirmed: bool = True) -> dict[str, Any]:
+YOUTUBE_ID_RE = re.compile(r"^[A-Za-z0-9_-]{11}$")
+
+def resolve_manual_video(vid_id: str, resolution: str, youtube_id: str = "", confirmed: bool = True, strict_id: bool = False) -> dict[str, Any]:
     """Manually resolve an ambiguous upload outcome (upload_unknown / upload_unresolved)."""
     with GUARD:
         video = store.get("videos", vid_id)
@@ -1238,8 +1240,12 @@ def resolve_manual_video(vid_id: str, resolution: str, youtube_id: str = "", con
                 yt_id = yt_id.split("/shorts/")[1].split("?")[0].split("#")[0]
             yt_id = yt_id.strip()
 
-            if not yt_id or len(yt_id) < 6 or not re.match(r'^[A-Za-z0-9_-]+$', yt_id):
-                raise ValueError("A valid YouTube Video ID or URL is required to confirm upload.")
+            if strict_id:
+                if not yt_id or not YOUTUBE_ID_RE.match(yt_id):
+                    raise ValueError(f"Invalid YouTube Video ID '{yt_id}'. Must be exactly 11 characters matching ^[A-Za-z0-9_-]{{11}}$.")
+            else:
+                if not yt_id or len(yt_id) < 6 or not re.match(r'^[A-Za-z0-9_-]+$', yt_id):
+                    raise ValueError("A valid YouTube Video ID or URL is required to confirm upload.")
 
             # Idempotent re-confirmation: if already confirmed with this ID, sync state and return success
             if current_status == "uploaded":
@@ -2153,7 +2159,7 @@ class StudioHandler(BaseHTTPRequestHandler):
             if not resolution:
                 raise ValueError("Missing resolution action ('confirm_uploaded' or 'confirm_absent')")
             confirmed = data.get("confirmed", data.get("confirm", True))
-            return resolve_manual_video(vid_id, resolution, data.get("youtube_id", ""), confirmed=confirmed)
+            return resolve_manual_video(vid_id, resolution, data.get("youtube_id", ""), confirmed=confirmed, strict_id=True)
 
         if path == "/api/connections/test":
             return test_youtube_connection()

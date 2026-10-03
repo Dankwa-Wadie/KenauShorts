@@ -729,11 +729,11 @@ class Stage7Phase3Tests(unittest.TestCase):
         self.assertEqual(code, 200)
         self.assertEqual(resp.get("status"), "uploaded")
 
-        # 3. Conflicting re-confirmation with different ID fails with 409 Conflict
+        # 3. Conflicting re-confirmation with different valid 11-char ID fails with 409 Conflict
         code, resp = self.request("POST", "/api/video/resolve", body={
             "id": "v_resolve_upload_1",
             "action": "confirm_uploaded",
-            "youtube_id": "another_id_123",
+            "youtube_id": "dQw4w9WgXcZ",
         }, headers=headers)
         self.assertEqual(code, 409)
 
@@ -784,15 +784,52 @@ class Stage7Phase3Tests(unittest.TestCase):
         }, headers=headers)
         self.assertEqual(code, 409)
 
-        # 7. confirm_uploaded with blank/invalid ID is rejected with 400
+        # 7. Strict 11-character validation: reject too short, too long, empty, or invalid characters
         store.put("videos", "v_invalid_id", {
             "id": "v_invalid_id",
             "status": "upload_unresolved",
         })
+        # Empty ID
         code, resp = self.request("POST", "/api/video/resolve", body={
             "id": "v_invalid_id",
             "action": "confirm_uploaded",
             "youtube_id": "   ",
+        }, headers=headers)
+        self.assertEqual(code, 400)
+
+        # Too short (5 chars)
+        code, _ = self.request("POST", "/api/video/resolve", body={
+            "id": "v_invalid_id", "action": "confirm_uploaded", "youtube_id": "short",
+        }, headers=headers)
+        self.assertEqual(code, 400)
+
+        # Too short (10 chars)
+        code, _ = self.request("POST", "/api/video/resolve", body={
+            "id": "v_invalid_id", "action": "confirm_uploaded", "youtube_id": "1234567890",
+        }, headers=headers)
+        self.assertEqual(code, 400)
+
+        # Too long (12 chars)
+        code, _ = self.request("POST", "/api/video/resolve", body={
+            "id": "v_invalid_id", "action": "confirm_uploaded", "youtube_id": "123456789012",
+        }, headers=headers)
+        self.assertEqual(code, 400)
+
+        # Too long (14 chars)
+        code, _ = self.request("POST", "/api/video/resolve", body={
+            "id": "v_invalid_id", "action": "confirm_uploaded", "youtube_id": "another_id_123",
+        }, headers=headers)
+        self.assertEqual(code, 400)
+
+        # Invalid characters (punctuation)
+        code, _ = self.request("POST", "/api/video/resolve", body={
+            "id": "v_invalid_id", "action": "confirm_uploaded", "youtube_id": "dQw4w9WgXc!",
+        }, headers=headers)
+        self.assertEqual(code, 400)
+
+        # Invalid characters (spaces)
+        code, _ = self.request("POST", "/api/video/resolve", body={
+            "id": "v_invalid_id", "action": "confirm_uploaded", "youtube_id": "dQw4w9 WgXc",
         }, headers=headers)
         self.assertEqual(code, 400)
 
@@ -904,8 +941,160 @@ class Stage7Phase3Tests(unittest.TestCase):
         with patch("core.agent.upload_to_youtube", return_value="yt_uploaded_id_2"):
             worker_module.work("upload", "v_worker_resumable_test")
 
-        after_resumable_count = store.get_local_quota_tracker()["videos_insert_count"]
-        self.assertEqual(after_resumable_count, after_count)
+        # 3. Fresh upload at quota limit fails closed and leaves video in ready status
+        quota_path = self.root / "studio-quota.json"
+        today_pt = store.get_pacific_date()
+        quota_path.write_text(json.dumps({
+            "date_pt": today_pt,
+            "videos_insert_count": 100,
+            "videos_insert_limit": 100,
+        }), encoding="utf-8")
+
+        store.put("videos", "v_worker_quota_blocked", {
+            "id": "v_worker_quota_blocked",
+            "title": "Worker Quota Blocked Test",
+            "status": "ready",
+            "video": "out/test_upload.mp4",
+        })
+
+        with patch("core.agent.upload_to_youtube") as mock_upload:
+            with self.assertRaises(worker_module.QuotaBlockedError):
+                worker_module.work("upload", "v_worker_quota_blocked")
+            mock_upload.assert_not_called()
+
+        rec_blocked = store.get("videos", "v_worker_quota_blocked")
+        self.assertEqual(rec_blocked["status"], "ready")
+        self.assertIn("limit reached", rec_blocked.get("error", "").lower())
+
+        # 4. Quota tracker exception before upload fails closed and leaves video in ready status
+        store.put("videos", "v_worker_tracker_err", {
+            "id": "v_worker_tracker_err",
+            "title": "Worker Tracker Error Test",
+            "status": "ready",
+            "video": "out/test_upload.mp4",
+        })
+
+        with patch("studio.store.check_and_reserve_quota", side_effect=OSError("Disk read failure")):
+            with patch("core.agent.upload_to_youtube") as mock_upload:
+                with self.assertRaises(worker_module.QuotaBlockedError):
+                    worker_module.work("upload", "v_worker_tracker_err")
+                mock_upload.assert_not_called()
+
+        rec_err = store.get("videos", "v_worker_tracker_err")
+        self.assertEqual(rec_err["status"], "ready")
+        self.assertIn("verification failed", rec_err.get("error", "").lower())
+
+        # 5. Upload failure after quota admission transitions to upload_unknown and preserves quota
+        quota_path.write_text(json.dumps({
+            "date_pt": today_pt,
+            "videos_insert_count": 0,
+            "videos_insert_limit": 100,
+        }), encoding="utf-8")
+
+        store.put("videos", "v_worker_transfer_fail", {
+            "id": "v_worker_transfer_fail",
+            "title": "Worker Transfer Fail Test",
+            "status": "ready",
+            "video": "out/test_upload.mp4",
+        })
+
+        def simulate_session_created(uri):
+            store.update_record("videos", "v_worker_transfer_fail", {"resumable_uri": uri})
+
+        def fail_during_transfer(*args, **kwargs):
+            if kwargs.get("on_session_created"):
+                kwargs["on_session_created"]("https://upload.youtube.com/session/fail_session")
+            raise RuntimeError("Connection dropped during video transfer")
+
+        with patch("core.agent.upload_to_youtube", side_effect=fail_during_transfer):
+            with self.assertRaises(RuntimeError):
+                worker_module.work("upload", "v_worker_transfer_fail")
+
+        rec_fail = store.get("videos", "v_worker_transfer_fail")
+        self.assertEqual(rec_fail["status"], "upload_unknown")
+        # Quota remains accounted for since Google initialized the upload resource
+        self.assertEqual(store.get_local_quota_tracker()["videos_insert_count"], 1)
+
+    def test_concurrent_upload_quota_reservation_race_prevention(self):
+        """Test atomic check_and_reserve_quota prevents concurrent workers from exceeding upload limit."""
+        quota_path = self.root / "studio-quota.json"
+        today_pt = store.get_pacific_date()
+        quota_path.write_text(json.dumps({
+            "date_pt": today_pt,
+            "videos_insert_count": 0,
+            "videos_insert_limit": 1,
+        }), encoding="utf-8")
+
+        success_count = [0]
+        failed_count = [0]
+        lock = threading.Lock()
+
+        def try_reserve_upload():
+            allowed, _ = store.check_and_reserve_quota("videos_insert", 1)
+            with lock:
+                if allowed:
+                    success_count[0] += 1
+                else:
+                    failed_count[0] += 1
+
+        threads = [threading.Thread(target=try_reserve_upload) for _ in range(8)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        self.assertEqual(success_count[0], 1)
+        self.assertEqual(failed_count[0], 7)
+        final_tracker = store.get_local_quota_tracker()
+        self.assertEqual(final_tracker["videos_insert_count"], 1)
+
+    def test_discover_youtube_fail_closed_on_quota_exceptions(self):
+        """Test discover_youtube fails closed when quota verification raises an exception."""
+        # 1. Preflight exception
+        stats_pre = {}
+        with patch("studio.store.get_local_quota_tracker", side_effect=OSError("Disk failure")):
+            with patch("requests.get") as mock_get:
+                res = agent.discover_youtube(["q1", "q2"], api_key="dummy_key", stats=stats_pre)
+                self.assertEqual(len(res), 0)
+                mock_get.assert_not_called()
+                self.assertTrue(stats_pre.get("quota_tracker_failed"))
+                self.assertTrue(stats_pre.get("search_quota_blocked"))
+                explanation = agent.generate_idle_explanation(stats_pre)
+                self.assertEqual(explanation, "YouTube quota tracking failed; search queries aborted to fail closed")
+
+        # 2. Per-query check_and_reserve_quota exception
+        stats_per = {}
+        with patch("studio.store.check_and_reserve_quota", side_effect=RuntimeError("Lock error")):
+            with patch("requests.get") as mock_get:
+                res2 = agent.discover_youtube(["q1", "q2"], api_key="dummy_key", stats=stats_per)
+                self.assertEqual(len(res2), 0)
+                mock_get.assert_not_called()
+                self.assertTrue(stats_per.get("quota_tracker_failed"))
+                self.assertTrue(stats_per.get("search_quota_blocked"))
+                explanation2 = agent.generate_idle_explanation(stats_per)
+                self.assertEqual(explanation2, "YouTube quota tracking failed; search queries aborted to fail closed")
+
+    def test_multi_process_quota_safety_and_file_lock(self):
+        """Test that _quota_lock_guard creates and acquires studio-quota.lock across threads/processes."""
+        lock_file = self.root / "studio-quota.lock"
+
+        # Recording activity creates and utilizes the file lock
+        store.record_local_quota_activity("search_list", 1)
+        self.assertTrue(lock_file.exists())
+
+        # Test concurrent activity under multi-process lock guard
+        def bump_quota():
+            for _ in range(5):
+                store.record_local_quota_activity("general", 1)
+
+        threads = [threading.Thread(target=bump_quota) for _ in range(6)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        tracker = store.get_local_quota_tracker()
+        self.assertEqual(tracker["general_units"], 30)
 
     def test_discovery_diagnostics_distinguish_failures_from_empty(self):
         """Test that generate_idle_explanation distinguishes upstream source failures from valid empty results."""
@@ -933,6 +1122,26 @@ class Stage7Phase3Tests(unittest.TestCase):
         }
         exp_failed = agent.generate_idle_explanation(stats_failed)
         self.assertIn("Discovery queries failed due to network or upstream API errors (2 failure(s))", exp_failed)
+
+        # Case C: Quota tracker failure occurred
+        stats_tracker_err = {
+            "total_discovered_raw": 0,
+            "unique_candidates": 0,
+            "quota_tracker_failed": True,
+            "rejected_by_reason": {},
+        }
+        exp_tracker = agent.generate_idle_explanation(stats_tracker_err)
+        self.assertEqual(exp_tracker, "YouTube quota tracking failed; search queries aborted to fail closed")
+
+        # Case D: Google quotaExceeded circuit breaker tripped
+        stats_google_ex = {
+            "total_discovered_raw": 0,
+            "unique_candidates": 0,
+            "google_quota_exhausted": True,
+            "rejected_by_reason": {},
+        }
+        exp_google = agent.generate_idle_explanation(stats_google_ex)
+        self.assertEqual(exp_google, "YouTube search quota exhausted by upstream API; 0 candidates from other sources")
 
     def test_quota_persistence_resilience_and_corrupt_recovery(self):
         """Test recovery from corrupt or malformed studio-quota.json file."""

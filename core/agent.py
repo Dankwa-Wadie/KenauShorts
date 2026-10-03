@@ -417,16 +417,24 @@ def discover_youtube(queries: list[str], api_key: str, per_query: int = 8,
                 }
         return []
 
-    # Local pre-flight quota guard: enforce 100 search calls/day limit and circuit breaker
+    # Local pre-flight quota guard: enforce search limit and circuit breaker (fail closed)
     try:
         tracker = store.get_local_quota_tracker()
         search_limit = int(tracker.get("search_list_limit", 100))
         search_used = int(tracker.get("search_list_count", 0))
         quota_exhausted = bool(tracker.get("google_quota_exhausted", False))
-    except Exception:
-        search_limit = 100
-        search_used = 0
-        quota_exhausted = False
+    except Exception as q_err:
+        LOG.error("YouTube quota tracker preflight verification failed: %s — failing closed.", q_err)
+        emit_progress("YouTube quota tracker unavailable — skipping search")
+        if stats is not None:
+            stats["quota_tracker_failed"] = True
+            stats["search_quota_blocked"] = True
+            stats.setdefault("sources", {})["youtube_search"] = {
+                "attempted": 0, "configured": len(queries), "candidates": 0,
+                "failures": len(queries), "skipped_quota": len(queries),
+                "quota_tracker_error": str(q_err),
+            }
+        return []
 
     if quota_exhausted or search_used >= search_limit:
         LOG.warning("YouTube search quota blocked (exhausted=%s, %d/%d) — skipping search-based clip source.",
@@ -449,22 +457,30 @@ def discover_youtube(queries: list[str], api_key: str, per_query: int = 8,
     }
 
     for q in queries:
-        # Atomically check quota availability and reserve 1 unit before making HTTP request
+        # Atomically check quota availability and reserve 1 unit before making HTTP request (fail closed)
         try:
             can_proceed, curr_tracker = store.check_and_reserve_quota("search_list", 1)
-            if not can_proceed:
-                is_google_ex = bool(curr_tracker.get("google_quota_exhausted", False))
-                LOG.warning("YouTube search quota blocked (exhausted=%s, count=%d/%d) while evaluating %r — stopping search.",
-                            is_google_ex, curr_tracker.get("search_list_count", 0),
-                            curr_tracker.get("search_list_limit", search_limit), q)
-                if stats is not None:
-                    stats["search_quota_blocked"] = True
-                    if is_google_ex:
-                        stats["google_quota_exhausted"] = True
-                yt_stats["skipped_quota"] += len(queries) - yt_stats["attempted"]
-                break
-        except Exception:
-            pass
+        except Exception as q_err:
+            LOG.error("Failed to check/reserve quota for query %r: %s — failing closed.", q, q_err)
+            if stats is not None:
+                stats["quota_tracker_failed"] = True
+                stats["search_quota_blocked"] = True
+            remaining = len(queries) - yt_stats["attempted"]
+            yt_stats["failures"] += remaining
+            yt_stats["skipped_quota"] += remaining
+            break
+
+        if not can_proceed:
+            is_google_ex = bool(curr_tracker.get("google_quota_exhausted", False))
+            LOG.warning("YouTube search quota blocked (exhausted=%s, count=%d/%d) while evaluating %r — stopping search.",
+                        is_google_ex, curr_tracker.get("search_list_count", 0),
+                        curr_tracker.get("search_list_limit", search_limit), q)
+            if stats is not None:
+                stats["search_quota_blocked"] = True
+                if is_google_ex:
+                    stats["google_quota_exhausted"] = True
+            yt_stats["skipped_quota"] += len(queries) - yt_stats["attempted"]
+            break
 
         params: dict[str, Any] = {
             "part": "snippet", "q": q, "type": "video", "order": "viewCount",
@@ -676,7 +692,9 @@ def generate_idle_explanation(stats: dict[str, Any]) -> str:
     if not stats:
         return "No new candidates to process"
 
-    quota_blocked = bool(stats.get("search_quota_blocked", False) or stats.get("google_quota_exhausted", False))
+    quota_tracker_failed = bool(stats.get("quota_tracker_failed", False))
+    google_exhausted = bool(stats.get("google_quota_exhausted", False))
+    quota_blocked = bool(stats.get("search_quota_blocked", False) or google_exhausted)
     total_raw = int(stats.get("total_discovered_raw", 0))
     unique = int(stats.get("unique_candidates", 0))
     rejections = dict(stats.get("rejected_by_reason", {}))
@@ -689,6 +707,12 @@ def generate_idle_explanation(stats: dict[str, Any]) -> str:
         for s_data in sources.values():
             if isinstance(s_data, dict):
                 total_failures += int(s_data.get("failures", 0))
+
+    if quota_tracker_failed and total_raw == 0:
+        return "YouTube quota tracking failed; search queries aborted to fail closed"
+
+    if google_exhausted and total_raw == 0:
+        return "YouTube search quota exhausted by upstream API; 0 candidates from other sources"
 
     if quota_blocked and total_raw == 0:
         return "YouTube search quota limit reached; 0 candidates from other sources"
@@ -1266,9 +1290,14 @@ def upload_to_youtube(
 
     if record_quota:
         try:
-            store.record_local_quota_activity("videos_insert", 1)
+            can_proceed, q_tracker = store.check_and_reserve_quota("videos_insert", 1)
+            if not can_proceed:
+                limit = q_tracker.get("videos_insert_limit", 100)
+                used = q_tracker.get("videos_insert_count", 0)
+                raise RuntimeError(f"YouTube upload quota limit reached ({used}/{limit}) — upload postponed.")
         except Exception as q_err:
-            LOG.warning("Failed to record videos_insert quota unit: %s", q_err)
+            LOG.error("YouTube upload quota verification failed: %s — failing closed.", q_err)
+            raise
 
     from googleapiclient.discovery import build
     from googleapiclient.http import MediaFileUpload

@@ -17,6 +17,7 @@ config.json
 state.json
 studio-settings.json
 studio-quota.json
+studio-quota.lock
 studio-channel.json
 .pipeline.lock
 .studio.lock

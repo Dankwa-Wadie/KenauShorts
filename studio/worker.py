@@ -24,6 +24,10 @@ from studio import store
 
 LOG = logging.getLogger("kenaushorts.worker")
 
+class QuotaBlockedError(RuntimeError):
+    """Raised when YouTube API quota is exceeded or unverified before upload."""
+    pass
+
 def work(action: str, key: str) -> None:
     store.load_secrets()
     with store.pipeline_lock():
@@ -77,9 +81,15 @@ def work(action: str, key: str) -> None:
                 agent.emit_progress("Preparing YouTube upload")
                 if not resumable_uri:
                     try:
-                        store.record_local_quota_activity("videos_insert", 1)
+                        can_proceed, q_tracker = store.check_and_reserve_quota("videos_insert", 1)
+                        if not can_proceed:
+                            limit = q_tracker.get("videos_insert_limit", 100)
+                            used = q_tracker.get("videos_insert_count", 0)
+                            raise QuotaBlockedError(f"YouTube upload quota limit reached ({used}/{limit}) — upload postponed.")
+                    except QuotaBlockedError:
+                        raise
                     except Exception as q_err:
-                        LOG.warning("Failed to record videos_insert quota unit: %s", q_err)
+                        raise QuotaBlockedError(f"YouTube upload quota verification failed: {q_err} — failing closed.")
                 vid_id = agent.upload_to_youtube(
                     video_path=video_file,
                     title=record["title"],
@@ -171,12 +181,25 @@ def work(action: str, key: str) -> None:
                     })
                     LOG.warning("Upload outcome for %s is ambiguous (%s); set to upload_unknown", key, e)
                 else:
-                    latest_rec.update(
-                        status="failed",
-                        error=err_msg,
+                    is_quota_blocked = (
+                        isinstance(e, QuotaBlockedError)
+                        or ("quota" in err_msg.lower() and ("limit reached" in err_msg.lower() or "verification failed" in err_msg.lower()))
                     )
-                    store.put("videos", key, latest_rec)
-                    agent.emit_summary({"status": "failed", "message": err_msg})
+                    if is_quota_blocked:
+                        latest_rec.update(
+                            status="ready",
+                            error=err_msg,
+                        )
+                        store.put("videos", key, latest_rec)
+                        agent.emit_summary({"status": "blocked", "message": err_msg})
+                        LOG.warning("Upload for %s blocked by quota governance: %s", key, err_msg)
+                    else:
+                        latest_rec.update(
+                            status="failed",
+                            error=err_msg,
+                        )
+                        store.put("videos", key, latest_rec)
+                        agent.emit_summary({"status": "failed", "message": err_msg})
                 raise
 
         elif action == "render":

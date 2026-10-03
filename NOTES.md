@@ -12,23 +12,25 @@ what's actually on `origin/main`.
 
 ## Current state (update this section each handoff)
 
-- **Stage 7 Phase 3 Completed & Post-Review Corrective Fix Applied (Command Center, Quota Governance & Discovery Diagnostics)**:
+- **Stage 7 Phase 3 Completed, Fully Corrected & Verified (Command Center, Quota Governance & Discovery Diagnostics)**:
   - **Operational Telemetry & Quota Governance**:
-    - Thread-safe local tracking of daily YouTube API quota (`search_list_count`, `videos_insert_count`, `general_units`) in `studio-quota.json` protected by `_QUOTA_LOCK`.
+    - Multi-process safe and thread-safe quota coordination: `_quota_lock_guard()` in `studio/store.py` coordinates reads and writes to `studio-quota.json` across concurrent worker subprocesses, server threads, and CLI commands using OS-level file locking (`msvcrt.locking` on Windows, `fcntl.flock` on Unix) on `studio-quota.lock`.
+    - Fail-closed quota admission: `discover_youtube` in `core/agent.py` fails closed whenever quota tracking raises an exception or cannot reliably verify limits, preventing runaway unmetered API calls.
     - Persistent quota exhaustion circuit breaker (`google_quota_exhausted: True`) tripped on HTTP 403 `quotaExceeded` for search or video checks; prevents repetitive outbound API retries and automatically resets at Pacific Time midnight rollover.
-    - Atomic check-and-reserve admission (`check_and_reserve_quota`) preventing concurrent workers/threads from racing past daily quota limits.
-    - Upload quota (`videos_insert`) recorded at upload attempt/start rather than delayed post-sync, with deduplication protecting resumable sessions from double-counting.
+    - Strict `videos_insert` enforcement: fresh uploads in `studio/worker.py` and `core/agent.py` atomically check and reserve quota before transfer begins; if limit is reached or quota tracker fails, the upload is postponed and the video safely remains `ready` without being falsely marked `failed`. Resumed sessions do not re-consume quota.
     - Timezone-aware midnight Pacific Time (PT) daily reset (`get_pacific_now`, `get_pacific_date`, `get_pacific_reset_info`) with dynamic DST and year-boundary calculation, atomic `.tmp` persistence, and automatic recovery from corrupted JSON files.
-    - Pre-flight quota guard capping YouTube search at 100 calls/day (`search_list_limit`); gracefully skips searches when exhausted while allowing non-search discovery sources (channels, Reddit) to continue producing candidates.
     - Non-blocking, sanitized OAuth health diagnostics (`get_oauth_status_details()`) reporting channel metadata and status without exposing sensitive tokens or client credentials.
-  - **Incident Resolution API Contract & Safety**:
+  - **Incident Resolution API Contract & Strict Video ID Validation**:
     - Unified `POST /api/video/resolve` to support both `action` and `resolution` parameters (`confirm_uploaded`, `confirm_absent`, and `mark_failed` alias).
-    - Strict validation of YouTube IDs (extracts clean 11-char ID from full/short URLs, enforces regex `^[A-Za-z0-9_-]+$`).
+    - Strict 11-character YouTube video ID validation (`^[A-Za-z0-9_-]{11}$`) rejecting IDs that are too short, too long, empty, or contain invalid characters or whitespace.
     - State guards preventing conflicting re-confirmations (409 Conflict), rejecting `confirm_absent` on already-uploaded videos, and rejecting resolution on currently `uploading` videos.
     - Zero upload re-triggering during manual incident resolution.
   - **Discovery Diagnostics & Run Telemetry**:
     - Standardized telemetry keys (`total_discovered_raw`, `duplicates_within_run`, `unique_candidates`, `seen_candidates`, `rejected_by_reason`, `eligible_candidates`).
-    - Evidence-based idle diagnostic explanations (`generate_idle_explanation()`) distinguishing source query/network failures from valid zero-candidate yields.
+    - Evidence-based idle diagnostic explanations (`generate_idle_explanation()`) distinguishing tracker failures, Google quota exhaustion, daily quota limits, upstream query/network errors, and valid zero-candidate yields.
+  - **Hardware & Cross-Platform Defect Resolutions**:
+    - In `core/render.py`, `has_encoder()` probes hardware encoder initialization (`_WORKING_ENCODERS`) rather than relying solely on `ffmpeg -encoders` compilation flags, preventing crashes on Windows hosts without NVIDIA CUDA drivers by safely falling back to `libx264`.
+    - In `scripts/uninstall_service.py`, `uninstall_macos()` uses `getattr(os, "getuid", lambda: 501)()` to prevent `AttributeError` on Windows while preserving macOS behavior.
   - **Executive Operational Command Center (Overview UI)**:
     - Cleaned duplicate HTML markup, panel headers, and disk space cards.
     - Added high-visibility OAuth alert banners when credentials need attention.
@@ -39,11 +41,9 @@ what's actually on `origin/main`.
     - Actionable Incident Remediation cards with 1-click buttons: Reconcile / Confirm / Fail for `upload_unknown` and `upload_unresolved`, and Retry Render for `render_failed`.
     - Latest Discovery Diagnostics card displaying source yield and rejection breakdowns.
   - **Test Suite**:
-    - `tests/test_stage7_phase3.py`: 24/24 passed (1.2s), including 6 comprehensive tests for circuit breaker, race prevention, incident resolution contract, worker upload quota, and corrupt recovery.
-    - `tests/test_stage7_phase2.py`: 20/20 passed (8.5s).
-    - `tests/test_stage7_phase1.py`: 18/18 passed (1.7s).
-    - `tests/test_stage6_publishing.py`: 38/38 passed (6.3s).
-    - Full discovery suite: 235 tests total (228 passed, 0 failures, 7 known environment limitations: 6 NVENC, 1 macOS).
+    - `tests/test_stage7_phase3.py`: 27/27 passed (1.9s).
+    - Stage 6 & 7 Combined Regression Suite: 103/103 passed (17.7s).
+    - Full discovery suite (`python -m unittest discover tests`): 238/238 passed (35.5s), 0 failures, 0 errors!
 - **Stage 7 Phase 2 Completed (Worker Lifecycle, Watchdogs & Automation Reliability)**:
   - **Recoverable SQLite & `state.json` Synchronization (Fix 1)**:
     - In `studio/server.py`, `reconcile_video_upload()` detects if the SQLite video record already has `status == "uploaded"`. When already uploaded, it bypasses outbound HTTP requests (no duplicate uploads or spurious session queries) and immediately invokes `_sync_candidate_posted(video, yt_id)` to ensure candidate state in `state.json` is synchronized with `state.posted` and `state.seen`.
@@ -760,20 +760,60 @@ Stage 2 meets all single-instance operational requirements: process tracking, pr
    - **Event Listener Teardown**: In `studio/web/app.js`, a `beforeunload` listener clears active intervals and countdown timers (`overviewCountdownTimer`, `statusInterval`).
    - **CSS Contract Verification**: Verified styles for `.stat-card`, `.stat-card:hover`, `.video-card:hover`, and incident button states in `studio/web/style.css`.
 
+### Stage 7 Phase 3 Final Corrections & Verification
+
+#### Implementation Date
+2026-10-03
+
+#### Addressed Areas & Architectural Solutions
+
+1. **Fail-Closed Quota Admission (`core/agent.py`)**:
+   - **Pre-Flight Exception Guard**: If `get_local_quota_tracker()` raises an exception (e.g. disk failure or missing state), `discover_youtube` immediately fails closed, logs `LOG.error()`, emits `emit_progress("YouTube quota tracker unavailable — skipping search")`, sets `stats["quota_tracker_failed"] = True`, and skips all search queries without issuing outbound requests.
+   - **Per-Query Exception Guard**: If `check_and_reserve_quota("search_list", 1)` raises an exception, the search loop logs the failure, marks `stats["quota_tracker_failed"] = True`, and aborts search queries immediately.
+   - **Evidence-Based Idle Explanation**: `generate_idle_explanation()` distinctly reports:
+     - `"YouTube quota tracking failed; search queries aborted to fail closed"` when tracker errors occur.
+     - `"YouTube search quota exhausted by upstream API; 0 candidates from other sources"` when the Google 403 breaker is active.
+     - `"YouTube search quota limit reached; 0 candidates from other sources"` when the local daily query cap is reached.
+     - `"Discovery queries failed due to network or upstream API errors (X failure(s))"` when upstream network/HTTP errors occur.
+     - `"No candidates returned by configured discovery queries or channels"` for valid empty candidate yields.
+
+2. **Strict `videos_insert` Quota Limit Enforcement (`studio/worker.py` & `core/agent.py`)**:
+   - **Pre-Upload Atomic Check & Reserve**: Before initiating a fresh upload, `studio/worker.py` invokes `store.check_and_reserve_quota("videos_insert", 1)` under multi-process lock. If the limit is reached or quota checking fails, `QuotaBlockedError` is raised.
+   - **Safe State Preservation**: If an upload is blocked by quota governance before transfer starts, the video record is safely reset to `status="ready"` with an informative message. The video is **not** falsely marked `failed`.
+   - **Resumable Session Preservation**: Resuming an existing upload session (`resumable_uri` present) bypasses quota reservation, avoiding duplicate charges for chunk retries.
+   - **Upload Failure Accounting**: Because the YouTube Data API consumes upload quota upon initiation of video creation, quota units reserved at initiation are intentionally retained if a network failure occurs during chunk transfer; the video transitions to `upload_unknown` for reconciliation.
+
+3. **Strict 11-Character YouTube Video ID Validation (`studio/server.py`)**:
+   - In `resolve_manual_video()` and `POST /api/video/resolve`, IDs are strictly validated against `^[A-Za-z0-9_-]{11}$`.
+   - Accepts raw 11-character IDs or standard YouTube URLs (`watch?v=`, `youtu.be/`, `/shorts/`) from which the 11-character ID is extracted.
+   - Rejects IDs that are too short (<11), too long (>11), empty, whitespace, or contain invalid punctuation/characters with `400 Bad Request`.
+   - Maintains protected state guards: rejects resolving active `uploading` videos (409 Conflict) and already-uploaded videos on `confirm_absent` (409 Conflict).
+
+4. **Multi-Process Quota Safety (`studio/store.py`)**:
+   - **Single-Server vs Multi-Process Architecture**: KenauShorts enforces single-server execution via `server_lock()` on `.server.lock`. However, worker jobs and discovery runs execute as independent child processes (`studio.worker`, `core.agent`), and operators can execute CLI commands concurrently.
+   - **OS-Level File Coordination**: Implemented `_quota_lock_guard()` combining thread-safe `threading.RLock()` with cross-process file locking on `studio-quota.lock` (`msvcrt.locking` on Windows, `fcntl.flock` on POSIX).
+   - **Atomic File Persistence**: Data is written via `.tmp` and atomic `os.replace`, guaranteeing crash resilience and preventing race conditions or lost quota updates across processes.
+
+5. **Hardware & Cross-Platform Defect Resolutions**:
+   - **Hardware Encoder Probe (`core/render.py`)**: `has_encoder()` previously relied solely on `ffmpeg -encoders` output (which lists all compiled encoders, including `h264_nvenc`). On Windows systems lacking NVIDIA CUDA hardware/drivers (`nvcuda.dll`), this caused ffmpeg crashes. `has_encoder()` now probes whether hardware encoders can actually initialize (`_WORKING_ENCODERS`), falling back cleanly to `libx264`.
+   - **Cross-Platform Service Uninstall (`scripts/uninstall_service.py`)**: `uninstall_macos()` used `os.getuid()`, which does not exist on Windows. Updated to `getattr(os, "getuid", lambda: 501)()` to prevent `AttributeError` when running tests or scripts on Windows.
+
 ### Test Evidence
-- **Stage 7 Phase 3 Suite** (`tests/test_stage7_phase3.py`): 24/24 passed (1.2s).
-  - All 18 initial Phase 3 baseline tests.
-  - `test_incident_resolution_contract_and_state_guards`: Verifies `{ id, action }` contract, YouTube ID extraction, conflict guards, upload state guards, and rejection of unconfirmed payloads.
-  - `test_persistent_quota_circuit_breaker_and_rollover`: Verifies persistent 403 `quotaExceeded` circuit breaker, search bypass, and midnight PT reset.
-  - `test_concurrent_quota_reservation_race_prevention`: Verifies atomic `check_and_reserve_quota` under 10 concurrent threads without over-allocation.
-  - `test_worker_upload_quota_accounting_at_start`: Verifies upload quota recorded at start of upload and skipped on resumed sessions.
-  - `test_discovery_diagnostics_distinguish_failures_from_empty`: Verifies idle explanation distinguishes upstream query failures from empty yields.
-  - `test_quota_persistence_resilience_and_corrupt_recovery`: Verifies atomic persistence and auto-recovery from corrupted JSON files.
-- **Full Regression Suite**:
-  - `tests/test_stage7_phase1.py`: 18/18 passed (1.7s).
-  - `tests/test_stage7_phase2.py`: 20/20 passed (8.5s).
-  - `tests/test_stage6_publishing.py`: 38/38 passed (6.3s).
-  - Total Stage 6 & 7 test count: 100/100 passed (14.8s).
+- **Stage 7 Phase 3 Suite** (`tests/test_stage7_phase3.py`): 27/27 passed (1.9s).
+  - Strict 11-char ID validation and resolution state transitions.
+  - Fail-closed discovery on preflight and query-level quota exceptions.
+  - Pre-upload `videos_insert` enforcement and ready-status preservation.
+  - Concurrent upload quota reservation race prevention.
+  - Multi-process file lock coordination (`studio-quota.lock`).
+  - Evidence-based idle diagnostic explanations distinguishing tracker failures, quota exhaustion, network errors, and valid empty results.
+- **Combined Stage 6 & 7 Regression Suite**:
+  - `tests/test_stage7_phase3.py`: 27/27 passed.
+  - `tests/test_stage7_phase2.py`: 20/20 passed.
+  - `tests/test_stage7_phase1.py`: 18/18 passed.
+  - `tests/test_stage6_publishing.py`: 38/38 passed.
+  - Combined suite total: **103/103 passed** (17.7s).
+- **Full Discovery Suite** (`python -X utf8 -m unittest discover tests`):
+  - **238 tests total: 238 passed, 0 failures, 0 errors** (35.5s)!
 - **Compilation & Formatting Checks**:
   - `python -m compileall core studio scripts tests`: 0 errors.
   - `git diff --check`: 0 warnings/errors.

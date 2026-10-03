@@ -409,6 +409,7 @@ PROBE_TIMEOUT: float = 15.0
 ENCODER_TIMEOUT: float = 10.0
 
 _ENCODERS_CACHE: str | None = None
+_WORKING_ENCODERS: dict[str, bool] = {}
 
 def has_encoder(name: str) -> bool:
     global _ENCODERS_CACHE
@@ -420,7 +421,26 @@ def has_encoder(name: str) -> bool:
             ).stdout
         except (subprocess.TimeoutExpired, FileNotFoundError):
             _ENCODERS_CACHE = ""
-    return name in (_ENCODERS_CACHE or "")
+
+    if name not in (_ENCODERS_CACHE or ""):
+        return False
+
+    # For hardware-accelerated encoders, probe if driver/hardware can actually initialize
+    if name in ("h264_nvenc", "h264_videotoolbox", "h264_qsv", "hevc_nvenc"):
+        if name not in _WORKING_ENCODERS:
+            try:
+                probe = subprocess.run(
+                    ["ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+                     "-f", "lavfi", "-i", "color=c=black:s=64x64:d=0.04",
+                     "-c:v", name, "-f", "null", "-"],
+                    capture_output=True, check=False, timeout=ENCODER_TIMEOUT,
+                )
+                _WORKING_ENCODERS[name] = (probe.returncode == 0)
+            except Exception:
+                _WORKING_ENCODERS[name] = False
+        return _WORKING_ENCODERS[name]
+
+    return True
 
 def video_encoder_args(config: dict[str, Any]) -> list[str]:
     posting = config.get("posting", {})
