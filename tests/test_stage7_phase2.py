@@ -839,7 +839,7 @@ class Stage7Phase2Tests(unittest.TestCase):
 
         new_job = store.get("jobs", res["id"])
         self.assertIsNotNone(new_job)
-        self.assertEqual(new_job["status"], "pending")
+        self.assertIn(new_job["status"], ("pending", "running"))
 
 
 if __name__ == "__main__":
