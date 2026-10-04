@@ -12,6 +12,40 @@ what's actually on `origin/main`.
 
 ## Current state (update this section each handoff)
 
+- **Stage 7 Phase 4 Milestone 2 Completed & Verified (Retention Reference Engine & Dry-Run Audit API)**:
+  - **Safe Retention Reference Engine (`studio/retention.py`)**:
+    - Strictly read-only, non-destructive audit engine for candidate raw downloads in `work/`. Real deletion pathways are NOT implemented. No files are deleted, moved, renamed, truncated, or modified.
+    - Uploaded output MP4s and poster PNGs are permanent and never deleted.
+    - Verified raw-download naming convention: `work/short_{epoch}_{key}_raw.mp4`.
+    - Strict acquisition epoch assessment: File age is computed directly from the acquisition epoch embedded in the filename (`now - epoch`). Never falls back to Windows `ctime`, filesystem `mtime`, or `videos.created_at`.
+    - Enforces 7-day retention threshold (604,800s): Files `>= 604,800s` are `age_eligible`; files `< 604,800s` are `too_young`. Validates epoch bounds (`1_000_000_000` to `2_500_000_000`) and rejects clock-skewed future timestamps (`> now + 300s`) with `invalid_timestamp`.
+  - **Discovery Rules & Windows Path Safety**:
+    - Discovers `.mp4` candidate files ending in `_raw.mp4` directly inside `ROOT / "work"`. Subdirectory scanning is rejected (`not a direct child`).
+    - Traversal prevention: Verifies resolved file path is strictly contained within the approved `work/` directory (`relative_to` validation).
+    - Windows reparse point and symlink rejection: Rejects symlinks and directory junctions via `os.path.islink()` and Windows `FILE_ATTRIBUTE_REPARSE_POINT` (0x0400). Rejects Windows Alternate Data Streams (`:`). Case-insensitive Windows path comparisons normalized via `os.path.normcase()`.
+  - **Conservative Reference Detection & Fail-Closed State Inspection**:
+    - Inspects SQLite tables (`videos`, `jobs`), queue state, re-render lineage (`_edit_`), and `state.json` under read-only transactions.
+    - References tracked:
+      - SQLite video records matching canonical raw path `f"{id}_raw.mp4"` or explicit `raw_video` field.
+      - Re-render source lineage: video records with `_edit_` in `id` preserve the original `{orig_key}_raw.mp4` as re-render source.
+      - Active and pending jobs in SQLite (`jobs` with status `pending` or `running`).
+      - In-progress, unresolved, or pending retry workflows (`ready`, `rendering`, `uploading`, `upload_unknown`, `upload_unresolved`, `failed`, `render_failed`).
+      - Host execution state: active pipeline lock (`.pipeline.lock`).
+    - Fail-closed behavior: Any database error, unreadable SQLite file, or corrupt `state.json` fails closed with `unknown_reference` without assuming files are unreferenced.
+  - **Deterministic Safety Classification Precedence**:
+    - Precedence: (1) `inspection_error` -> (2) `invalid_path` / `invalid_metadata` -> (3) `unknown_reference` -> (4) `unknown_age` / `invalid_timestamp` -> (5) `referenced` -> (6) `too_young` -> (7) `age_eligible_unreferenced`.
+    - Only files confirmed unreferenced across all successfully inspected state sources and `>= 7 days` old are classified as `age_eligible_unreferenced` (retention review candidates).
+  - **Dry-Run Audit API (`GET` and `POST` `/api/retention/audit` & `/api/retention`)**:
+    - Exposed on local Studio server in `studio/server.py`.
+    - Returns structured JSON with `"mode": "dry_run"`, `"deletion_occurred": false`, `"deletion_enabled": false`, summary metrics (file counts, estimated reclaimable bytes/MB), and sanitized per-file diagnostics with zero internal absolute path leakage.
+  - **Test Suite**:
+    - `tests/test_stage7_phase4_retention.py`: 35 tests passed (1 skip on Windows symlink privilege, while mocked reparse detection passed). Covers discovery, path traversal, ADS rejection, age thresholds, future timestamp rejection, reference detection across drafts, active/queued jobs, re-render lineage, corrupt DB/state fail-closed, safety precedence, dry-run guarantees, and server integration.
+    - Full repository test discovery suite: 307/307 passed (56.8s, 0 failures, 0 errors, 1 skipped).
+  - **Remaining Stage 7 Phase 4 Milestones**:
+    - Milestone 3: Quota-aware scheduling, jitter, and PT rollover resumption.
+    - Milestone 4: Operational alert lifecycle and SQLite partial index (`studio/alerts.py`).
+    - Milestone 5: Independent health telemetry and diagnostic stall alerts (`studio/supervisor.py`).
+    - Milestone 6: Frontend integration and end-to-end verification.
 - **Stage 7 Phase 4 Milestone 1 Completed & Verified (Configuration Integrity, Cross-Process Locking & Atomic Persistence)**:
   - **Standalone Settings Module (`studio/settings.py`)**:
     - Centralized access to `studio-settings.json` with typed exceptions (`SettingsError`, `SettingsLockError`, `ConfigurationCorruptError`).

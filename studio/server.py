@@ -39,6 +39,7 @@ if __name__ == "__main__" and __package__ is None:
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from core.style_presets import STYLE_PRESETS
+from studio import retention as studio_retention
 from studio import settings as studio_settings
 from studio import store
 
@@ -100,7 +101,7 @@ def probe_network_connectivity() -> bool:
     """Raw socket probe to check external connectivity outside of any locks."""
     for host in ("www.google.com", "1.1.1.1"):
         try:
-            with socket.create_connection((host, 443), timeout=3):
+            with socket.create_connection((host, 443), timeout=1):
                 return True
         except OSError:
             pass
@@ -1896,6 +1897,15 @@ class StudioHandler(BaseHTTPRequestHandler):
             self.send_json(enriched)
             return
 
+        if path in ("/api/retention/audit", "/api/retention"):
+            try:
+                audit_result = studio_retention.audit_retention(root=ROOT)
+                self.send_json(audit_result)
+            except Exception as e:
+                LOG.error("Failed to execute retention audit: %s", e)
+                self.send_json({"error": "Retention audit failed. Check the local service log."}, 500)
+            return
+
         if path == "/api/failures":
             state_path = ROOT / "state.json"
             data = read_json(state_path, {})
@@ -2096,6 +2106,9 @@ class StudioHandler(BaseHTTPRequestHandler):
             self.send_json({"error": "The action could not be completed. Check the local service log."}, 500)
 
     def mutate(self, path: str, data: dict) -> dict | None:
+        if path in ("/api/retention/audit", "/api/retention"):
+            return studio_retention.audit_retention(root=ROOT)
+
         if path == "/api/job/cancel":
             return cancel_job(data.get("id"))
 
