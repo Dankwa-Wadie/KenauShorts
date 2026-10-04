@@ -12,6 +12,33 @@ what's actually on `origin/main`.
 
 ## Current state (update this section each handoff)
 
+- **Stage 7 Phase 4 Milestone 1 Completed & Verified (Configuration Integrity, Cross-Process Locking & Atomic Persistence)**:
+  - **Standalone Settings Module (`studio/settings.py`)**:
+    - Centralized access to `studio-settings.json` with typed exceptions (`SettingsError`, `SettingsLockError`, `ConfigurationCorruptError`).
+    - Cross-process OS file locking on `studio-settings.lock` combining `threading.RLock()` with `msvcrt.locking` on Windows (`fcntl.flock` on POSIX) with a 5.0s bounded timeout and fail-closed semantics.
+    - Thread-local reentrancy tracking (`_LOCAL = threading.local()`) enabling nested `load_settings()` and `update_settings()` operations within the same thread without file-handle self-deadlocks.
+    - Strict global lock hierarchy adherence: `GUARD (Level 1) -> studio-settings.lock (Level 2) -> studio-quota.lock (Level 3) -> SQLite WAL (Level 4)`. Locks are never held across long I/O, network calls, rendering, or subprocess execution.
+  - **Schema Validation & Unknown-Field Preservation**:
+    - `validate_settings_schema()` enforces strict types: `enabled` (bool), `interval_hours` (strictly finite numeric 1-168, non-bool, rejects `NaN`/`inf`), `mode` ("preview", "publish", with "publish_approved" normalized to "publish"), `auto_discovery_publish_opt_in` (bool), `next_run` (strictly finite non-negative numeric), `consecutive_failures` (non-negative int), and quota suspension fields.
+    - Aligned `DEFAULT_SETTINGS` and `DEFAULT_AUTOMATION` strictly to the approved Milestone 1 scope (`{"enabled": False, "interval_hours": 5, "mode": "preview", "next_run": 0, "auto_discovery_publish_opt_in": False}`), leaving existing configured disk settings intact.
+    - Unknown and custom configuration fields (e.g. `custom_debug_flag`, arbitrary metadata) are preserved verbatim across all read-modify-write operations without loss or mutation.
+    - Missing settings files cleanly initialize with backward-compatible defaults; unreadable or corrupt JSON fails closed with `ConfigurationCorruptError` without overwriting valid data.
+  - **Atomic Read-Modify-Write Persistence**:
+    - `update_settings()` reads existing settings under lock, applies partial updates, validates the merged document, serializes to a unique `.tmp` file in the same directory with `os.fsync()`, and atomically replaces via `os.replace()`. Cleans up temporary files on write failure.
+  - **Server Integration & Error Sanitization (`studio/server.py`)**:
+    - Migrated `get_automation_settings()` to delegate to `studio.settings.load_settings()`.
+    - Migrated `automation_loop()` to persist `next_run` via `studio.settings.update_settings()`.
+    - Migrated `/api/settings` POST handler to persist automation updates via `studio.settings.update_settings()`.
+    - Sanitized `/api/settings` error handling: `ConfigurationCorruptError` and `SettingsLockError` are logged to server error log and return clean client error responses without leaking internal filesystem paths.
+  - **Test Suite**:
+    - `tests/test_stage7_phase4_settings.py`: 30/30 passed (8.7s) covering schema validation, bool-type rejection, non-finite number rejection (`NaN`, `inf`, `-inf`), defaults schema scope, unknown-field preservation, lock reentrancy in the same thread, 10-thread concurrency, 5-subprocess concurrency under `msvcrt.locking`, lock timeouts, abrupt process termination (`kill`) OS handle release, atomic-write failure recovery, server integration, and API error message sanitization.
+    - Full repository test discovery suite: 272/272 passed (46.3s, 0 failures, 0 errors).
+  - **Remaining Stage 7 Phase 4 Milestones**:
+    - Milestone 2: Retention reference engine and dry-run audit API (`studio/retention.py`).
+    - Milestone 3: Quota-aware scheduling, jitter, and PT rollover resumption.
+    - Milestone 4: Operational alert lifecycle and SQLite partial index (`studio/alerts.py`).
+    - Milestone 5: Independent health telemetry and diagnostic stall alerts (`studio/supervisor.py`).
+    - Milestone 6: Frontend integration and end-to-end verification.
 - **Stage 7 Phase 3 Completed, Fully Corrected & Verified (Command Center, Quota Governance & Discovery Diagnostics)**:
   - **Operational Telemetry & Quota Governance**:
     - Multi-process safe and thread-safe quota coordination: `_quota_lock_guard()` in `studio/store.py` coordinates reads and writes to `studio-quota.json` across concurrent worker subprocesses, server threads, and CLI commands using OS-level file locking (`msvcrt.locking` on Windows, `fcntl.flock` on Unix) on `studio-quota.lock`.

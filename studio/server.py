@@ -12,6 +12,7 @@ import copy
 import datetime as dt
 import json
 import logging
+import math
 import mimetypes
 import os
 import platform
@@ -38,6 +39,7 @@ if __name__ == "__main__" and __package__ is None:
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from core.style_presets import STYLE_PRESETS
+from studio import settings as studio_settings
 from studio import store
 
 LOG = logging.getLogger("kenaushorts.server")
@@ -66,6 +68,7 @@ DEFAULT_AUTOMATION = {
     "interval_hours": 5,
     "mode": "preview",  # "preview" or "publish"
     "next_run": 0,
+    "auto_discovery_publish_opt_in": False,
 }
 
 def read_json(path: Path, default=None):
@@ -87,7 +90,11 @@ def write_json(path: Path, data: dict, private: bool = False) -> None:
     os.replace(tmp, path)
 
 def get_automation_settings() -> dict:
-    return {**DEFAULT_AUTOMATION, **read_json(ROOT / "studio-settings.json", {})}
+    try:
+        return studio_settings.load_settings(settings_path=ROOT / "studio-settings.json")
+    except Exception as e:
+        LOG.error("Failed to load automation settings: %s — falling back to safe defaults", e)
+        return copy.deepcopy(DEFAULT_AUTOMATION)
 
 def probe_network_connectivity() -> bool:
     """Raw socket probe to check external connectivity outside of any locks."""
@@ -1592,14 +1599,20 @@ def automation_loop() -> None:
                     else:
                         # Resilient check: check again in 60s when newly rendered videos may be ready
                         settings["next_run"] = now_ts + 60.0
-                    write_json(ROOT / "studio-settings.json", settings)
+                    try:
+                        studio_settings.update_settings(
+                            {"next_run": settings["next_run"]},
+                            settings_path=ROOT / "studio-settings.json",
+                        )
+                    except Exception as set_err:
+                        LOG.error("Automation: Failed to update next_run: %s", set_err)
         except Exception as e:
             LOG.error("Automation error: %s", e)
 
 HEX_COLOR_RE = re.compile(r"^#[0-9A-Fa-f]{6}$")
 
 def _is_number(v: Any) -> bool:
-    return isinstance(v, (int, float)) and not isinstance(v, bool)
+    return isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v)
 
 def _is_int(v: Any) -> bool:
     return isinstance(v, int) and not isinstance(v, bool)
@@ -2317,9 +2330,17 @@ class StudioHandler(BaseHTTPRequestHandler):
                         raise ValueError("Choose an interval of 1-168 hours and a valid mode")
                     if auto.get("mode") == "publish_approved":
                         auto["mode"] = "publish"
-                    current_auto = get_automation_settings()
-                    current_auto.update(auto)
-                    write_json(ROOT / "studio-settings.json", current_auto)
+                    try:
+                        studio_settings.update_settings(auto, settings_path=ROOT / "studio-settings.json")
+                    except studio_settings.ConfigurationCorruptError as e:
+                        LOG.error("Settings configuration corrupt: %s", e)
+                        raise ValueError("Settings file or payload is invalid or corrupt.")
+                    except studio_settings.SettingsLockError as e:
+                        LOG.error("Settings lock timeout: %s", e)
+                        raise ValueError("Settings are currently locked by another operation. Try again shortly.")
+                    except studio_settings.SettingsError as e:
+                        LOG.error("Failed to persist settings: %s", e)
+                        raise ValueError("Failed to save settings.")
                 return {"status": "updated"}
 
         if path == "/api/wizard":

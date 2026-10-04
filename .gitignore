@@ -16,6 +16,7 @@ config.json
 *.sqlite3-shm
 state.json
 studio-settings.json
+studio-settings.lock
 studio-quota.json
 studio-quota.lock
 studio-channel.json
