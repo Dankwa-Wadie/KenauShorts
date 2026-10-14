@@ -9,10 +9,12 @@ from __future__ import annotations
 
 import contextlib
 import copy
+import datetime as dt
 import json
 import math
 import os
 from pathlib import Path
+import random
 import sys
 import threading
 import time
@@ -323,3 +325,61 @@ def update_settings(
 
         # 6. Return fully populated settings
         return {**DEFAULT_SETTINGS, **final_settings}
+
+
+def calculate_jitter(interval_seconds: float, rng: random.Random | None = None) -> float:
+    """
+    Calculate bounded positive uniform jitter in [0, min(900.0, interval_seconds * 0.10)].
+    Guaranteed non-negative so scheduled execution never occurs earlier than configured interval.
+    """
+    max_jitter = min(900.0, max(0.0, float(interval_seconds) * 0.10))
+    if max_jitter <= 0.0:
+        return 0.0
+    r = rng if rng is not None else random
+    return round(r.uniform(0.0, max_jitter), 2)
+
+
+def calculate_rollover_jitter(rng: random.Random | None = None) -> float:
+    """
+    Calculate bounded uniform rollover jitter in [60.0, 300.0] seconds past Pacific midnight.
+    Prevents thundering herd immediately at 00:00:00 PT.
+    """
+    r = rng if rng is not None else random
+    return round(r.uniform(60.0, 300.0), 2)
+
+
+def calculate_backoff_delay(consecutive_failures: int, rng: random.Random | None = None) -> float:
+    """
+    Calculate exponential failure backoff delay:
+    delay = min(1800.0, 60.0 * 2^(failures - 1)) + uniform(0.0, 30.0).
+    Progression: 60s, 120s, 240s, 480s, 960s, capped at 1800s (30m).
+    """
+    f = max(1, int(consecutive_failures))
+    base = min(1800.0, 60.0 * (2.0 ** (f - 1)))
+    r = rng if rng is not None else random
+    jitter = round(r.uniform(0.0, 30.0), 2)
+    return round(base + jitter, 2)
+
+
+def calculate_effective_due_time(
+    next_run: float,
+    quota_suspended: bool = False,
+    quota_suspended_until: float | str | None = None,
+) -> float:
+    """
+    Derive effective due time: max(normal_next_run, quota_suspended_until_epoch).
+    Preserves normal recurrence interval while respecting quota suspension boundary.
+    """
+    if not quota_suspended or not quota_suspended_until:
+        return float(next_run)
+
+    suspension_epoch = 0.0
+    if isinstance(quota_suspended_until, (int, float)):
+        suspension_epoch = float(quota_suspended_until)
+    elif isinstance(quota_suspended_until, str):
+        try:
+            suspension_epoch = dt.datetime.fromisoformat(quota_suspended_until).timestamp()
+        except Exception:
+            pass
+
+    return max(float(next_run), suspension_epoch)

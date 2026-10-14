@@ -12,6 +12,54 @@ what's actually on `origin/main`.
 
 ## Current state (update this section each handoff)
 
+- **Stage 7 Phase 4 Milestone 3 Completed & Verified (Quota-Aware Scheduling, Bounded Jitter & Pacific-Time Rollover Resumption)**:
+  - **Decoupled Job Dispatch from Execution Completion (`studio/server.py`)**:
+    - Decoupled `next_run` advancement and failure count resets from initial job dispatch. Successful dispatch via `start_job()` merely transitions the scheduler to track the running job.
+    - Added `handle_automatic_job_completion(job, finished_at)` hooked into worker process termination in `run_job_process()`.
+    - Genuine pipeline/upload success resets `consecutive_failures = 0` and advances `next_run = finished_at + interval_seconds + calculate_jitter(interval_seconds)`.
+    - Normal discovery runs yielding 0 candidates (genuine idle) reset `consecutive_failures = 0` and advance `next_run` normally with bounded jitter.
+  - **Bounded Exponential Backoff on Pipeline Failures (`studio/settings.py`)**:
+    - `calculate_backoff_delay(consecutive_failures)`: Implements bounded exponential backoff `delay = min(3600.0, 60.0 * (2 ** (consecutive_failures - 1)))`.
+    - Jitter is bounded to `±10%` of delay (minimum `±1.0s`, clamped to `[60.0, 3600.0]`).
+    - Terminal job failures, crashes, and pipeline errors increment `consecutive_failures` and schedule the next attempt with backoff delay instead of normal recurrence.
+  - **Option B for Publish-Mode Waiting**:
+    - In `publish` mode, when no ready candidate is found, `next_run` is preserved in place without forward schedule drift or synthetic retry delays.
+    - Scheduler state transitions to `waiting_for_candidate` with `deferral_reason: "publish_waiting_for_candidate"`.
+    - Reactive wakeup via `AUTOMATION_EVENT.set()` wakes the scheduler immediately when a newly rendered video transitions to `ready`, avoiding polling latency.
+  - **Quota Governance & Rollover Resumption**:
+    - Worker-authoritative quota reservation: The worker subprocess remains authoritative for YouTube upload quota checking and reservations (`videos_insert`).
+    - Search vs. upload quota decoupling: Search quota exhaustion (`search_list` limit reached or Google circuit breaker tripped) does not block eligible ready videos from being uploaded.
+    - Non-YouTube discovery preservation: When YouTube search quota is exhausted, discovery continues if non-YouTube sources (RSS feeds or Reddit) are configured.
+    - Timezone-aware Pacific-Time rollover: `studio/store.py:get_pacific_next_rollover(now_utc)` computes the exact epoch and ISO string of the next 00:00:00 Pacific Time midnight, accounting for dynamic DST transitions (PST/PDT) and year boundaries.
+    - Rollover jitter: `calculate_rollover_jitter()` introduces `0` to `+900s` (+0 to +15 minutes) jitter to prevent thundering-herd API requests at midnight rollover.
+    - Scheduler preflight checks detect quota exhaustion and set diagnostics (`state: "quota_suspended"`, `deferral_reason: "quota_exhausted_search"` or `"quota_exhausted_upload"`).
+  - **Diagnostics & Status Integration (`studio/server.py`)**:
+    - `SCHEDULER_DIAGNOSTICS` exposed via `/api/status` with `scheduler_state`, `deferral_reason`, and `effective_due_time`.
+    - `calculate_effective_due_time(settings)` determines the actual due timestamp considering quota suspension rollover and backoff.
+  - **Harness & Phase 2 Test Synchronization (`tests/test_stage7_phase2.py`)**:
+    - Resolved reproducible scheduler hang in `test_automation_loop_advances_interval_when_candidate_queued`. Replaced obsolete `time.sleep` monkeypatching with deterministic `AUTOMATION_EVENT.wait` interception and clean `try...finally: STOP_EVENT.clear()` cleanup.
+    - Aligned Phase 2 assertions with approved Milestone 3 contract (decoupled dispatch, completion-time interval advancement, and Option B waiting without schedule drift).
+  - **Scheduler Event Synchronization & Deterministic Wakeups (`studio/server.py`)**:
+    - Eliminated lost-wakeup window by relocating `AUTOMATION_EVENT.clear()` inside the `with GUARD:` critical section in `automation_loop()`.
+    - Proved locking invariants: all state mutations and event signals (`run_job_process()`, `handle_automatic_job_completion()`, `resolve_incident()`, and `/api/settings`) execute under `with GUARD:`.
+    - Added immediate event signaling (`AUTOMATION_EVENT.set()`) when worker completes (`ACTIVE_JOB = None`), when videos resolve to `ready`, and when automation configuration updates via `/api/settings`.
+  - **Defensive Completion-Handling Hardening (`studio/server.py`)**:
+    - Added `completion_handled` lifecycle guard in `run_job_process()`: ensures that an unexpected exception inside `handle_automatic_job_completion()` on the normal path cannot escape into the outer exception handler, preventing successful jobs from being corrupted into failed jobs or executing completion handling twice.
+    - Added early-cancellation recurrence handling: when an automatic job is cancelled immediately after process creation, completion handling is invoked before early return, preventing the scheduler from remaining indefinitely due or repeatedly re-dispatching.
+  - **In-Memory Scheduling Persistence Recovery & Self-Healing Reconciliation (`studio/server.py`)**:
+    - Added guarded in-memory scheduling override state (`_IN_MEMORY_NEXT_RUN`, `_IN_MEMORY_CONSECUTIVE_FAILURES`) protected under `with GUARD:`.
+    - Upload success persistence failure: If `studio_settings.update_settings({"next_run": ...})` fails while multiple ready videos exist, the calculated recurrence interval (3h + jitter) is held in memory, strictly preventing immediate back-to-back dispatch of subsequent ready videos.
+    - Consecutive failure backoff escalation: If settings persistence fails during repeated pipeline errors, failure counts and exponential backoff delays escalate in memory ($60\text{s} \to 120\text{s} \to 240\text{s}$) rather than spinning against stale on-disk timestamps every 15-second polling cycle.
+    - Publish-staging discovery wakeup: `AUTOMATION_EVENT.set()` is executed in a `finally:` block so that newly staged ready candidates are immediately dispatched for upload even if persisting `consecutive_failures: 0` to disk raises an exception.
+    - Self-healing reconciliation: On each scheduler iteration, if in-memory overrides are present, the scheduler opportunistically persists them to disk once transient filelock or disk errors clear, resetting in-memory overrides to `None` upon successful write.
+  - **Test Suite**:
+    - `tests/test_stage7_phase4_scheduling.py`: 41/41 passed (3.5s), including 6 in-memory persistence-recovery regression tests (covering upload success persistence failure, publish-staging failure, consecutive failure backoff escalation, self-healing reconciliation, Pacific rollover with a future in-memory deadline, and `/api/settings` mutation override preservation/clearing), 5 deterministic synchronization regression tests, and 3 focused defensive completion-handling and early-cancellation tests.
+    - Full repository test discovery suite: 348 passed and 1 skipped out of 349 discovered tests (43.9s, 0 failures, 0 errors, 1 skipped on Windows symlink privileges).
+  - **Remaining Stage 7 Phase 4 Milestones**:
+    - Milestone 4: Operational alert lifecycle and SQLite partial index (`studio/alerts.py`).
+    - Milestone 5: Independent health telemetry and diagnostic stall alerts (`studio/supervisor.py`).
+    - Milestone 6: Frontend integration and end-to-end verification.
+
 - **Stage 7 Phase 4 Milestone 2 Completed & Verified (Retention Reference Engine & Dry-Run Audit API)**:
   - **Safe Retention Reference Engine (`studio/retention.py`)**:
     - Strictly read-only, non-destructive audit engine for candidate raw downloads in `work/`. Real deletion pathways are NOT implemented. No files are deleted, moved, renamed, truncated, or modified.

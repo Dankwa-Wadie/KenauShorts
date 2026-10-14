@@ -486,7 +486,7 @@ class Stage7Phase2Tests(unittest.TestCase):
     # =========================================================================
 
     def test_automation_loop_no_candidates_schedules_short_retry_not_interval(self):
-        """When no eligible ready videos exist, automation loop sets next_run to 60s, avoiding 5-hour stall."""
+        """When no eligible ready videos exist, automation loop preserves schedule in due state without drift."""
         settings_file = self.root / "studio-settings.json"
         now_ts = 1000000.0
         settings = {
@@ -498,20 +498,23 @@ class Stage7Phase2Tests(unittest.TestCase):
         settings_file.write_text(json.dumps(settings), encoding="utf-8")
 
         server.STOP_EVENT.clear()
-        # Mock is_online, time, and empty videos
-        with patch("time.time", return_value=now_ts), \
-             patch("time.sleep", side_effect=lambda s: server.STOP_EVENT.set()), \
-             patch.object(store, "busy", return_value=False), \
-             patch.object(server, "is_online", return_value=True):
-            server.automation_loop()
+        try:
+            with patch("time.time", return_value=now_ts), \
+                 patch.object(server.AUTOMATION_EVENT, "wait", side_effect=lambda timeout=None: server.STOP_EVENT.set()), \
+                 patch.object(store, "busy", return_value=False), \
+                 patch.object(server, "is_online", return_value=True):
+                server.automation_loop()
+        finally:
             server.STOP_EVENT.clear()
 
         updated_settings = json.loads(settings_file.read_text(encoding="utf-8"))
-        # Must be now_ts + 60.0 (short backoff), NOT now_ts + 5 * 3600
-        self.assertEqual(updated_settings["next_run"], now_ts + 60.0)
+        # Milestone 3 Option B: next_run is preserved in due state (not overwritten with +60s drift)
+        self.assertEqual(updated_settings["next_run"], now_ts - 10)
+        self.assertEqual(server.SCHEDULER_DIAGNOSTICS.get("state"), "waiting_for_candidate")
+        self.assertEqual(server.SCHEDULER_DIAGNOSTICS.get("deferral_reason"), "no_ready_videos")
 
     def test_automation_loop_advances_interval_when_candidate_queued(self):
-        """When an eligible candidate is queued, automation loop advances next_run by interval_hours."""
+        """When an eligible candidate is queued, automation loop dispatches job; completion advances schedule."""
         vid_file = self.root / "out" / "ready_short.mp4"
         vid_file.write_bytes(b"ready video")
         vid_id = "vid_auto_ready"
@@ -540,19 +543,40 @@ class Stage7Phase2Tests(unittest.TestCase):
             return {"status": "pending"}
 
         server.STOP_EVENT.clear()
-        with patch("time.time", return_value=now_ts), \
-             patch("time.sleep", side_effect=lambda s: server.STOP_EVENT.set()), \
-             patch.object(store, "busy", return_value=False), \
-             patch.object(server, "is_online", return_value=True), \
-             patch.object(server, "start_job", side_effect=fake_start):
-            server.automation_loop()
+        try:
+            with patch("time.time", return_value=now_ts), \
+                 patch.object(server.AUTOMATION_EVENT, "wait", side_effect=lambda timeout=None: server.STOP_EVENT.set()), \
+                 patch.object(store, "busy", return_value=False), \
+                 patch.object(server, "is_online", return_value=True), \
+                 patch.object(server, "start_job", side_effect=fake_start):
+                server.automation_loop()
+        finally:
             server.STOP_EVENT.clear()
 
         self.assertEqual(len(queued_jobs), 1)
         self.assertEqual(queued_jobs[0], ("upload", vid_id))
+        self.assertEqual(server.SCHEDULER_DIAGNOSTICS.get("state"), "job_dispatched")
 
-        updated_settings = json.loads(settings_file.read_text(encoding="utf-8"))
-        self.assertEqual(updated_settings["next_run"], now_ts + 4.0 * 3600)
+        # Milestone 3 contract: dispatching does NOT advance next_run prematurely
+        dispatched_settings = json.loads(settings_file.read_text(encoding="utf-8"))
+        self.assertEqual(dispatched_settings["next_run"], now_ts - 10)
+
+        # Milestone 3 contract: completion handling advances the schedule according to interval and jitter
+        completed_job = {
+            "id": "job_completed_1",
+            "action": "upload",
+            "key": vid_id,
+            "automatic": True,
+            "status": "completed",
+        }
+        with patch("time.time", return_value=now_ts):
+            server.handle_automatic_job_completion(completed_job, store.now())
+
+        completed_settings = json.loads(settings_file.read_text(encoding="utf-8"))
+        self.assertEqual(completed_settings["consecutive_failures"], 0)
+        # Interval is 4h = 14400s; jitter is in [0, min(900, 1440)] = [0, 900]
+        self.assertGreaterEqual(completed_settings["next_run"], now_ts + 14400.0)
+        self.assertLessEqual(completed_settings["next_run"], now_ts + 14400.0 + 900.0)
 
     def test_automation_loop_skips_failed_video_picks_next_ready_fifo(self):
         """Automation loop skips failed/unknown videos and picks the oldest ready video."""
@@ -597,12 +621,14 @@ class Stage7Phase2Tests(unittest.TestCase):
             return {"status": "pending"}
 
         server.STOP_EVENT.clear()
-        with patch("time.time", return_value=now_ts), \
-             patch("time.sleep", side_effect=lambda s: server.STOP_EVENT.set()), \
-             patch.object(store, "busy", return_value=False), \
-             patch.object(server, "is_online", return_value=True), \
-             patch.object(server, "start_job", side_effect=fake_start):
-            server.automation_loop()
+        try:
+            with patch("time.time", return_value=now_ts), \
+                 patch.object(server.AUTOMATION_EVENT, "wait", side_effect=lambda timeout=None: server.STOP_EVENT.set()), \
+                 patch.object(store, "busy", return_value=False), \
+                 patch.object(server, "is_online", return_value=True), \
+                 patch.object(server, "start_job", side_effect=fake_start):
+                server.automation_loop()
+        finally:
             server.STOP_EVENT.clear()
 
         self.assertEqual(queued_keys, ["v2_ready"])

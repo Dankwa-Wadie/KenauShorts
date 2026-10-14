@@ -370,6 +370,13 @@ def get_pacific_reset_info(now_utc: dt.datetime | None = None) -> dict[str, Any]
     }
 
 
+def get_pacific_next_rollover(now_utc: dt.datetime | None = None) -> tuple[float, str]:
+    """Return next midnight Pacific Time reset timestamp (float epoch) and ISO string."""
+    info = get_pacific_reset_info(now_utc)
+    return info["reset_at"], info["reset_at_iso"]
+
+
+
 def _save_quota_data(quota_path: Path, data: dict[str, Any]) -> None:
     """Safely persist quota data using atomic write. Fails closed on any write or replacement error."""
     try:

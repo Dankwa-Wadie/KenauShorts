@@ -56,6 +56,13 @@ ACTIVE_JOB: dict | None = None
 ACTIVE_PROC: subprocess.Popen | None = None
 QUEUE_EVENT = threading.Event()
 STOP_EVENT = threading.Event()
+AUTOMATION_EVENT = threading.Event()
+SCHEDULER_DIAGNOSTICS: dict[str, str] = {
+    "state": "idle",
+    "deferral_reason": "",
+}
+_IN_MEMORY_NEXT_RUN: float | None = None
+_IN_MEMORY_CONSECUTIVE_FAILURES: int | None = None
 QUEUE_WORKER_THREAD: threading.Thread | None = None
 _CONNECTION_TEST_LOCK = threading.Lock()
 _RECONCILING_VIDEOS: set[str] = set()
@@ -429,6 +436,235 @@ DEFAULT_JOB_TIMEOUTS: dict[str, float] = {
     "manual": 300.0,          # 5 minutes
 }
 
+def handle_automatic_job_completion(job: dict, finished_at: str) -> None:
+    """
+    Hook invoked when an automatic job finishes execution.
+    Manages scheduling recurrence, failure backoff progression, intent preservation,
+    and quota suspension based on the exact job outcome.
+    """
+    global _IN_MEMORY_NEXT_RUN, _IN_MEMORY_CONSECUTIVE_FAILURES
+    if not job.get("automatic"):
+        return
+
+    action = job.get("action", "")
+    status = job.get("status", "")
+    extra = job.get("extra") or {}
+    intent = extra.get("intent", "")
+    summary = job.get("summary") or {}
+    summary_status = summary.get("status")
+
+    try:
+        settings = get_automation_settings()
+    except Exception as e:
+        LOG.error("Failed to load settings during job completion handling: %s", e)
+        return
+
+    now_ts = time.time()
+    interval_hours = float(settings.get("interval_hours", 5))
+    interval_sec = interval_hours * 3600.0
+
+    # Inspect discovery and quota status
+    discovery_stats = summary.get("discovery_stats") or {}
+    search_quota_blocked = bool(discovery_stats.get("search_quota_blocked", False))
+    google_exhausted = bool(discovery_stats.get("google_quota_exhausted", False))
+    total_raw = int(discovery_stats.get("total_discovered_raw", 0))
+
+    try:
+        tracker = store.get_local_quota_tracker()
+    except Exception:
+        tracker = {}
+
+    tracker_google_ex = bool(tracker.get("google_quota_exhausted", False))
+    tracker_search_reached = bool(tracker.get("search_limit_reached", False))
+    err_text = str(job.get("error", "")).lower()
+
+    # 1. Quota Blocked Upload (Worker upload QuotaBlockedError or summary status blocked)
+    is_upload_quota_blocked = (
+        action == "upload" and (
+            summary_status == "blocked"
+            or ("quota" in err_text and ("limit reached" in err_text or "blocked" in err_text))
+        )
+    )
+
+    if is_upload_quota_blocked:
+        reason = "google_quota_exhausted" if (tracker_google_ex or google_exhausted) else "upload_quota_limit"
+        try:
+            reset_info = store.get_pacific_reset_info()
+            studio_settings.update_settings(
+                {
+                    "quota_suspended": True,
+                    "quota_suspended_reason": reason,
+                    "quota_suspended_until_pt": reset_info.get("reset_at_iso", ""),
+                    "quota_suspended_at": finished_at,
+                },
+                settings_path=ROOT / "studio-settings.json",
+            )
+            LOG.info("Automatic upload job %s blocked by quota (%s). Entered quota suspension until %s", job["id"], reason, reset_info.get("reset_at_iso"))
+        except Exception as set_err:
+            LOG.error("Failed to persist quota suspension state: %s", set_err)
+        return
+
+    # 2. Check if discovery finished with idle/failed specifically due to quota:
+    # A discovery job is quota-blocked ONLY IF it produced 0 candidates (idle or blocked)
+    # AND Google quota was exhausted OR search quota limit was reached.
+    # Note: If status == "completed", discovery succeeded (e.g. from Reddit or RSS) even if search quota was reached!
+    is_discovery_quota_blocked = (
+        action in ("preview", "run")
+        and status in ("idle", "failed", "blocked")
+        and (
+            google_exhausted
+            or tracker_google_ex
+            or (search_quota_blocked and total_raw == 0)
+            or (tracker_search_reached and total_raw == 0)
+        )
+    )
+
+    if is_discovery_quota_blocked:
+        reason = "google_quota_exhausted" if (google_exhausted or tracker_google_ex) else "search_quota_limit"
+        try:
+            reset_info = store.get_pacific_reset_info()
+            studio_settings.update_settings(
+                {
+                    "quota_suspended": True,
+                    "quota_suspended_reason": reason,
+                    "quota_suspended_until_pt": reset_info.get("reset_at_iso", ""),
+                    "quota_suspended_at": finished_at,
+                },
+                settings_path=ROOT / "studio-settings.json",
+            )
+            LOG.info("Automatic discovery job %s blocked by quota (%s). Entered quota suspension until %s", job["id"], reason, reset_info.get("reset_at_iso"))
+        except Exception as set_err:
+            LOG.error("Failed to persist quota suspension state: %s", set_err)
+        return
+
+    # 3. Successful Completion
+    if status == "completed":
+        if action == "upload":
+            # Successful publication
+            jitter = studio_settings.calculate_jitter(interval_sec)
+            target_next_run = now_ts + interval_sec + jitter
+            try:
+                studio_settings.update_settings(
+                    {
+                        "next_run": target_next_run,
+                        "consecutive_failures": 0,
+                    },
+                    settings_path=ROOT / "studio-settings.json",
+                )
+                with GUARD:
+                    _IN_MEMORY_NEXT_RUN = None
+                    _IN_MEMORY_CONSECUTIVE_FAILURES = None
+                LOG.info("Automatic upload completed. Next run scheduled in %.1fh (next_run=%s)", interval_hours + (jitter / 3600.0), target_next_run)
+            except Exception as set_err:
+                with GUARD:
+                    _IN_MEMORY_NEXT_RUN = target_next_run
+                    _IN_MEMORY_CONSECUTIVE_FAILURES = 0
+                LOG.error("Failed to update next_run on upload completion: %s (in-memory schedule protection active)", set_err)
+        elif action in ("preview", "run"):
+            if intent == "publish_staging":
+                # Discovery for publish mode completed and staged a video into 'ready'.
+                # Reset consecutive failures and wake scheduler up immediately to upload the staged video!
+                try:
+                    studio_settings.update_settings(
+                        {"consecutive_failures": 0},
+                        settings_path=ROOT / "studio-settings.json",
+                    )
+                    with GUARD:
+                        _IN_MEMORY_CONSECUTIVE_FAILURES = None
+                    LOG.info("Automatic discovery for publish mode completed. Ready video staged; upload will proceed on next tick.")
+                except Exception as set_err:
+                    with GUARD:
+                        _IN_MEMORY_CONSECUTIVE_FAILURES = 0
+                    LOG.error("Failed to update settings after publish staging: %s", set_err)
+                finally:
+                    AUTOMATION_EVENT.set()
+            else:
+                # Ordinary preview in preview mode
+                jitter = studio_settings.calculate_jitter(interval_sec)
+                target_next_run = now_ts + interval_sec + jitter
+                try:
+                    studio_settings.update_settings(
+                        {
+                            "next_run": target_next_run,
+                            "consecutive_failures": 0,
+                        },
+                        settings_path=ROOT / "studio-settings.json",
+                    )
+                    with GUARD:
+                        _IN_MEMORY_NEXT_RUN = None
+                        _IN_MEMORY_CONSECUTIVE_FAILURES = None
+                    LOG.info("Automatic preview completed. Next run scheduled in %.1fh", interval_hours + (jitter / 3600.0))
+                except Exception as set_err:
+                    with GUARD:
+                        _IN_MEMORY_NEXT_RUN = target_next_run
+                        _IN_MEMORY_CONSECUTIVE_FAILURES = 0
+                    LOG.error("Failed to update next_run on preview completion: %s", set_err)
+
+    # 4. Genuine Idle (Discovery found 0 candidates across non-quota sources)
+    elif status == "idle":
+        jitter = studio_settings.calculate_jitter(interval_sec)
+        target_next_run = now_ts + interval_sec + jitter
+        try:
+            studio_settings.update_settings(
+                {
+                    "next_run": target_next_run,
+                    "consecutive_failures": 0,
+                },
+                settings_path=ROOT / "studio-settings.json",
+            )
+            with GUARD:
+                _IN_MEMORY_NEXT_RUN = None
+                _IN_MEMORY_CONSECUTIVE_FAILURES = None
+            LOG.info("Automatic discovery was idle (0 fresh candidates). Next run scheduled in %.1fh", interval_hours + (jitter / 3600.0))
+        except Exception as set_err:
+            with GUARD:
+                _IN_MEMORY_NEXT_RUN = target_next_run
+                _IN_MEMORY_CONSECUTIVE_FAILURES = 0
+            LOG.error("Failed to update next_run on idle completion: %s", set_err)
+
+    # 5. Pipeline Failure (crash, timeout, exception, non-zero exit code without quota cause)
+    elif status == "failed":
+        with GUARD:
+            current_failures = max(int(settings.get("consecutive_failures", 0)), _IN_MEMORY_CONSECUTIVE_FAILURES or 0)
+        failures = current_failures + 1
+        backoff_delay = studio_settings.calculate_backoff_delay(failures)
+        target_next_run = now_ts + backoff_delay
+        try:
+            studio_settings.update_settings(
+                {
+                    "next_run": target_next_run,
+                    "consecutive_failures": failures,
+                },
+                settings_path=ROOT / "studio-settings.json",
+            )
+            with GUARD:
+                _IN_MEMORY_NEXT_RUN = None
+                _IN_MEMORY_CONSECUTIVE_FAILURES = None
+            LOG.warning("Automatic job %s failed (consecutive_failures=%d). Backing off for %.1fs (next_run=%s)", job["id"], failures, backoff_delay, target_next_run)
+        except Exception as set_err:
+            with GUARD:
+                _IN_MEMORY_NEXT_RUN = target_next_run
+                _IN_MEMORY_CONSECUTIVE_FAILURES = failures
+            LOG.error("Failed to update backoff on job failure: %s (in-memory backoff protection active: failures=%d, next_run=%s)", set_err, failures, target_next_run)
+
+    # 6. Cancellation (user manually cancelled)
+    elif status == "cancelled":
+        jitter = studio_settings.calculate_jitter(interval_sec)
+        target_next_run = now_ts + interval_sec + jitter
+        try:
+            studio_settings.update_settings(
+                {"next_run": target_next_run},
+                settings_path=ROOT / "studio-settings.json",
+            )
+            with GUARD:
+                _IN_MEMORY_NEXT_RUN = None
+            LOG.info("Automatic job was cancelled by user. Next run scheduled in %.1fh", interval_hours + (jitter / 3600.0))
+        except Exception as set_err:
+            with GUARD:
+                _IN_MEMORY_NEXT_RUN = target_next_run
+            LOG.error("Failed to update next_run on job cancellation: %s", set_err)
+
+
 def run_job_process(job: dict, command: list[str]) -> None:
     global ACTIVE_JOB, ACTIVE_PROC
     log_lines = []
@@ -439,6 +675,7 @@ def run_job_process(job: dict, command: list[str]) -> None:
     proc_created_at = None
     watchdog = None
     timed_out = threading.Event()
+    completion_handled = False
 
     job_timeout = float(job.get("timeout") or DEFAULT_JOB_TIMEOUTS.get(job.get("action", ""), 600.0))
 
@@ -478,9 +715,20 @@ def run_job_process(job: dict, command: list[str]) -> None:
             if current and current.get("status") == "cancelled":
                 watchdog.cancel()
                 terminate_process_tree(proc.pid, expected_created_at=proc_created_at)
+                try:
+                    proc.wait(timeout=0.5)
+                except Exception:
+                    pass
                 cleanup_job_artifacts(job)
                 ACTIVE_PROC = None
                 ACTIVE_JOB = None
+                if (current.get("automatic") or job.get("automatic")) and not completion_handled:
+                    completion_handled = True
+                    fin_at = current.get("finished_at") or store.now()
+                    try:
+                        handle_automatic_job_completion(current, fin_at)
+                    except Exception as comp_err:
+                        LOG.error("Failed to handle completion on early cancellation for job %s: %s", job["id"], comp_err)
                 return
             ACTIVE_PROC = proc
             job["pid"] = proc.pid
@@ -567,6 +815,11 @@ def run_job_process(job: dict, command: list[str]) -> None:
                     job["stage"] = f"Failed: {summary_msg}" if summary_msg else "Failed"
                     job["error"] = summary_msg or "Pipeline step failed"
                     append_job_stage(job, job["stage"], finished_at)
+                elif summary_status == "blocked":
+                    job["status"] = "failed"
+                    job["stage"] = f"Blocked: {summary_msg}" if summary_msg else "Blocked: Quota limit reached"
+                    job["error"] = summary_msg or "Quota limit reached"
+                    append_job_stage(job, job["stage"], finished_at)
                 elif summary_status == "idle":
                     job["status"] = "idle"
                     job["stage"] = f"Idle: {summary_msg}" if summary_msg else "Idle: No new candidates"
@@ -595,6 +848,12 @@ def run_job_process(job: dict, command: list[str]) -> None:
             store.put("jobs", job["id"], job)
             ACTIVE_JOB = None
             ACTIVE_PROC = None
+            if not completion_handled:
+                completion_handled = True
+                try:
+                    handle_automatic_job_completion(job, finished_at)
+                except Exception as comp_err:
+                    LOG.error("Failed to handle automatic job completion for job %s: %s", job["id"], comp_err)
 
     except Exception as e:
         if watchdog:
@@ -638,6 +897,12 @@ def run_job_process(job: dict, command: list[str]) -> None:
             store.put("jobs", job["id"], job)
             ACTIVE_JOB = None
             ACTIVE_PROC = None
+            if not completion_handled:
+                completion_handled = True
+                try:
+                    handle_automatic_job_completion(job, finished_at)
+                except Exception as comp_err:
+                    LOG.error("Failed to handle automatic job completion in error handler for job %s: %s", job["id"], comp_err)
 
     finally:
         if watchdog:
@@ -656,6 +921,7 @@ def run_job_process(job: dict, command: list[str]) -> None:
             if ACTIVE_JOB and ACTIVE_JOB.get("id") == job.get("id"):
                 ACTIVE_JOB = None
                 ACTIVE_PROC = None
+            AUTOMATION_EVENT.set()
         QUEUE_EVENT.set()
 
 def get_next_pending_job() -> dict | None:
@@ -1318,6 +1584,7 @@ def resolve_manual_video(vid_id: str, resolution: str, youtube_id: str = "", con
             video["upload_failure_reason"] = "Operator confirmed absent on YouTube; reset to ready."
             video["error"] = ""
             store.put("videos", vid_id, video)
+            AUTOMATION_EVENT.set()
             return {
                 "status": "ready",
                 "message": "Video confirmed absent on YouTube and reset to ready for fresh upload.",
@@ -1332,6 +1599,7 @@ def resolve_manual_video(vid_id: str, resolution: str, youtube_id: str = "", con
             video["upload_failure_reason"] = "Operator marked ready to resume upload session."
             video["error"] = ""
             store.put("videos", vid_id, video)
+            AUTOMATION_EVENT.set()
             return {
                 "status": "ready",
                 "resumable": True,
@@ -1545,68 +1813,294 @@ def retry_job(source_id: str) -> dict:
 
 
 def automation_loop() -> None:
+    global _IN_MEMORY_NEXT_RUN, _IN_MEMORY_CONSECUTIVE_FAILURES
     while not STOP_EVENT.is_set():
         try:
-            time.sleep(15)
+            AUTOMATION_EVENT.wait(timeout=15.0)
+
             with GUARD:
+                AUTOMATION_EVENT.clear()
                 settings = get_automation_settings()
                 if not settings.get("enabled", False):
+                    SCHEDULER_DIAGNOSTICS["state"] = "disabled"
+                    SCHEDULER_DIAGNOSTICS["deferral_reason"] = "disabled"
                     continue
 
-                now_ts = time.time()
-                next_ts = float(settings.get("next_run", 0))
-                has_pending = bool(get_next_pending_job())
+                if not is_online():
+                    SCHEDULER_DIAGNOSTICS["state"] = "waiting_for_network"
+                    SCHEDULER_DIAGNOSTICS["deferral_reason"] = "offline"
+                    continue
 
-                if now_ts >= next_ts and not ACTIVE_JOB and not store.busy() and not has_pending and is_online():
-                    interval = float(settings.get("interval_hours", 5))
-                    mode = settings.get("mode", "preview")
-                    job_started = False
-
-                    if mode in ("publish", "publish_approved"):
-                        videos = store.records("videos")
-                        videos.sort(key=lambda v: v.get("created_at", ""))
-                        all_jobs = store.records("jobs")
-                        active_upload_keys = {
-                            j.get("key") for j in all_jobs
-                            if j.get("status") in ("pending", "running") and j.get("action") == "upload"
-                        }
-                        candidate = None
-                        for v in videos:
-                            if (v.get("status") == "ready"
-                                    and v.get("id") not in active_upload_keys):
-                                v_file = v.get("video")
-                                if v_file and (ROOT / v_file).is_file():
-                                    candidate = v
-                                    break
-
-                        if candidate:
-                            LOG.info("Automation: Selected eligible ready video '%s' for publishing.", candidate["id"])
-                            try:
-                                start_job("upload", key=candidate["id"], automatic=True)
-                                job_started = True
-                            except Exception as start_err:
-                                LOG.error("Automation: Failed to queue upload for '%s': %s", candidate["id"], start_err)
-                        else:
-                            LOG.info("Automation: publish mode enabled, but no eligible ready videos available.")
-                    else:
-                        try:
-                            start_job("preview", automatic=True)
-                            job_started = True
-                        except Exception as start_err:
-                            LOG.error("Automation: Failed to start preview job: %s", start_err)
-
-                    if job_started:
-                        settings["next_run"] = now_ts + interval * 3600
-                    else:
-                        # Resilient check: check again in 60s when newly rendered videos may be ready
-                        settings["next_run"] = now_ts + 60.0
+                # Opportunistic self-healing: reconcile in-memory overrides to disk if writable
+                if _IN_MEMORY_NEXT_RUN is not None or _IN_MEMORY_CONSECUTIVE_FAILURES is not None:
                     try:
+                        reconcile_payload = {}
+                        if _IN_MEMORY_NEXT_RUN is not None:
+                            reconcile_payload["next_run"] = _IN_MEMORY_NEXT_RUN
+                        if _IN_MEMORY_CONSECUTIVE_FAILURES is not None:
+                            reconcile_payload["consecutive_failures"] = _IN_MEMORY_CONSECUTIVE_FAILURES
                         studio_settings.update_settings(
-                            {"next_run": settings["next_run"]},
+                            reconcile_payload,
                             settings_path=ROOT / "studio-settings.json",
                         )
-                    except Exception as set_err:
-                        LOG.error("Automation: Failed to update next_run: %s", set_err)
+                        LOG.info("Reconciled in-memory schedule override to disk: %s", reconcile_payload)
+                        _IN_MEMORY_NEXT_RUN = None
+                        _IN_MEMORY_CONSECUTIVE_FAILURES = None
+                        settings = get_automation_settings()
+                    except Exception as recon_err:
+                        LOG.debug("Could not reconcile in-memory schedule to disk: %s", recon_err)
+
+                now_ts = time.time()
+                disk_next_ts = float(settings.get("next_run", 0))
+                effective_next_ts = max(disk_next_ts, _IN_MEMORY_NEXT_RUN or 0.0)
+                effective_failures = max(int(settings.get("consecutive_failures", 0)), _IN_MEMORY_CONSECUTIVE_FAILURES or 0)
+
+                # Pacific Time rollover and quota suspension check
+                try:
+                    tracker = store.get_local_quota_tracker()
+                except Exception as q_err:
+                    LOG.warning("Could not probe quota tracker in scheduler: %s", q_err)
+                    tracker = {}
+
+                quota_suspended = bool(settings.get("quota_suspended", False))
+                suspended_until_str = settings.get("quota_suspended_until_pt", "")
+                reason = settings.get("quota_suspended_reason", "")
+
+                # Check if rollover has arrived and suspension should be lifted
+                if quota_suspended:
+                    lift_suspension = False
+                    if suspended_until_str:
+                        try:
+                            suspension_epoch = dt.datetime.fromisoformat(suspended_until_str).timestamp()
+                            if now_ts >= suspension_epoch:
+                                lift_suspension = True
+                        except Exception:
+                            lift_suspension = True
+                    else:
+                        lift_suspension = True
+
+                    if lift_suspension:
+                        LOG.info("Pacific rollover arrived. Clearing scheduler quota suspension (was: %s).", reason)
+                        rollover_jitter = studio_settings.calculate_rollover_jitter()
+                        resumed_next_run = max(effective_next_ts, now_ts + rollover_jitter)
+                        try:
+                            studio_settings.update_settings(
+                                {
+                                    "quota_suspended": False,
+                                    "quota_suspended_reason": "",
+                                    "quota_suspended_until_pt": "",
+                                    "quota_suspended_at": "",
+                                    "next_run": resumed_next_run,
+                                    "consecutive_failures": 0,
+                                },
+                                settings_path=ROOT / "studio-settings.json",
+                            )
+                            settings["quota_suspended"] = False
+                            settings["quota_suspended_reason"] = ""
+                            quota_suspended = False
+                            reason = ""
+                            effective_next_ts = resumed_next_run
+                            _IN_MEMORY_NEXT_RUN = None
+                            _IN_MEMORY_CONSECUTIVE_FAILURES = None
+                        except Exception as set_err:
+                            LOG.error("Failed to clear quota suspension in settings: %s", set_err)
+                            _IN_MEMORY_NEXT_RUN = resumed_next_run
+                            _IN_MEMORY_CONSECUTIVE_FAILURES = 0
+                            effective_next_ts = resumed_next_run
+
+                # Worker concurrency check
+                has_pending = bool(get_next_pending_job())
+                if ACTIVE_JOB or store.busy() or has_pending:
+                    SCHEDULER_DIAGNOSTICS["state"] = "waiting_for_worker"
+                    SCHEDULER_DIAGNOSTICS["deferral_reason"] = "worker_busy"
+                    continue
+
+                # Check schedule due condition
+                if now_ts < effective_next_ts:
+                    SCHEDULER_DIAGNOSTICS["state"] = "waiting_for_schedule"
+                    SCHEDULER_DIAGNOSTICS["deferral_reason"] = "waiting_schedule"
+                    continue
+
+                # Ready to evaluate execution eligibility for mode
+                mode = settings.get("mode", "preview")
+                if mode in ("publish", "publish_approved"):
+                    videos = store.records("videos")
+                    videos.sort(key=lambda v: v.get("created_at", ""))
+                    all_jobs = store.records("jobs")
+                    active_upload_keys = {
+                        j.get("key") for j in all_jobs
+                        if j.get("status") in ("pending", "running") and j.get("action") == "upload"
+                    }
+                    candidate = None
+                    for v in videos:
+                        if (v.get("status") == "ready" and v.get("id") not in active_upload_keys):
+                            v_file = v.get("video")
+                            if v_file and (ROOT / v_file).is_file():
+                                candidate = v
+                                break
+
+                    if candidate:
+                        # An eligible ready video is available to upload!
+                        # Preflight upload quota
+                        google_ex = bool(tracker.get("google_quota_exhausted", False)) or (quota_suspended and reason == "google_quota_exhausted")
+                        upload_count = int(tracker.get("videos_insert_count", 0))
+                        upload_limit = int(tracker.get("videos_insert_limit", 100))
+                        upload_limit_hit = (upload_count >= upload_limit) or (quota_suspended and reason == "upload_quota_limit")
+
+                        if google_ex:
+                            SCHEDULER_DIAGNOSTICS["state"] = "waiting_for_quota"
+                            SCHEDULER_DIAGNOSTICS["deferral_reason"] = "google_quota_exhausted"
+                            if not quota_suspended:
+                                try:
+                                    reset_info = store.get_pacific_reset_info()
+                                    studio_settings.update_settings(
+                                        {
+                                            "quota_suspended": True,
+                                            "quota_suspended_reason": "google_quota_exhausted",
+                                            "quota_suspended_until_pt": reset_info.get("reset_at_iso", ""),
+                                            "quota_suspended_at": store.now(),
+                                        },
+                                        settings_path=ROOT / "studio-settings.json",
+                                    )
+                                except Exception as err:
+                                    LOG.error("Failed to enter quota suspension: %s", err)
+                            continue
+
+                        if upload_limit_hit:
+                            SCHEDULER_DIAGNOSTICS["state"] = "waiting_for_quota"
+                            SCHEDULER_DIAGNOSTICS["deferral_reason"] = "upload_quota_limit"
+                            if not quota_suspended:
+                                try:
+                                    reset_info = store.get_pacific_reset_info()
+                                    studio_settings.update_settings(
+                                        {
+                                            "quota_suspended": True,
+                                            "quota_suspended_reason": "upload_quota_limit",
+                                            "quota_suspended_until_pt": reset_info.get("reset_at_iso", ""),
+                                            "quota_suspended_at": store.now(),
+                                        },
+                                        settings_path=ROOT / "studio-settings.json",
+                                    )
+                                except Exception as err:
+                                    LOG.error("Failed to enter quota suspension: %s", err)
+                            continue
+
+                        # Upload quota is available!
+                        LOG.info("Automation: Selected eligible ready video '%s' for publishing.", candidate["id"])
+                        try:
+                            start_job("upload", key=candidate["id"], automatic=True)
+                            SCHEDULER_DIAGNOSTICS["state"] = "job_dispatched"
+                            SCHEDULER_DIAGNOSTICS["deferral_reason"] = ""
+                        except Exception as start_err:
+                            LOG.error("Automation: Failed to queue upload for '%s': %s", candidate["id"], start_err)
+                            failures = effective_failures + 1
+                            delay = studio_settings.calculate_backoff_delay(failures)
+                            target_next = now_ts + delay
+                            try:
+                                studio_settings.update_settings(
+                                    {
+                                        "consecutive_failures": failures,
+                                        "next_run": target_next,
+                                    },
+                                    settings_path=ROOT / "studio-settings.json",
+                                )
+                                _IN_MEMORY_NEXT_RUN = None
+                                _IN_MEMORY_CONSECUTIVE_FAILURES = None
+                            except Exception:
+                                _IN_MEMORY_NEXT_RUN = target_next
+                                _IN_MEMORY_CONSECUTIVE_FAILURES = failures
+                    else:
+                        # No ready video available in publish mode
+                        auto_opt_in = bool(settings.get("auto_discovery_publish_opt_in", False))
+                        if not auto_opt_in:
+                            # Auto-discovery not opted in: wait for candidate. Do not modify next_run!
+                            SCHEDULER_DIAGNOSTICS["state"] = "waiting_for_candidate"
+                            SCHEDULER_DIAGNOSTICS["deferral_reason"] = "no_ready_videos"
+                        else:
+                            # Auto-discovery opted in!
+                            # Preflight search quota
+                            google_ex = bool(tracker.get("google_quota_exhausted", False)) or (quota_suspended and reason == "google_quota_exhausted")
+                            if google_ex:
+                                SCHEDULER_DIAGNOSTICS["state"] = "waiting_for_quota"
+                                SCHEDULER_DIAGNOSTICS["deferral_reason"] = "google_quota_exhausted"
+                                continue
+
+                            cfg = get_config()
+                            disc_cfg = cfg.get("discovery", {})
+                            has_yt = bool(disc_cfg.get("youtube_queries"))
+                            has_others = bool(disc_cfg.get("subreddits") or disc_cfg.get("news_rss") or disc_cfg.get("wikimedia_sections") or disc_cfg.get("wikipedia_queries"))
+                            search_limit_reached = bool(tracker.get("search_limit_reached", False)) or (quota_suspended and reason == "search_quota_limit")
+
+                            if has_yt and not has_others and search_limit_reached:
+                                SCHEDULER_DIAGNOSTICS["state"] = "waiting_for_quota"
+                                SCHEDULER_DIAGNOSTICS["deferral_reason"] = "search_quota_limit"
+                                continue
+
+                            LOG.info("Automation: Publish mode has no ready videos; auto-discovery opt-in is enabled. Dispatching discovery.")
+                            try:
+                                start_job("preview", automatic=True, extra={"intent": "publish_staging"})
+                                SCHEDULER_DIAGNOSTICS["state"] = "job_dispatched"
+                                SCHEDULER_DIAGNOSTICS["deferral_reason"] = ""
+                            except Exception as start_err:
+                                LOG.error("Automation: Failed to dispatch auto-discovery: %s", start_err)
+                                failures = effective_failures + 1
+                                delay = studio_settings.calculate_backoff_delay(failures)
+                                target_next = now_ts + delay
+                                try:
+                                    studio_settings.update_settings(
+                                        {
+                                            "consecutive_failures": failures,
+                                            "next_run": target_next,
+                                        },
+                                        settings_path=ROOT / "studio-settings.json",
+                                    )
+                                    _IN_MEMORY_NEXT_RUN = None
+                                    _IN_MEMORY_CONSECUTIVE_FAILURES = None
+                                except Exception:
+                                    _IN_MEMORY_NEXT_RUN = target_next
+                                    _IN_MEMORY_CONSECUTIVE_FAILURES = failures
+
+                else:
+                    # Mode is "preview"
+                    google_ex = bool(tracker.get("google_quota_exhausted", False)) or (quota_suspended and reason == "google_quota_exhausted")
+                    if google_ex:
+                        SCHEDULER_DIAGNOSTICS["state"] = "waiting_for_quota"
+                        SCHEDULER_DIAGNOSTICS["deferral_reason"] = "google_quota_exhausted"
+                        continue
+
+                    cfg = get_config()
+                    disc_cfg = cfg.get("discovery", {})
+                    has_yt = bool(disc_cfg.get("youtube_queries"))
+                    has_others = bool(disc_cfg.get("subreddits") or disc_cfg.get("news_rss") or disc_cfg.get("wikimedia_sections") or disc_cfg.get("wikipedia_queries"))
+                    search_limit_reached = bool(tracker.get("search_limit_reached", False)) or (quota_suspended and reason == "search_quota_limit")
+
+                    if has_yt and not has_others and search_limit_reached:
+                        SCHEDULER_DIAGNOSTICS["state"] = "waiting_for_quota"
+                        SCHEDULER_DIAGNOSTICS["deferral_reason"] = "search_quota_limit"
+                        continue
+
+                    try:
+                        start_job("preview", automatic=True)
+                        SCHEDULER_DIAGNOSTICS["state"] = "job_dispatched"
+                        SCHEDULER_DIAGNOSTICS["deferral_reason"] = ""
+                    except Exception as start_err:
+                        LOG.error("Automation: Failed to start preview job: %s", start_err)
+                        failures = effective_failures + 1
+                        delay = studio_settings.calculate_backoff_delay(failures)
+                        target_next = now_ts + delay
+                        try:
+                            studio_settings.update_settings(
+                                {
+                                    "consecutive_failures": failures,
+                                    "next_run": target_next,
+                                },
+                                settings_path=ROOT / "studio-settings.json",
+                            )
+                            _IN_MEMORY_NEXT_RUN = None
+                            _IN_MEMORY_CONSECUTIVE_FAILURES = None
+                        except Exception:
+                            _IN_MEMORY_NEXT_RUN = target_next
+                            _IN_MEMORY_CONSECUTIVE_FAILURES = failures
         except Exception as e:
             LOG.error("Automation error: %s", e)
 
@@ -1820,6 +2314,17 @@ class StudioHandler(BaseHTTPRequestHandler):
 
             with GUARD:
                 cfg = get_automation_settings()
+                sched_state = SCHEDULER_DIAGNOSTICS.get("state", "idle")
+                defer_reason = SCHEDULER_DIAGNOSTICS.get("deferral_reason", "")
+                eff_due = studio_settings.calculate_effective_due_time(
+                    cfg.get("next_run", 0),
+                    quota_suspended=cfg.get("quota_suspended", False),
+                    quota_suspended_until=cfg.get("quota_suspended_until_pt", ""),
+                )
+                cfg["scheduler_state"] = sched_state
+                cfg["deferral_reason"] = defer_reason
+                cfg["effective_due_time"] = eff_due
+
                 records = store.records("jobs")
                 pending = [j for j in records if j.get("status") == "pending"]
                 pending.sort(key=lambda j: j.get("created_at", ""))
@@ -1846,6 +2351,9 @@ class StudioHandler(BaseHTTPRequestHandler):
                     "busy": store.busy(),
                     "free_space_mb": int(shutil.disk_usage(ROOT).free / (1024 * 1024)),
                     "automation": cfg,
+                    "scheduler_state": sched_state,
+                    "deferral_reason": defer_reason,
+                    "effective_due_time": eff_due,
                     "platform": platform.system(),
                     "queue_count": len(pending),
                     "queued_jobs": [j["id"] for j in pending],
@@ -2106,6 +2614,7 @@ class StudioHandler(BaseHTTPRequestHandler):
             self.send_json({"error": "The action could not be completed. Check the local service log."}, 500)
 
     def mutate(self, path: str, data: dict) -> dict | None:
+        global _IN_MEMORY_NEXT_RUN, _IN_MEMORY_CONSECUTIVE_FAILURES
         if path in ("/api/retention/audit", "/api/retention"):
             return studio_retention.audit_retention(root=ROOT)
 
@@ -2345,6 +2854,11 @@ class StudioHandler(BaseHTTPRequestHandler):
                         auto["mode"] = "publish"
                     try:
                         studio_settings.update_settings(auto, settings_path=ROOT / "studio-settings.json")
+                        if not auto.get("enabled", True) or "next_run" in auto:
+                            _IN_MEMORY_NEXT_RUN = None
+                        if not auto.get("enabled", True) or "consecutive_failures" in auto:
+                            _IN_MEMORY_CONSECUTIVE_FAILURES = None
+                        AUTOMATION_EVENT.set()
                     except studio_settings.ConfigurationCorruptError as e:
                         LOG.error("Settings configuration corrupt: %s", e)
                         raise ValueError("Settings file or payload is invalid or corrupt.")
