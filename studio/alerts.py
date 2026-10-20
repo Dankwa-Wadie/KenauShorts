@@ -303,6 +303,10 @@ def reset_engine_for_testing() -> None:
     global _ACCEPTED_EVENTS_COUNT, _COMMITTED_EVENTS_COUNT, _DROPPED_STALE_COUNT, _DROPPED_ALERTS_COUNT
     global _PERSISTENCE_FAILURES_COUNT, _HAS_PERSISTENCE_FAILURE, _CURRENT_EVENT_BEING_PROCESSED
 
+    _SHUTDOWN_EVENT.set()
+    if _DRAIN_THREAD and _DRAIN_THREAD.is_alive():
+        _DRAIN_THREAD.join(timeout=1.0)
+
     with _TRANSITION_LOCK:
         _TRANSITION_SEQ = 0
         _INITIALIZED = False
@@ -481,6 +485,16 @@ def close_alert_intake() -> None:
     with _ENQUEUE_LOCK:
         if _ENGINE_STATE == "running":
             _ENGINE_STATE = "stopping"
+
+
+def wait_for_drain(timeout: float = 2.0) -> bool:
+    """Waits for all enqueued alert events to be processed by the drain worker."""
+    deadline = time.monotonic() + timeout
+    while not _ALERT_QUEUE.empty() or _CURRENT_EVENT_BEING_PROCESSED is not None:
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(0.005)
+    return True
 
 
 def enqueue_alert_event(event: AlertEvent) -> bool:

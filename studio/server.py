@@ -39,7 +39,7 @@ if __name__ == "__main__" and __package__ is None:
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from core.style_presets import STYLE_PRESETS
-from studio import alerts, retention as studio_retention
+from studio import alerts, retention as studio_retention, supervisor
 from studio import settings as studio_settings
 from studio import store
 
@@ -64,6 +64,8 @@ SCHEDULER_DIAGNOSTICS: dict[str, str] = {
 _IN_MEMORY_NEXT_RUN: float | None = None
 _IN_MEMORY_CONSECUTIVE_FAILURES: int | None = None
 QUEUE_WORKER_THREAD: threading.Thread | None = None
+SUPERVISOR_THREAD: threading.Thread | None = None
+SUPERVISOR_INSTANCE: Any | None = None
 _CONNECTION_TEST_LOCK = threading.Lock()
 _RECONCILING_VIDEOS: set[str] = set()
 _RECONCILE_LOCK = threading.Lock()
@@ -1037,6 +1039,14 @@ def ensure_queue_worker() -> None:
         if QUEUE_WORKER_THREAD is None or not QUEUE_WORKER_THREAD.is_alive():
             QUEUE_WORKER_THREAD = threading.Thread(target=queue_worker_loop, daemon=True)
             QUEUE_WORKER_THREAD.start()
+
+def ensure_supervisor() -> None:
+    global SUPERVISOR_THREAD, SUPERVISOR_INSTANCE
+    with GUARD:
+        if SUPERVISOR_INSTANCE is None:
+            SUPERVISOR_INSTANCE = supervisor.Supervisor(stop_event=STOP_EVENT)
+        if SUPERVISOR_THREAD is None or not SUPERVISOR_THREAD.is_alive():
+            SUPERVISOR_THREAD = SUPERVISOR_INSTANCE.start()
 
 def cancel_job(job_id: str | None = None) -> dict:
     global ACTIVE_JOB, ACTIVE_PROC
@@ -2372,6 +2382,10 @@ class StudioHandler(BaseHTTPRequestHandler):
             self.send_json({"alerts": alerts_list, "count": len(alerts_list)})
             return
 
+        if path == "/api/health":
+            self.send_json(supervisor.get_health_telemetry())
+            return
+
         if path == "/api/queue":
             with GUARD:
                 records = store.records("jobs")
@@ -3351,6 +3365,7 @@ def run_server(port: int = PORT) -> None:
             recover_interrupted_jobs()
             alerts.start_alert_engine()
             ensure_queue_worker()
+            ensure_supervisor()
 
             LOG.info("KenauShorts Studio running at http://127.0.0.1:%d/", port)
 
@@ -3368,6 +3383,8 @@ def run_server(port: int = PORT) -> None:
                     workers.append(QUEUE_WORKER_THREAD)
                 if t and t.is_alive():
                     workers.append(t)
+                if SUPERVISOR_THREAD and SUPERVISOR_THREAD.is_alive():
+                    workers.append(SUPERVISOR_THREAD)
                 clean, diag = stop_studio_application(
                     server=httpd,
                     alert_engine_stop_fn=alerts.stop_alert_engine,

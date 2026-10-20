@@ -12,6 +12,36 @@ what's actually on `origin/main`.
 
 ## Current state (update this section each handoff)
 
+- **Stage 7 Phase 4 Milestone 5 Completed & Verified (Independent Health Telemetry and Diagnostic Stall Alerts in `studio/supervisor.py`)**:
+  - **Bounded Probe Runner & Resource Leak Prevention (`studio/supervisor.py`)**:
+    - `BoundedProbeRunner`: Thread-safe bounded execution ($\le 2.0\text{s}$) with single-probe concurrency lock refusing new thread spawning while a probe is active; the concurrency lock remains held until the probe worker completes, not merely until caller timeout expires, strictly guaranteeing zero thread accumulation under persistent probe timeouts, hung I/O, or SQLite lock contention.
+    - `probe_database(db_path, runner)`: Lightweight `SELECT 1` query probe with `sqlite3.connect(..., timeout=1.5)` bounded by 2.0s runner timeout. Handles connection errors, query timeouts, and schema accessibility, with connection cleanup strictly in `finally: conn.close()`.
+    - `probe_disk_space(root_dir, runner)`: Filesystem free space probe supporting namedtuples, tuples, and dicts. Classifies disk health into `critical` (< 512 MB), `low` (< 1024 MB), and `healthy`.
+  - **Authoritative Stall Semantics & Background Supervisor Daemon**:
+    - `Supervisor`: Background daemon thread executing on an approved 15-second tick interval.
+    - Non-blocking `GUARD.acquire(timeout=0.5)` for in-memory active job inspection, falling back safely to SQLite state if locked.
+    - Active job progress stall detection: Inspects running jobs (`status == "running"`) and detects stalls when elapsed time since the latest progress stage or start time exceeds the 300-second stall threshold (`time.time() - last_progress > 300.0`). All authoritative terminal states (`completed`, `failed`, `cancelled`, `interrupted`, `idle`) resolve active job-stall alerts.
+    - Scheduler stall detection: Detects dead or stalled scheduler loop when next scheduled run is overdue beyond acceptable grace period, while strictly excluding all legitimate scheduler deferral states (`waiting_for_quota`, `waiting_for_candidate`, `waiting_for_worker`, `waiting_for_network`, `disabled`) and deferral reasons (`google_quota_exhausted`, `upload_quota_limit`, `search_quota_limit`, `no_ready_videos`, `publish_waiting_for_candidate`, `worker_busy`, `offline`, `disabled`).
+    - Dead queue worker detection: Detects queue thread failure while queued jobs remain pending.
+  - **Idempotent Alert Creation & Auto-Recovery**:
+    - Enqueues diagnostic alerts through the Milestone 4 alert engine (`studio/alerts.py`) utilizing partial unique index `idx_alerts_active` via fingerprinting (`db_probe_failed`, `disk_space_low`, `disk_space_critical`, `scheduler_stalled`, `queue_worker_dead`, `job_progress_stalled:{job_id}`).
+    - Deterministic condition auto-recovery: Automatically detects when a condition recovers (e.g., job progress resumes, disk space frees, database connectivity restores, job reaches terminal state) and resolves active alerts via `alerts.resolve_condition()`, advancing recovery markers.
+  - **Studio Server Lifecycle Coordination (`studio/server.py`)**:
+    - Added `SUPERVISOR_THREAD` and `SUPERVISOR_INSTANCE` globals, `ensure_supervisor()`.
+    - Added `GET /api/health` HTTP endpoint delivering live telemetry (`status`, `db_healthy`, `disk_healthy`, `scheduler_healthy`, `queue_healthy`, `active_job`, `stalled_jobs`, `alerts`).
+    - Registered `SUPERVISOR_THREAD` in server shutdown lifecycle (`workers` in `stop_studio_application()`), ensuring supervisor is joined before producer quiescence checks and alert intake closure.
+  - **Alert Engine Hardening (`studio/alerts.py`)**:
+    - Added `wait_for_drain(timeout: float = 2.0) -> bool` to await `_ALERT_QUEUE` and `_CURRENT_EVENT_BEING_PROCESSED`.
+    - Hardened `reset_engine_for_testing()` to signal `_SHUTDOWN_EVENT.set()` and join `_DRAIN_THREAD` before clearing queue and state, eliminating thread leakage between unit tests.
+  - **Deterministic Test Suites & Comprehensive Coverage**:
+    - `tests/test_supervisor.py` (13 tests): Database probe success (`SELECT 1`), database probe failure/timeout, disk space health classification, zero thread accumulation and concurrency lock retention under probe timeout, scheduler stall detection with all legitimate quota/state exclusions, dead queue worker detection, active job progress stall detection (>300s since last stage), active job progress resumed -> auto-resolution of stall alert, all terminal job states (`completed`, `failed`, `cancelled`, `interrupted`, `idle`) resolve stall alerts, alert deduplication on repeated supervisor ticks, orderly shutdown responsiveness within bounded timeout, health telemetry payload schema and consistency, and HTTP `GET /api/health` integration via `StudioHandler`.
+    - Test Suite Pass Evidence:
+      - `tests/test_supervisor.py`: 13/13 passed (4.1s, 0 ResourceWarnings).
+      - Lifecycle + Alerts + Supervisor combined suite: 40/40 passed (8.7s, 0 ResourceWarnings).
+      - Full repository test discovery suite: 388/388 passed (61.4s, 1 skipped on Windows symlink privileges, 0 failures, 0 errors).
+  - **Remaining Stage 7 Phase 4 Milestones**:
+    - Milestone 6: Frontend integration and end-to-end verification.
+
 - **Stage 7 Phase 4 Milestone 4 Completed & Verified (Operational Alert Lifecycle, Transition Matrix, Drain Worker & Server Shutdown Coordination)**:
   - **Operational Alert Engine & Persistence (`studio/alerts.py`)**:
     - Complete alert lifecycle with severity ranking (`critical`, `warning`, `info`), incident deduplication via unique partial index `idx_alerts_active` (`WHERE resolved_at IS NULL`), and transitions (`active` -> `acknowledged` -> `resolved`).
@@ -1018,4 +1048,4 @@ Stage 2 meets all single-instance operational requirements: process tracking, pr
 
 ### Remaining Limitations
 - Local quota counters remain estimates; Google Developer Console is the authoritative source of truth.
-- Stage 7 Phase 4 Milestones 1-4 completed & verified. Milestone 5 (Supervisor health telemetry) is next.
+- Stage 7 Phase 4 Milestones 1-5 completed & verified. Milestone 6 (Frontend integration and end-to-end verification) is next.
