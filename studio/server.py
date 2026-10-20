@@ -39,7 +39,7 @@ if __name__ == "__main__" and __package__ is None:
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from core.style_presets import STYLE_PRESETS
-from studio import retention as studio_retention
+from studio import alerts, retention as studio_retention
 from studio import settings as studio_settings
 from studio import store
 
@@ -2366,6 +2366,12 @@ class StudioHandler(BaseHTTPRequestHandler):
             self.send_json(payload)
             return
 
+        if path == "/api/alerts":
+            with store.connect() as db:
+                alerts_list = alerts.list_active_alerts(db)
+            self.send_json({"alerts": alerts_list, "count": len(alerts_list)})
+            return
+
         if path == "/api/queue":
             with GUARD:
                 records = store.records("jobs")
@@ -2404,6 +2410,23 @@ class StudioHandler(BaseHTTPRequestHandler):
             enriched = [store.enrich_video_record(r) for r in records]
             self.send_json(enriched)
             return
+
+        if path == "/api/alerts/resolve":
+            target_id = data.get("id", "").strip()
+            if not target_id:
+                raise ValueError("Missing alert id to resolve")
+            actor = data.get("actor", "operator").strip()
+            reason = data.get("reason", "").strip()
+            with store.connect() as db:
+                return alerts.execute_operator_transition(db, "resolve", target_id, actor=actor, reason=reason)
+
+        if path == "/api/alerts/acknowledge":
+            target_id = data.get("id", "").strip()
+            if not target_id:
+                raise ValueError("Missing alert id to acknowledge")
+            actor = data.get("actor", "operator").strip()
+            with store.connect() as db:
+                return alerts.execute_operator_transition(db, "acknowledge", target_id, actor=actor)
 
         if path in ("/api/retention/audit", "/api/retention"):
             try:
@@ -2605,6 +2628,8 @@ class StudioHandler(BaseHTTPRequestHandler):
                 raise ValueError("Invalid request")
             result = self.mutate(path, data)
             self.send_json(result if result is not None else {"status": "ok"})
+        except alerts.AlertNotFoundError as e:
+            self.send_json({"error": str(e)}, 404)
         except ConflictError as e:
             self.send_json({"error": str(e)}, 409)
         except (ValueError, KeyError, TypeError) as e:
@@ -3052,8 +3077,264 @@ def server_lock():
                 except Exception:
                     pass
 
-class StudioServer(ThreadingHTTPServer):
+class ServerLifecycle:
+    NOT_STARTED = "not_started"
+    STARTING = "starting"
+    SERVING = "serving"
+    STOPPING = "stopping"
+    STOPPED = "stopped"
+
+
+class StudioServerLifecycleMixIn:
+    allow_reuse_address = False  # Preserves Stage 3 multi-instance collision prevention
+    daemon_threads = False
+    block_on_close = False       # Eliminates ThreadingMixIn's unbounded join in server_close()
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._lifecycle_lock = threading.Lock()
+        self._lifecycle_state = ServerLifecycle.NOT_STARTED
+        self._active_handlers: set[threading.Thread] = set()
+        self._in_flight_handlers: int = 0
+        self._shutdown_requested = threading.Event()
+        self._loop_ready = threading.Event()
+        self._loop_terminated = threading.Event()
+        self._serving_thread: threading.Thread | None = None
+        self._socket_closed: bool = False
+
+    def service_actions(self) -> None:
+        super().service_actions()
+        if not self._loop_ready.is_set():
+            with self._lifecycle_lock:
+                if self._lifecycle_state == ServerLifecycle.STARTING:
+                    self._lifecycle_state = ServerLifecycle.SERVING
+            self._loop_ready.set()
+
+    def serve_forever(self, poll_interval: float = 0.05) -> None:
+        with self._lifecycle_lock:
+            if self._shutdown_requested.is_set():
+                self._lifecycle_state = ServerLifecycle.STOPPED
+                self._loop_terminated.set()
+                return
+            self._lifecycle_state = ServerLifecycle.STARTING
+            self._serving_thread = threading.current_thread()
+
+        try:
+            super().serve_forever(poll_interval=poll_interval)
+        finally:
+            with self._lifecycle_lock:
+                self._lifecycle_state = ServerLifecycle.STOPPED
+            self._loop_terminated.set()
+
+    def process_request_thread(self, request, client_address) -> None:
+        current = threading.current_thread()
+        admitted = False
+
+        with self._lifecycle_lock:
+            if self._lifecycle_state == ServerLifecycle.SERVING and not self._shutdown_requested.is_set():
+                self._active_handlers.add(current)
+                self._in_flight_handlers += 1
+                admitted = True
+
+        if not admitted:
+            try:
+                request.sendall(
+                    b"HTTP/1.1 503 Service Unavailable\r\n"
+                    b"Content-Type: application/json\r\n"
+                    b"Connection: close\r\n\r\n"
+                    b"{\"error\":\"Server is shutting down\"}"
+                )
+            except Exception:
+                pass
+            finally:
+                self.close_request(request)
+            return
+
+        try:
+            super().process_request_thread(request, client_address)
+        finally:
+            with self._lifecycle_lock:
+                self._active_handlers.discard(current)
+                self._in_flight_handlers -= 1
+
+    def stop_serving(self, total_timeout: float = 3.0) -> tuple[bool, dict[str, Any]]:
+        deadline = time.monotonic() + total_timeout
+        self._shutdown_requested.set()
+
+        with self._lifecycle_lock:
+            state = self._lifecycle_state
+            if state in (ServerLifecycle.NOT_STARTED, ServerLifecycle.STOPPED):
+                if self._serving_thread is None or not self._serving_thread.is_alive():
+                    self._lifecycle_state = ServerLifecycle.STOPPED
+                    if not self._socket_closed:
+                        try:
+                            self.server_close()
+                        except Exception:
+                            pass
+                        finally:
+                            self._socket_closed = True
+                    return True, {
+                        "serving_loop_stopped": True,
+                        "socket_closed": True,
+                        "registered_handlers": 0,
+                        "live_handler_threads": 0,
+                        "timed_out": False,
+                    }
+            self._lifecycle_state = ServerLifecycle.STOPPING
+
+        # 1. Await loop readiness bounded by shared deadline
+        budget = max(0.0, deadline - time.monotonic())
+        self._loop_ready.wait(timeout=min(0.5, budget))
+
+        # 2. Always trigger public shutdown() method in background thread
+        if self._serving_thread and self._serving_thread.is_alive():
+            shutdown_thread = threading.Thread(target=self.shutdown, daemon=True)
+            shutdown_thread.start()
+            budget = max(0.0, deadline - time.monotonic())
+            shutdown_thread.join(timeout=budget)
+
+        # 3. Join serving loop thread within remaining budget
+        if self._serving_thread and self._serving_thread.is_alive():
+            budget = max(0.0, deadline - time.monotonic())
+            self._serving_thread.join(timeout=budget)
+
+        with self._lifecycle_lock:
+            loop_stopped = (self._serving_thread is None) or (
+                self._loop_terminated.is_set() and not self._serving_thread.is_alive()
+            )
+            if loop_stopped:
+                self._lifecycle_state = ServerLifecycle.STOPPED
+
+            # 4. Close listening socket ONLY if loop is confirmed stopped
+            if loop_stopped and not self._socket_closed:
+                try:
+                    self.server_close()
+                except Exception as e:
+                    LOG.debug("server_close error: %s", e)
+                finally:
+                    self._socket_closed = True
+            socket_closed = self._socket_closed
+
+        # 5. Join in-flight handlers within remaining deadline
+        with self._lifecycle_lock:
+            handlers_snapshot = list(self._active_handlers)
+
+        for h in handlers_snapshot:
+            budget = max(0.0, deadline - time.monotonic())
+            if budget <= 0:
+                break
+            h.join(timeout=budget)
+
+        with self._lifecycle_lock:
+            registered_count = len(self._active_handlers)
+            in_flight_count = self._in_flight_handlers
+            live_handlers = [h for h in handlers_snapshot if h.is_alive()]
+
+        timed_out = (time.monotonic() >= deadline)
+        clean = loop_stopped and socket_closed and (registered_count == 0) and (in_flight_count == 0) and (len(live_handlers) == 0) and (not timed_out)
+        return clean, {
+            "serving_loop_stopped": loop_stopped,
+            "socket_closed": socket_closed,
+            "registered_handlers": registered_count,
+            "in_flight_handlers": in_flight_count,
+            "live_handler_threads": len(live_handlers),
+            "timed_out": timed_out,
+        }
+
+
+class StudioServer(StudioServerLifecycleMixIn, ThreadingHTTPServer):
     allow_reuse_address = False
+    daemon_threads = False
+    block_on_close = False
+
+
+def stop_studio_application(
+    server: StudioServerLifecycleMixIn,
+    alert_engine_stop_fn: Optional[callable] = None,
+    stop_event: Optional[threading.Event] = None,
+    background_workers: Optional[list[threading.Thread]] = None,
+    total_timeout: float = 6.0,
+) -> tuple[bool, dict[str, Any]]:
+    deadline = time.monotonic() + total_timeout
+
+    # 1. Signal producer events (STOP_EVENT notifies queue and automation loops)
+    if stop_event:
+        stop_event.set()
+
+    # 2. Stop HTTP server bounded by shared deadline (best-effort cooperative join)
+    rem_budget = max(0.0, deadline - time.monotonic())
+    http_budget = min(rem_budget, total_timeout * 0.4)
+    http_clean, http_diag = server.stop_serving(total_timeout=http_budget)
+
+    # 3. Stop and join required background workers BEFORE alert engine drain
+    workers_clean = True
+    live_workers_count = 0
+    if background_workers:
+        for w in background_workers:
+            rem_budget = max(0.0, deadline - time.monotonic())
+            if rem_budget > 0:
+                w.join(timeout=rem_budget)
+            if w.is_alive():
+                workers_clean = False
+                live_workers_count += 1
+
+    # 4. Close alert intake gate so NO NEW alerts or operator transitions can be accepted
+    alerts.close_alert_intake()
+
+    # 5. Definitive producer-quiescence barrier across HTTP handlers, background workers, and operator transitions
+    with server._lifecycle_lock:
+        live_handlers = [h for h in server._active_handlers if h.is_alive()]
+        in_flight_count = getattr(server, "_in_flight_handlers", len(live_handlers))
+    live_workers = [w for w in background_workers if w.is_alive()] if background_workers else []
+    active_transitions = getattr(alerts, "get_active_operator_transitions", lambda: getattr(alerts, "_ACTIVE_OPERATOR_TRANSITIONS", 0))()
+    producers_quiescent = (
+        (len(live_handlers) == 0) and
+        (in_flight_count == 0) and
+        (len(live_workers) == 0) and
+        (active_transitions == 0)
+    )
+
+    # 6. Drain and stop Alert Engine bounded by remaining deadline (best-effort cooperative join)
+    alerts_clean = True
+    alerts_diag = {}
+    if alert_engine_stop_fn:
+        rem_budget = max(0.0, deadline - time.monotonic())
+        try:
+            alerts_clean, alerts_diag = alert_engine_stop_fn(timeout=rem_budget, producers_quiescent=producers_quiescent)
+        except TypeError:
+            alerts_clean, alerts_diag = alert_engine_stop_fn(timeout=rem_budget)
+
+    # If any producer remained alive, report degraded shutdown and do not claim clean drain
+    if not producers_quiescent:
+        alerts_clean = False
+        alerts_diag["producers_quiescent"] = False
+        alerts_diag["producer_drain_clean"] = False
+        alerts_diag["accounting_complete"] = False
+        alerts_diag["live_handlers_count"] = len(live_handlers)
+        alerts_diag["in_flight_handlers_count"] = in_flight_count
+        alerts_diag["live_workers_count"] = len(live_workers)
+        alerts_diag["active_operator_transitions"] = active_transitions
+
+    # 7. Check if total deadline was exhausted or any subsystem timed out
+    timed_out = (time.monotonic() >= deadline) or http_diag.get("timed_out", False) or alerts_diag.get("timed_out", False)
+
+    # 8. Overall application cleanliness requires ALL subsystems clean, all producers quiescent, and no timeout
+    app_clean = http_clean and alerts_clean and workers_clean and producers_quiescent and (not timed_out)
+
+    return app_clean, {
+        "app_clean": app_clean,
+        "http_clean": http_clean,
+        "http_diag": http_diag,
+        "alerts_clean": alerts_clean,
+        "alerts_diag": alerts_diag,
+        "workers_clean": workers_clean,
+        "live_workers_count": live_workers_count,
+        "in_flight_handlers_count": in_flight_count,
+        "active_operator_transitions": active_transitions,
+        "producers_quiescent": producers_quiescent,
+        "timed_out": timed_out,
+    }
+
 
 def run_server(port: int = PORT) -> None:
     try:
@@ -3068,6 +3349,7 @@ def run_server(port: int = PORT) -> None:
             store.load_secrets()
             store.import_legacy()
             recover_interrupted_jobs()
+            alerts.start_alert_engine()
             ensure_queue_worker()
 
             LOG.info("KenauShorts Studio running at http://127.0.0.1:%d/", port)
@@ -3081,9 +3363,20 @@ def run_server(port: int = PORT) -> None:
             except KeyboardInterrupt:
                 LOG.info("Stopping KenauShorts Studio...")
             finally:
-                STOP_EVENT.set()
-                httpd.shutdown()
-                httpd.server_close()
+                workers = []
+                if QUEUE_WORKER_THREAD and QUEUE_WORKER_THREAD.is_alive():
+                    workers.append(QUEUE_WORKER_THREAD)
+                if t and t.is_alive():
+                    workers.append(t)
+                clean, diag = stop_studio_application(
+                    server=httpd,
+                    alert_engine_stop_fn=alerts.stop_alert_engine,
+                    stop_event=STOP_EVENT,
+                    background_workers=workers,
+                    total_timeout=6.0,
+                )
+                if not clean:
+                    LOG.warning("KenauShorts Studio shutdown degraded: %s", diag)
     except RuntimeError as e:
         LOG.error("Cannot start KenauShorts Studio: %s", e)
         return

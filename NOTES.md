@@ -12,6 +12,40 @@ what's actually on `origin/main`.
 
 ## Current state (update this section each handoff)
 
+- **Stage 7 Phase 4 Milestone 4 Completed & Verified (Operational Alert Lifecycle, Transition Matrix, Drain Worker & Server Shutdown Coordination)**:
+  - **Operational Alert Engine & Persistence (`studio/alerts.py`)**:
+    - Complete alert lifecycle with severity ranking (`critical`, `warning`, `info`), incident deduplication via unique partial index `idx_alerts_active` (`WHERE resolved_at IS NULL`), and transitions (`active` -> `acknowledged` -> `resolved`).
+    - Explicit transaction and migration atomicity (`init_alert_schema`): uses transaction savepoints (`SAVEPOINT init_alert_schema`) to protect schema creation, defensive legacy column migrations (all 21 columns and default values), duplicate active incident resolution, and partial unique index creation.
+    - Idempotent table and index creation, safe on existing SQLite connections whether or not an outer transaction is active.
+    - Deterministic recovery marker tracking (`alert_recovery_markers` table) tracking high-water marks and recovery states for active alerts.
+  - **Fail-Stop Drain Worker & In-Memory Enqueue Queue**:
+    - Dedicated drain thread (`_DRAIN_THREAD`) with unbounded thread-safe FIFO queue (`_ENQUEUE_QUEUE`) consuming enqueue requests and persisting alerts/events to SQLite via dedicated database connection (`_DEDICATED_CONN`).
+    - Dedicated database connection lifecycle: `_DEDICATED_CONN` is never closed while `_DRAIN_THREAD` is alive, even if shutdown times out, preventing `ProgrammingError: Cannot operate on a closed database`.
+    - Fail-stop crash containment: In the event of a drain loop exception, the worker captures the diagnostic crash state, sets `_DRAIN_CRASH_EVENT`, and stops cleanly without corrupting transaction state.
+  - **Operator-Transition Shutdown Barrier & Admission Protocol**:
+    - Race-safe transition admission: `execute_operator_transition()` checks `_ENGINE_STATE == "running"` under `_ENQUEUE_LOCK` and tracks in-flight operations with `_ACTIVE_OPERATOR_TRANSITIONS`.
+    - `get_active_operator_transitions()` inspects in-flight transitions under `_ENQUEUE_LOCK`.
+    - New operator transitions are rejected with `RuntimeError("Alert intake is closed")` once shutdown begins (`close_alert_intake()`).
+    - Shutdown coordination (`stop_studio_application` in `studio/server.py` and `stop_alert_engine` in `studio/alerts.py`) checks `active_operator_transitions == 0` before declaring `producers_quiescent`.
+    - `accounting_complete` and `clean` shutdown fail closed (`False`) whenever any operator transition or handler remains active or unrecorded.
+  - **Studio Server Lifecycle Coordination (`studio/server.py`)**:
+    - Unified orderly shutdown sequence in `stop_studio_application()`:
+      1. Closes server socket and stops HTTP request intake (`StudioServer.stop_serving()`).
+      2. Waits for in-flight HTTP request handlers (`live_handlers`) to finish.
+      3. Signals automation and supervisor background loops to stop and joins worker threads (`live_workers`).
+      4. Closes alert intake via `close_alert_intake()` under `_ENQUEUE_LOCK`.
+      5. Evaluates producer quiescence: `producers_quiescent = (len(live_handlers) == 0 and in_flight_count == 0 and len(live_workers) == 0 and active_transitions == 0)`.
+      6. Stops alert drain engine (`stop_alert_engine()`), draining remaining events and verifying accounting against high-water marks.
+      7. Returns comprehensive diagnostic payload including `clean`, `producers_quiescent`, `accounting_complete`, `live_handlers`, `live_workers`, and `active_operator_transitions`.
+  - **Deterministic Test Suites & Comprehensive Coverage**:
+    - `tests/test_alerts.py` (14 tests): Full schema migration, all 21 column definitions and defaults, partial unique index `idx_alerts_active`, duplicate resolution, recovery marker schema, transition matrix (`active` -> `acknowledged` -> `resolved`), stale acknowledgement rejections, recovery accounting, and crash-containment isolation.
+    - `tests/test_server_lifecycle.py` (13 tests): Orderly application shutdown, socket closure and connection refusal, active request handler drains, stuck-handler timeout diagnostics, producer quiescence barriers, deterministic operator-transition barriers (`test_active_operator_transition_blocks_quiescence_and_accounting`), and drain accounting completeness.
+    - Stage 7 Regression: 175 tests passed (1 skip on Windows symlink privilege).
+    - Full repository test discovery suite: 375 tests passed (1 skip on Windows symlink privilege, 0 failures, 0 errors in 60.9s).
+  - **Remaining Stage 7 Phase 4 Milestones**:
+    - Milestone 5: Independent health telemetry and diagnostic stall alerts (`studio/supervisor.py`).
+    - Milestone 6: Frontend integration and end-to-end verification.
+
 - **Stage 7 Phase 4 Milestone 3 Completed & Verified (Quota-Aware Scheduling, Bounded Jitter & Pacific-Time Rollover Resumption)**:
   - **Decoupled Job Dispatch from Execution Completion (`studio/server.py`)**:
     - Decoupled `next_run` advancement and failure count resets from initial job dispatch. Successful dispatch via `start_job()` merely transitions the scheduler to track the running job.
@@ -56,7 +90,6 @@ what's actually on `origin/main`.
     - `tests/test_stage7_phase4_scheduling.py`: 41/41 passed (3.5s), including 6 in-memory persistence-recovery regression tests (covering upload success persistence failure, publish-staging failure, consecutive failure backoff escalation, self-healing reconciliation, Pacific rollover with a future in-memory deadline, and `/api/settings` mutation override preservation/clearing), 5 deterministic synchronization regression tests, and 3 focused defensive completion-handling and early-cancellation tests.
     - Full repository test discovery suite: 348 passed and 1 skipped out of 349 discovered tests (43.9s, 0 failures, 0 errors, 1 skipped on Windows symlink privileges).
   - **Remaining Stage 7 Phase 4 Milestones**:
-    - Milestone 4: Operational alert lifecycle and SQLite partial index (`studio/alerts.py`).
     - Milestone 5: Independent health telemetry and diagnostic stall alerts (`studio/supervisor.py`).
     - Milestone 6: Frontend integration and end-to-end verification.
 
@@ -985,4 +1018,4 @@ Stage 2 meets all single-instance operational requirements: process tracking, pr
 
 ### Remaining Limitations
 - Local quota counters remain estimates; Google Developer Console is the authoritative source of truth.
-- Stage 7 Phase 4 has not been started.
+- Stage 7 Phase 4 Milestones 1-4 completed & verified. Milestone 5 (Supervisor health telemetry) is next.
