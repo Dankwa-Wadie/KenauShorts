@@ -115,6 +115,8 @@ class BoundedProbeRunner:
             return False, None, f"thread_spawn_failed: {e}"
 
         if done_event.wait(timeout=to):
+            # Probe finished within budget; wait for worker to complete lock release
+            th.join(timeout=0.5)
             if error_holder[0] is not None:
                 exc = error_holder[0]
                 return False, None, f"{type(exc).__name__}: {exc}"

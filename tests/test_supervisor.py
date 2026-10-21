@@ -527,6 +527,19 @@ class TestSupervisor(unittest.TestCase):
         self.assertEqual(res3, "healthy")
         self.assertIsNone(err3)
 
+    # -----------------------------------------------------------------------
+    # 14. Probe Runner Sequential Immediate Handoff
+    # -----------------------------------------------------------------------
+    def test_bounded_probe_runner_immediate_sequential_handoff(self):
+        """Verify sequential probes on the same runner complete back-to-back without busy rejection."""
+        runner = BoundedProbeRunner(max_timeout=1.0)
+        for i in range(10):
+            probe_val = f"probe_result_{i}"
+            ok, res, err = runner.run_probe(lambda val=probe_val: val, timeout=0.5)
+            self.assertTrue(ok, f"Sequential probe #{i} failed with error: {err}")
+            self.assertEqual(res, probe_val)
+            self.assertIsNone(err)
+
 
 if __name__ == "__main__":
     unittest.main()
