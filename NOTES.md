@@ -12,6 +12,30 @@ what's actually on `origin/main`.
 
 ## Current state (update this section each handoff)
 
+- **Operational Smoke Test Coverage & Probe Concurrency Race Fix Completed & Verified (`a8682c48c7014831b20249ecc033f8d8c17572c1`)**:
+  - **Sequential-Probe Concurrency Fix (`studio/supervisor.py`)**:
+    - Identified a race in `BoundedProbeRunner.run_probe()`: `done_event.set()` fired in the inner `finally` block before the worker thread executed outer `finally: self._concurrency_lock.release()`.
+    - Added `th.join(timeout=0.5)` when `done_event.wait(timeout=to)` is True. Guarantees the completed worker thread fully terminates and releases the concurrency lock before `run_probe()` returns to callers executing sequential probes (`Supervisor.tick()` calling `probe_database()` then `probe_disk_space()`).
+    - Strictly preserves single-worker bounds and timeout behavior: timed-out probes (`done_event.wait()` times out) bypass `join` and continue holding `_concurrency_lock` in the background, rejecting new threads with `"probe_worker_busy_previous_timed_out"`.
+  - **Sequential Probe Regression Test (`tests/test_supervisor.py`)**:
+    - Added `test_bounded_probe_runner_immediate_sequential_handoff`: 10 immediate sequential probes back-to-back on a single `BoundedProbeRunner` with zero sleeps, proving zero busy rejections.
+  - **Controlled Non-Publishing Operational Smoke Test (`tests/test_operational_smoke.py`)**:
+    - Pre-execution action inventory and isolation verification against all publish and network entry points.
+    - Outbound API & upload blackhole protection: `unittest.mock.patch` poison-pills on `core.agent.upload_to_youtube`, `core.agent.discover_youtube`, `studio.server.test_youtube_connection`, and `studio.server.reconcile_video_upload` raising `RuntimeError`.
+    - Network socket isolation: `studio.server.is_online` patched to return `True` without external network packets; loopback-only HTTP client.
+    - Database & settings isolation: dedicated ephemeral SQLite DB (`smoke_studio.sqlite3`) and isolated settings file (`isolated-settings.json`).
+    - Live loopback HTTP server binding on ephemeral port (`StudioServer` + `StudioHandler`).
+    - Validates static asset delivery (`/`, `/style.css`, `/app.js`), operational endpoints (`/api/status`, `/api/health`, `/api/alerts`, `/api/queue`, `/api/retention/audit`), supervisor tick cycle, and graceful shutdown (`server.stop_studio_application()`).
+    - Genuine `unittest` lifecycle cleanup verification: `test_operational_smoke_teardown_on_induced_failure` executes `NestedFailingSmokeTest` via `test_case.run(test_result)`, proving that `unittest`'s `doCleanups()` joins server and supervisor threads and closes listening socket even upon assertion failure.
+  - **Deterministic Test Suites & Verification Evidence**:
+    - Full repository discovery suite (`python -X utf8 -m unittest discover tests`): 401/401 passed (53.3s, 1 skipped on Windows symlinks, 0 failures, 0 errors).
+    - Node.js UI health tests: 13/13 passed (`node tests/test_health_ui.js`).
+    - Regression suites (`tests.test_supervisor`, `tests.test_alerts`, `tests.test_server_lifecycle`, `tests.test_frontend_integration`): 51/51 passed (10.8s).
+    - Codebase compilation: `python -m compileall core studio scripts tests` clean.
+    - Formatting check: `git diff --check` clean.
+    - Protected configuration: `studio-settings.json` completely untouched (`"interval_hours": 3`).
+    - Synchronized with `origin/main` at `a8682c48c7014831b20249ecc033f8d8c17572c1`.
+
 - **Stage 7 Phase 4 Milestone 6 Completed & Verified (Frontend Integration and End-to-End Verification)**:
   - **Health Telemetry UI Integration (`studio/web/app.js`, `studio/web/index.html`, `studio/web/style.css`)**:
     - Dual polling coordination: Replaced standalone status polling with concurrent `Promise.all([fetch('/api/status'), fetchHealthTelemetry()])` bounded by a 2.5s `AbortController` signal, preventing duplicate intervals or unbounded timer pileups.
@@ -1084,4 +1108,4 @@ Stage 2 meets all single-instance operational requirements: process tracking, pr
 
 ### Remaining Limitations
 - Local quota counters remain estimates; Google Developer Console is the authoritative source of truth.
-- Stage 7 Phase 4 (Milestones 1-6) completed & verified. Full end-to-end telemetry and alert pipeline operational.
+- Stage 7 Phase 4 (Milestones 1-6) + Operational Smoke Test & Probe Concurrency Race Fix completed & verified on origin/main (a8682c48c7014831b20249ecc033f8d8c17572c1).
