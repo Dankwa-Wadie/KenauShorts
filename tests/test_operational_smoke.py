@@ -199,7 +199,11 @@ class OperationalSmokeTest(unittest.TestCase):
         # Isolated automation settings loader
         self.patch_settings = patch(
             "studio.server.get_automation_settings",
-            side_effect=lambda: studio_settings.load_settings(settings_path=self.isolated_settings_path),
+            side_effect=lambda: json.loads(self.isolated_settings_path.read_text(encoding="utf-8")),
+        )
+        self.patch_load_settings = patch(
+            "studio.settings.load_settings",
+            side_effect=lambda *a, **kw: json.loads(self.isolated_settings_path.read_text(encoding="utf-8")),
         )
 
         self.patch_upload.start()
@@ -208,6 +212,7 @@ class OperationalSmokeTest(unittest.TestCase):
         self.patch_recon.start()
         self.patch_online.start()
         self.patch_settings.start()
+        self.patch_load_settings.start()
 
         self.addCleanup(self.patch_upload.stop)
         self.addCleanup(self.patch_discover.stop)
@@ -215,6 +220,7 @@ class OperationalSmokeTest(unittest.TestCase):
         self.addCleanup(self.patch_recon.stop)
         self.addCleanup(self.patch_online.stop)
         self.addCleanup(self.patch_settings.stop)
+        self.addCleanup(self.patch_load_settings.stop)
 
     def _http_get(self, path: str, host: str = None) -> tuple[int, dict[str, str], bytes]:
         """Performs a loopback HTTP GET request enforcing loopback-only destinations."""

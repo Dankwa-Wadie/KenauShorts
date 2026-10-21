@@ -204,6 +204,7 @@ def work(action: str, key: str) -> None:
             try:
                 preset_name = record.get("style_preset", "")
                 preset = get_style_preset(preset_name) if preset_name else None
+                presentation_mode = "card"
 
                 cand = record.get("candidate", {})
                 if cand.get("kind") == "story":
@@ -254,13 +255,25 @@ def work(action: str, key: str) -> None:
 
                     render_config = apply_style_preset(config, preset)
 
-                    agent.emit_progress("Compositing video card")
+                    presentation_mode = (
+                        record.get("presentation_mode")
+                        or render_config.get("layout", {}).get("presentation_mode")
+                        or render_config.get("presentation_mode")
+                        or "card"
+                    )
+
+                    if presentation_mode == "footage_clean":
+                        agent.emit_progress("Rendering clean footage")
+                    else:
+                        agent.emit_progress("Compositing video card")
+
                     render.render(
                         video=raw_clip,
                         headline=record["headline"],
                         out=new_mp4,
                         config=render_config,
                         poster=new_poster,
+                        presentation_mode=presentation_mode,
                     )
 
                 agent.emit_progress("Finalizing render")
@@ -271,6 +284,7 @@ def work(action: str, key: str) -> None:
                     poster=str(new_poster),
                     raw_video=str(raw_clip) if cand.get("kind") != "story" else "",
                     style_preset=record.get("style_preset", ""),
+                    presentation_mode=presentation_mode,
                     error="",
                 )
                 store.put("videos", key, record)

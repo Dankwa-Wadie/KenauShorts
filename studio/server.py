@@ -38,6 +38,7 @@ if __name__ == "__main__" and __package__ is None:
     # the service tries to start.
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+from core.render import RESERVED_PRESENTATION_MODES, SUPPORTED_PRESENTATION_MODES, VALID_PRESENTATION_MODES
 from core.style_presets import STYLE_PRESETS
 from studio import alerts, retention as studio_retention, supervisor
 from studio import settings as studio_settings
@@ -2725,6 +2726,19 @@ class StudioHandler(BaseHTTPRequestHandler):
                     if preset_val and preset_val not in valid_names:
                         raise ValueError(f"Invalid style_preset: '{preset_val}'. Must be one of {sorted(valid_names)} or empty string")
                     record["style_preset"] = preset_val
+                if "presentation_mode" in data:
+                    val = data["presentation_mode"]
+                    if val is None or val == "":
+                        mode_val = "card"
+                    elif isinstance(val, str):
+                        mode_val = val.strip().lower()
+                    else:
+                        raise ValueError(f"Invalid presentation_mode: expected string, got {type(val).__name__}")
+                    if mode_val in RESERVED_PRESENTATION_MODES:
+                        raise ValueError(f"Presentation mode '{mode_val}' is reserved for a future milestone and cannot be selected")
+                    if mode_val not in SUPPORTED_PRESENTATION_MODES:
+                        raise ValueError(f"Invalid presentation_mode: '{mode_val}'. Must be one of {sorted(SUPPORTED_PRESENTATION_MODES)}")
+                    record["presentation_mode"] = mode_val
                 if "review_status" in data:
                     val = data["review_status"]
                     if not isinstance(val, str):

@@ -120,6 +120,9 @@ class TestHealthEndpointAndLifecycle(unittest.TestCase):
         server.SUPERVISOR_INSTANCE = self.sup
         supervisor._GLOBAL_SUPERVISOR = self.sup
 
+        self.patch_settings = patch("studio.settings.load_settings", return_value={"enabled": False, "interval_hours": 3, "next_run": 0})
+        self.patch_settings.start()
+
         # Bind test server on loopback with port 0
         self.httpd = server.StudioServer(("127.0.0.1", 0), server.StudioHandler)
         self.assigned_port = self.httpd.server_address[1]
@@ -144,6 +147,8 @@ class TestHealthEndpointAndLifecycle(unittest.TestCase):
         server.PORT = self.orig_port
         server.SUPERVISOR_INSTANCE = self.orig_sup
         supervisor._GLOBAL_SUPERVISOR = self.orig_global_sup
+        if hasattr(self, "patch_settings"):
+            self.patch_settings.stop()
         alerts.reset_engine_for_testing()
 
         shutil.rmtree(self.tmp_dir, ignore_errors=True)

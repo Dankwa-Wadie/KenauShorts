@@ -43,10 +43,29 @@ from core.style_presets import (
 
 LOG = logging.getLogger("kenaushorts.render")
 
+PRESENTATION_MODE_CARD = "card"
+PRESENTATION_MODE_FOOTAGE_CLEAN = "footage_clean"
+PRESENTATION_MODE_FOOTAGE_CAPTION = "footage_caption"
+
+SUPPORTED_PRESENTATION_MODES = {
+    PRESENTATION_MODE_CARD,
+    PRESENTATION_MODE_FOOTAGE_CLEAN,
+}
+
+RESERVED_PRESENTATION_MODES = {
+    PRESENTATION_MODE_FOOTAGE_CAPTION,
+}
+
+VALID_PRESENTATION_MODES = SUPPORTED_PRESENTATION_MODES | RESERVED_PRESENTATION_MODES
+
+DEFAULT_PRESENTATION_MODE = PRESENTATION_MODE_CARD
+
 DEFAULT_LAYOUT: dict[str, Any] = {
     "canvas_width": 1080,
     "canvas_height": 1920,
     "background": "#000000",
+    "presentation_mode": DEFAULT_PRESENTATION_MODE,
+    "footage_fit": "auto",
     "side_margin": 72,
     "video_margin": None,
     "vertical_bias": 0.40,
@@ -186,10 +205,11 @@ class Account:
 @dataclass
 class RenderResult:
     output: Path
-    overlay: Path
+    overlay: Path | None
     video_box: tuple[int, int, int, int]
     duration: float
     poster: Path | None = None
+    presentation_mode: str = DEFAULT_PRESENTATION_MODE
 
 def _text_size(draw: ImageDraw.ImageDraw, text: str, font) -> tuple[int, int]:
     box = draw.textbbox((0, 0), text, font=font)
@@ -489,8 +509,8 @@ def has_audio_stream(video: Path) -> bool:
 
 def composite(
     video: Path,
-    overlay: Path,
-    box: tuple[int, int, int, int],
+    overlay: Path | None,
+    box: tuple[int, int, int, int] | None,
     layout: dict[str, Any],
     out: Path,
     max_seconds: float | None = None,
@@ -500,43 +520,87 @@ def composite(
     music: Path | None = None,
     loop_video: bool = False,
     timeout: float = RENDER_TIMEOUT,
+    presentation_mode: str | None = None,
 ) -> float:
     if not shutil.which("ffmpeg"):
         raise RuntimeError("ffmpeg was not found on your PATH. Please install ffmpeg.")
 
-    W = int(layout["canvas_width"])
-    H = int(layout["canvas_height"])
-    x, y, w, h = box
+    W = int(layout.get("canvas_width", 1080))
+    H = int(layout.get("canvas_height", 1920))
 
-    # Zoom + anchored crop. A watermark burned into a corner of the source can
-    # be pushed outside the frame by zooming in and biasing the crop away from
-    # it — anchor 0.5/0.5 is centred, lower values move the visible window
-    # toward the top-left and so discard the bottom-right.
-    zoom = max(1.0, float(layout.get("background_zoom", 1.0)))
-    ax = min(max(float(layout.get("background_anchor_x", 0.5)), 0.0), 1.0)
-    ay = min(max(float(layout.get("background_anchor_y", 0.5)), 0.0), 1.0)
-    sw, sh = int(w * zoom), int(h * zoom)
+    mode = presentation_mode or layout.get("presentation_mode") or ((config or {}).get("presentation_mode")) or DEFAULT_PRESENTATION_MODE
+    if not isinstance(mode, str):
+        raise ValueError(f"Invalid presentation_mode: expected string, got {type(mode).__name__}")
+    mode = mode.strip().lower()
+    if mode not in VALID_PRESENTATION_MODES:
+        raise ValueError(f"Invalid presentation_mode: '{mode}'. Must be one of {sorted(VALID_PRESENTATION_MODES)}")
 
-    fchain = (
-        f"[0:v]scale={sw}:{sh}:force_original_aspect_ratio=increase,"
-        f"crop={w}:{h}:(in_w-out_w)*{ax}:(in_h-out_h)*{ay},"
-        f"pad={W}:{H}:{x}:{y}:color={layout['background']},"
-        f"setsar=1[stage];"
-        f"[stage][1:v]overlay=0:0:format=auto,format=yuv420p[v]"
-    )
+    is_clean = (mode == PRESENTATION_MODE_FOOTAGE_CLEAN) or (overlay is None)
 
     cmd = ["ffmpeg", "-y", "-hide_banner", "-loglevel", "error"]
     if start_seconds:
         cmd += ["-ss", str(start_seconds)]
-    # A short mascot loop must repeat to fill the target duration. Without
-    # this, -shortest truncates the whole render to the mascot's length — a
-    # 5-second clip silently caps every post at 5 seconds.
     if loop_video:
         cmd += ["-stream_loop", "-1"]
-    cmd += ["-i", str(video), "-loop", "1", "-i", str(overlay)]
+    cmd += ["-i", str(video)]
 
-    # Music is input 2 when present. -stream_loop -1 repeats it indefinitely so
-    # a 20-second track still covers a 30-second clip; -shortest then trims it.
+    if is_clean:
+        music_input_idx = 1
+        footage_fit = str(layout.get("footage_fit", "auto")).strip().lower()
+        if footage_fit not in ("auto", "cover", "contain"):
+            footage_fit = "auto"
+
+        use_cover = False
+        if footage_fit == "cover":
+            use_cover = True
+        elif footage_fit == "contain":
+            use_cover = False
+        else:
+            bg_zoom = float(layout.get("background_zoom", 1.0))
+            src_aspect = get_source_aspect_ratio(video)
+            if bg_zoom > 1.0:
+                use_cover = True
+            elif src_aspect is not None and src_aspect <= 0.75:
+                use_cover = True
+            else:
+                use_cover = False
+
+        if use_cover:
+            zoom = max(1.0, float(layout.get("background_zoom", 1.0)))
+            ax = min(max(float(layout.get("background_anchor_x", 0.5)), 0.0), 1.0)
+            ay = min(max(float(layout.get("background_anchor_y", 0.5)), 0.0), 1.0)
+            sw, sh = int(W * zoom), int(H * zoom)
+            fchain = (
+                f"[0:v]scale={sw}:{sh}:force_original_aspect_ratio=increase,"
+                f"crop={W}:{H}:(in_w-out_w)*{ax}:(in_h-out_h)*{ay},"
+                f"setsar=1,format=yuv420p[v]"
+            )
+        else:
+            bg_color = layout.get("background", "#000000")
+            fchain = (
+                f"[0:v]scale={W}:{H}:force_original_aspect_ratio=decrease,"
+                f"pad={W}:{H}:(ow-iw)/2:(oh-ih)/2:color={bg_color},"
+                f"setsar=1,format=yuv420p[v]"
+            )
+    else:
+        cmd += ["-loop", "1", "-i", str(overlay)]
+        music_input_idx = 2
+        x, y, w, h = box if box else (0, 0, W, H)
+
+        zoom = max(1.0, float(layout.get("background_zoom", 1.0)))
+        ax = min(max(float(layout.get("background_anchor_x", 0.5)), 0.0), 1.0)
+        ay = min(max(float(layout.get("background_anchor_y", 0.5)), 0.0), 1.0)
+        sw, sh = int(w * zoom), int(h * zoom)
+
+        fchain = (
+            f"[0:v]scale={sw}:{sh}:force_original_aspect_ratio=increase,"
+            f"crop={w}:{h}:(in_w-out_w)*{ax}:(in_h-out_h)*{ay},"
+            f"pad={W}:{H}:{x}:{y}:color={layout['background']},"
+            f"setsar=1[stage];"
+            f"[stage][1:v]overlay=0:0:format=auto,format=yuv420p[v]"
+        )
+
+    # Music is input when present
     if music:
         cmd += ["-stream_loop", "-1", "-i", str(music)]
 
@@ -557,13 +621,13 @@ def composite(
             # Duck the music under the original audio rather than replacing it.
             fchain += (
                 f";[0:a]volume={src_vol}[a0]"
-                f";[2:a]volume={music_vol},afade=t=out:st={fade_start:.2f}:d={fade}[a1]"
+                f";[{music_input_idx}:a]volume={music_vol},afade=t=out:st={fade_start:.2f}:d={fade}[a1]"
                 f";[a0][a1]amix=inputs=2:duration=first:dropout_transition=0,"
                 f"aresample=48000[a]"
             )
         else:
             fchain += (
-                f";[2:a]volume={music_vol},afade=t=out:st={fade_start:.2f}:d={fade},"
+                f";[{music_input_idx}:a]volume={music_vol},afade=t=out:st={fade_start:.2f}:d={fade},"
                 f"aresample=48000[a]"
             )
         amap = ["-map", "[a]"]
@@ -617,13 +681,71 @@ def render(
     poster: Path | None = None,
     music: Path | None = None,
     timeout: float = RENDER_TIMEOUT,
+    presentation_mode: str | None = None,
 ) -> RenderResult:
     cfg = config or {}
     layout = {**DEFAULT_LAYOUT, **cfg.get("layout", {})}
     acct = account or Account(**{k: v for k, v in cfg.get("account", {}).items() if k in ("name", "handle", "avatar", "verified")})
 
+    mode = presentation_mode or layout.get("presentation_mode") or cfg.get("presentation_mode") or DEFAULT_PRESENTATION_MODE
+    if not isinstance(mode, str):
+        raise ValueError(f"Invalid presentation_mode: expected string, got {type(mode).__name__}")
+    mode = mode.strip().lower()
+
+    if mode not in VALID_PRESENTATION_MODES:
+        raise ValueError(f"Invalid presentation_mode: '{mode}'. Must be one of {sorted(VALID_PRESENTATION_MODES)}")
+
+    if mode == PRESENTATION_MODE_FOOTAGE_CAPTION:
+        raise NotImplementedError("Presentation mode 'footage_caption' is reserved for a future milestone.")
+
+    if mode == PRESENTATION_MODE_FOOTAGE_CLEAN:
+        W = int(layout.get("canvas_width", 1080))
+        H = int(layout.get("canvas_height", 1920))
+        box = (0, 0, W, H)
+        dur = composite(
+            video=video,
+            overlay=None,
+            box=box,
+            layout=layout,
+            out=out,
+            max_seconds=max_seconds,
+            poster=poster,
+            config=cfg,
+            music=music,
+            timeout=timeout,
+            presentation_mode=mode,
+        )
+        return RenderResult(
+            output=out,
+            overlay=None,
+            video_box=box,
+            duration=dur,
+            poster=poster,
+            presentation_mode=mode,
+        )
+
+    # Card mode
     overlay_path = out.parent / f"{out.stem}_overlay.png"
     box = build_overlay(headline, acct, layout, overlay_path)
-    dur = composite(video, overlay_path, box, layout, out, max_seconds=max_seconds, poster=poster, config=cfg, music=music, timeout=timeout)
+    dur = composite(
+        video=video,
+        overlay=overlay_path,
+        box=box,
+        layout=layout,
+        out=out,
+        max_seconds=max_seconds,
+        poster=poster,
+        config=cfg,
+        music=music,
+        timeout=timeout,
+        presentation_mode=mode,
+    )
 
-    return RenderResult(output=out, overlay=overlay_path, video_box=box, duration=dur, poster=poster)
+    return RenderResult(
+        output=out,
+        overlay=overlay_path,
+        video_box=box,
+        duration=dur,
+        poster=poster,
+        presentation_mode=mode,
+    )

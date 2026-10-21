@@ -25,6 +25,7 @@ STYLE_PRESETS: list[dict[str, Any]] = [
             "border_color": "#1D9BF0",
             "corner_radius": 40,
             "video_aspect": "16:9",
+            "presentation_mode": "card",
         },
         "story_layout": {
             "card_radius": 36,
@@ -41,6 +42,7 @@ STYLE_PRESETS: list[dict[str, Any]] = [
             "border_color": "#F59E0B",
             "corner_radius": 28,
             "video_aspect": "4:3",
+            "presentation_mode": "card",
             "background_anchor_y": 0.45,
         },
         "story_layout": {
@@ -58,6 +60,7 @@ STYLE_PRESETS: list[dict[str, Any]] = [
             "border_color": "#10B981",
             "corner_radius": 48,
             "video_aspect": "1:1",
+            "presentation_mode": "card",
         },
         "story_layout": {
             "card_radius": 44,
@@ -74,6 +77,7 @@ STYLE_PRESETS: list[dict[str, Any]] = [
             "border_color": "#8B5CF6",
             "corner_radius": 32,
             "video_aspect": "4:5",
+            "presentation_mode": "card",
             "background_zoom": 1.05,
         },
         "story_layout": {
@@ -104,6 +108,8 @@ def apply_style_preset(config: dict[str, Any], preset: dict[str, Any]) -> dict[s
     Returns a deep copy of config with overrides applied without mutating the original.
     """
     cfg = copy.deepcopy(config)
+    if "presentation_mode" in preset:
+        cfg["presentation_mode"] = preset["presentation_mode"]
     if "layout" in preset:
         cfg_layout = cfg.setdefault("layout", {})
         for k, v in preset["layout"].items():

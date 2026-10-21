@@ -42,8 +42,12 @@ class TestSupervisor(unittest.TestCase):
         server.ACTIVE_JOB = None
         server.QUEUE_WORKER_THREAD = None
         server.SCHEDULER_DIAGNOSTICS = {"state": "idle", "deferral_reason": ""}
+        self.patch_settings = patch("studio.settings.load_settings", return_value={"enabled": False, "interval_hours": 3, "next_run": 0})
+        self.patch_settings.start()
 
     def tearDown(self):
+        if hasattr(self, "patch_settings"):
+            self.patch_settings.stop()
         alerts.reset_engine_for_testing()
         server.ACTIVE_JOB = None
         server.QUEUE_WORKER_THREAD = None

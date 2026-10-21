@@ -12,6 +12,46 @@ what's actually on `origin/main`.
 
 ## Current state (update this section each handoff)
 
+- **Stage 8 Milestone 8.1 Completed & Verified (Footage-First and Clean-Footage Rendering Modes)**:
+  - **Core Rendering Foundation (`core/render.py`)**:
+    - Defined presentation mode constants: `PRESENTATION_MODE_CARD = "card"`, `PRESENTATION_MODE_FOOTAGE_CLEAN = "footage_clean"`, `PRESENTATION_MODE_FOOTAGE_CAPTION = "footage_caption"`, `VALID_PRESENTATION_MODES = ("card", "footage_clean", "footage_caption")`, `DEFAULT_PRESENTATION_MODE = "card"`.
+    - Added `presentation_mode` and `footage_fit` fields to `DEFAULT_LAYOUT`.
+    - Clean footage rendering filterchain: generates full-bleed 9:16 vertical Shorts video (1080x1920) without burned-in text overlays, channel badges, avatars, headlines, or branding borders. Skips `build_overlay` when in `footage_clean` mode.
+    - Source-aware scaling and cropping (`footage_fit`):
+      - `"cover"`: Scales and crops source center to fill 1080x1920 without distortion.
+      - `"contain"`: Scales source to fit within 1080x1920 with letterbox/pillarbox padding and black background.
+      - `"auto"`: Evaluates source aspect ratio via `ffprobe`; applies `cover` for vertical/portrait sources ($\le 1.0$) and `contain` for landscape/widescreen sources ($> 1.0$) to avoid aggressive cropping of horizontal content.
+    - Audio and music preservation: Preserves original video audio stream and mixes optional background music with volume normalization and ducking filters.
+    - Updated `RenderResult`: includes `overlay: Path | None` (`None` for clean footage) and `presentation_mode: str`.
+    - Reserved `footage_caption` mode: raises `NotImplementedError` if invoked, establishing architecture hook for future captioning milestone.
+  - **Style Presets Propagation (`core/style_presets.py`)**:
+    - Added `"presentation_mode": "card"` to layout configurations across all 5 built-in presets (`classic_blue`, `neon_cyan`, `warm_amber`, `minimal_mono`, `retro_purple`).
+    - Updated `apply_style_preset()` to propagate top-level `presentation_mode` configuration into merged layouts.
+  - **Automated Discovery Pipeline Integration (`core/agent.py`)**:
+    - Added `presentation_mode: str = ""` to `Pick` dataclass.
+    - Automated rendering in `_render_pick()`: resolves presentation mode from pick, layout, or config; emits stage-specific progress events (`"Rendering clean footage"` vs `"Rendering video card"`); passes mode to `render.render()`; and records mode in `store.draft()`.
+    - Safe render invocation: inspects `render` signature to ensure backward compatibility with test harnesses and legacy mocks.
+  - **Database Persistence & Studio Worker Integration (`studio/store.py`, `studio/worker.py`, `studio/server.py`)**:
+    - `studio/store.py`: `draft()` accepts `presentation_mode`; `enrich_video_record()` supplies backward-compatible default `"card"` for unmigrated records.
+    - `studio/worker.py`: manual worker action `"render"` resolves `presentation_mode` from video record or job config and invokes `render.render()`.
+    - `studio/server.py`: `/api/video` mutation endpoint validates and persists `presentation_mode`, rejecting invalid values with 400 Bad Request.
+  - **Unsupported & Reserved Mode Rejection (`core/render.py`, `studio/server.py`)**:
+    - Partitioned mode definitions into `SUPPORTED_PRESENTATION_MODES = {"card", "footage_clean"}` and `RESERVED_PRESENTATION_MODES = {"footage_caption"}`.
+    - `core/render.render()` immediately raises `NotImplementedError` if `footage_caption` or any reserved mode is requested.
+    - `/api/video` mutation endpoint strictly rejects `footage_caption` and any non-supported modes with HTTP 400 Bad Request (`ValueError`), preventing unsupported modes from being saved or scheduled for rendering.
+  - **Hermetic Test Isolation (`tests/test_supervisor.py`, `tests/test_frontend_integration.py`, `tests/test_operational_smoke.py`)**:
+    - Preserved production `studio/supervisor.py` completely untouched at its exact base-commit state.
+    - Isolated settings purely within test harnesses (`setUp()` / `_setup_safety_barriers()`), preventing wall-clock expiration of `studio-settings.json` on disk from causing false-positive scheduler stall alerts.
+  - **Deterministic Test Suites & Verification Evidence**:
+    - Focused Milestone 8.1 suite (`tests/test_milestone8_1.py`): 12/12 passed (11.4s).
+    - Full repository discovery suite (`python -X utf8 -m unittest discover tests`): 413/413 passed (74.2s, 1 skipped on Windows symlink privileges, 0 failures, 0 errors).
+    - Node.js UI health tests: 13/13 passed (`node tests/test_health_ui.js`).
+    - Smoke, supervisor, and frontend regression suites: 38/38 passed (18.6s).
+    - Codebase compilation: `python -m compileall core studio scripts tests` clean (0 errors).
+    - Formatting check: `git diff --check` clean (0 warnings).
+    - Protected configuration: `studio-settings.json` completely untouched (`"interval_hours": 3`).
+
+
 - **Operational Smoke Test Coverage & Probe Concurrency Race Fix Completed & Verified (`a8682c48c7014831b20249ecc033f8d8c17572c1`)**:
   - **Sequential-Probe Concurrency Fix (`studio/supervisor.py`)**:
     - Identified a race in `BoundedProbeRunner.run_probe()`: `done_event.set()` fired in the inner `finally` block before the worker thread executed outer `finally: self._concurrency_lock.release()`.

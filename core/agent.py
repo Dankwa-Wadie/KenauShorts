@@ -70,6 +70,7 @@ class Pick:
     hashtags: list[str] = field(default_factory=list)
     mood: str = "neutral"
     style_preset: str = ""
+    presentation_mode: str = ""
 
 def emit_progress(stage: str, **extras) -> None:
     payload = {"stage": stage, **extras}
@@ -1400,21 +1401,45 @@ def _render_pick(pick: Pick, config: dict[str, Any], work_dir: Path, out_dir: Pa
         pick.style_preset = preset["name"]
         render_config = apply_style_preset(config, preset)
 
-        emit_progress("Rendering video card")
+        pres_mode = (
+            getattr(pick, "presentation_mode", "")
+            or render_config.get("layout", {}).get("presentation_mode", "")
+            or render_config.get("presentation_mode", "")
+            or "card"
+        )
+        pick.presentation_mode = pres_mode
+        render_config["presentation_mode"] = pres_mode
+        render_config.setdefault("layout", {})["presentation_mode"] = pres_mode
+
+        if pres_mode == "footage_clean":
+            emit_progress("Rendering clean footage")
+        else:
+            emit_progress("Rendering video card")
+
         music_path_str = render_config.get("audio", {}).get("track", "")
         music_path = Path(music_path_str) if music_path_str else None
         if music_path and not music_path.is_file():
             LOG.warning("Configured music track %s not found — rendering without music", music_path)
             music_path = None
-        render(
-            video=raw_clip,
-            headline=pick.headline,
-            out=final_mp4,
-            config=render_config,
-            max_seconds=float(max_clip_seconds),
-            poster=poster_png,
-            music=music_path,
-        )
+
+        render_kwargs: dict[str, Any] = {
+            "video": raw_clip,
+            "headline": pick.headline,
+            "out": final_mp4,
+            "config": render_config,
+            "max_seconds": float(max_clip_seconds),
+            "poster": poster_png,
+            "music": music_path,
+        }
+        try:
+            import inspect
+            sig = inspect.signature(render)
+            if "presentation_mode" in sig.parameters or any(p.kind == p.VAR_KEYWORD for p in sig.parameters.values()):
+                render_kwargs["presentation_mode"] = pres_mode
+        except Exception:
+            render_kwargs["presentation_mode"] = pres_mode
+
+        render(**render_kwargs)
     else:
         emit_progress("Rendering story card")
         images = download_images(pick.candidate.images, work_dir, stem)
@@ -1508,6 +1533,7 @@ def run_manual(config_path: Path, url: str, headline: str = "", description: str
             config=config,
             candidate_data=dataclasses.asdict(pick.candidate),
             style_preset=getattr(pick, "style_preset", ""),
+            presentation_mode=getattr(pick, "presentation_mode", ""),
         )
 
         if not dry_run:
@@ -1605,6 +1631,7 @@ def run_pipeline(config_path: Path, dry_run: bool = False) -> None:
             config=config,
             candidate_data=dataclasses.asdict(pick.candidate),
             style_preset=getattr(pick, "style_preset", ""),
+            presentation_mode=getattr(pick, "presentation_mode", ""),
         )
 
         video_id = ""
