@@ -12,7 +12,7 @@ what's actually on `origin/main`.
 
 ## Current state (update this section each handoff)
 
-- **Stage 8 Milestone 8.1 Completed & Verified (Footage-First and Clean-Footage Rendering Modes)**:
+- **Stage 8 Milestone 8.1 Completed & Verified (Footage-First and Clean-Footage Rendering Modes in `76e48cb53264465e8cde9399c1ed47c5a203c8a2`)**:
   - **Core Rendering Foundation (`core/render.py`)**:
     - Defined presentation mode constants: `PRESENTATION_MODE_CARD = "card"`, `PRESENTATION_MODE_FOOTAGE_CLEAN = "footage_clean"`, `PRESENTATION_MODE_FOOTAGE_CAPTION = "footage_caption"`, `VALID_PRESENTATION_MODES = ("card", "footage_clean", "footage_caption")`, `DEFAULT_PRESENTATION_MODE = "card"`.
     - Added `presentation_mode` and `footage_fit` fields to `DEFAULT_LAYOUT`.
@@ -50,6 +50,7 @@ what's actually on `origin/main`.
     - Codebase compilation: `python -m compileall core studio scripts tests` clean (0 errors).
     - Formatting check: `git diff --check` clean (0 warnings).
     - Protected configuration: `studio-settings.json` completely untouched (`"interval_hours": 3`).
+    - Implemented in commit `76e48cb53264465e8cde9399c1ed47c5a203c8a2`.
 
 
 - **Operational Smoke Test Coverage & Probe Concurrency Race Fix Completed & Verified (`a8682c48c7014831b20249ecc033f8d8c17572c1`)**:
