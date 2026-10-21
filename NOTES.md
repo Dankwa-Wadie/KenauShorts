@@ -12,6 +12,42 @@ what's actually on `origin/main`.
 
 ## Current state (update this section each handoff)
 
+- **Stage 7 Phase 4 Milestone 6 Completed & Verified (Frontend Integration and End-to-End Verification)**:
+  - **Health Telemetry UI Integration (`studio/web/app.js`, `studio/web/index.html`, `studio/web/style.css`)**:
+    - Dual polling coordination: Replaced standalone status polling with concurrent `Promise.all([fetch('/api/status'), fetchHealthTelemetry()])` bounded by a 2.5s `AbortController` signal, preventing duplicate intervals or unbounded timer pileups.
+    - Six authoritative UI health states with distinct styling and fail-closed transitions:
+      1. `healthy` (`.status-indicator.online`, badge `Healthy`, green): All subsystems operational, probes responsive, no active diagnostic alerts.
+      2. `degraded` (`.status-indicator.degraded`, badge `Degraded`, amber): Non-critical warnings (e.g. low disk space <1GB, scheduler deferred or pending resolution).
+      3. `unhealthy` (`.status-indicator.unhealthy`, badge `Critical / Unhealthy`, red): Critical subsystem failure (e.g. critical disk space <512MB, database probe unresponsive, queue worker dead with pending jobs, active job progress stalled >300s, alert engine drain worker failure).
+      4. `unavailable` (`.status-indicator.unavailable`, badge `Unavailable`, muted red/gray): Host daemon unreachable, network drop, HTTP 5xx, or request timeout (>2.5s). Never falsely displays a healthy status.
+      5. `stale` (`.status-indicator.stale`, badge `Stale`, amber/orange): Telemetry data older than 45 seconds (`dataAgeSec > 45`), cleanly alerting operators to frozen background threads or client clock skew.
+      6. `malformed` (`.health-pill.malformed`, red): Rejects invalid JSON or unexpected schemas.
+    - Non-invasive Diagnostic Modal (`<dialog id="health-modal">`):
+      - Interactive detailed breakdown of all 6 subsystems: SQLite Database (with probe latency ms), Disk Storage (free GB/MB), Automation Scheduler (state & deferral reasons), Queue Worker (thread status & pending count), Active Job (stage, duration, stall status), and Alert Engine (drain worker status & queue depth).
+      - Live listing of all active supervisor stall alerts by fingerprint.
+      - "↻ Refresh Telemetry" button (`id="health-modal-refresh"`) for on-demand telemetry retrieval without waiting for background tick.
+      - Clickable sidebar host info `#host-info` opens modal with keyboard (ESC) and backdrop click dismissal.
+    - Overview Tab Telemetry Widget (`#overview-health-widget`):
+      - Replaced static storage panel with dynamic live subsystem cards grid, telemetry freshness display, and "↻ Refresh Telemetry" button (`id="overview-health-refresh"`).
+    - Security & Redaction:
+      - Strictly sanitized rendering using `escapeHtml()` across all subsystem parameters (stage, reason, error) preventing HTML injection / XSS.
+      - Telemetry endpoint `/api/health` and UI render no API keys, OAuth tokens, secrets, or sensitive filesystem paths.
+  - **Backend & Supervisor Enhancements (`studio/supervisor.py`, `studio/server.py`)**:
+    - Synchronized `tick()` and `get_latest_telemetry()` with `self._active_alerts` to ensure `active_supervisor_alerts` is immediately fresh on every tick.
+    - Enhanced `get_health_telemetry()` to inspect `server.SUPERVISOR_INSTANCE` if `_GLOBAL_SUPERVISOR` is not set, preventing redundant ad-hoc probes.
+    - `ensure_supervisor()` registers `SUPERVISOR_INSTANCE` into `supervisor._GLOBAL_SUPERVISOR`.
+    - Implemented `sanitize_probe_error(err)` to sanitize raw exception strings, filesystem paths, and credentials into generic safe error codes across probe collectors and active alert rows.
+    - Protected `DOMContentLoaded` and `beforeunload` in `studio/web/app.js` with `typeof document !== 'undefined'` and exported functions for automated Node.js testing.
+  - **Deterministic Test Suites & Comprehensive Coverage**:
+    - `tests/test_health_ui.js` (13 tests, Node.js): Unit test suite covering `evaluateHealthState` (all 6 states: null/undefined, explicit unavailable, malformed, stale >45s, healthy, degraded, unhealthy), `getHealthSummaryMessage` (subsystem breakdowns), `renderHealthSubsystemCards` with XSS sanitization, critical+stale precedence, fresh recovery, and `pollStatusInFlight` guard lifecycle / independent status processing.
+    - `tests/test_frontend_integration.py` (10 tests, Python unittest): End-to-end integration suite verifying static asset delivery (`/index.html`, `/style.css`, `/app.js`), modal markup and CSS rules, `/api/health` JSON schema conformance, security credential redaction check, sensitive path/token exception redaction check, degraded storage reflection, unhealthy critical storage reflection and alert listing, and fail-closed DNS rebinding rejection (HTTP 403 on invalid Host).
+    - Combined Milestone Regression (`tests.test_alerts`, `tests.test_server_lifecycle`, `tests.test_supervisor`, `tests.test_frontend_integration`): 50/50 passed (10.3s).
+    - Full repository discovery suite (`python -X utf8 -m unittest discover tests`): 398/398 passed (63.2s, 1 skipped on Windows symlink privileges, 0 failures, 0 errors).
+    - Codebase compilation: `python -m compileall core studio scripts tests` 0 errors.
+    - Formatting check: `git diff --check` 0 warnings/errors.
+    - Protected configuration: `studio-settings.json` completely untouched (`"interval_hours": 3`).
+  - **Stage 7 Phase 4 Completed**: All 6 milestones (Milestones 1-6) fully complete and verified.
+
 - **Stage 7 Phase 4 Milestone 5 Completed & Verified (Independent Health Telemetry and Diagnostic Stall Alerts in `studio/supervisor.py`)**:
   - **Bounded Probe Runner & Resource Leak Prevention (`studio/supervisor.py`)**:
     - `BoundedProbeRunner`: Thread-safe bounded execution ($\le 2.0\text{s}$) with single-probe concurrency lock refusing new thread spawning while a probe is active; the concurrency lock remains held until the probe worker completes, not merely until caller timeout expires, strictly guaranteeing zero thread accumulation under persistent probe timeouts, hung I/O, or SQLite lock contention.
@@ -1048,4 +1084,4 @@ Stage 2 meets all single-instance operational requirements: process tracking, pr
 
 ### Remaining Limitations
 - Local quota counters remain estimates; Google Developer Console is the authoritative source of truth.
-- Stage 7 Phase 4 Milestones 1-5 completed & verified. Milestone 6 (Frontend integration and end-to-end verification) is next.
+- Stage 7 Phase 4 (Milestones 1-6) completed & verified. Full end-to-end telemetry and alert pipeline operational.

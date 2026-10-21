@@ -1045,6 +1045,8 @@ def ensure_supervisor() -> None:
     with GUARD:
         if SUPERVISOR_INSTANCE is None:
             SUPERVISOR_INSTANCE = supervisor.Supervisor(stop_event=STOP_EVENT)
+            with supervisor._SUPERVISOR_LOCK:
+                supervisor._GLOBAL_SUPERVISOR = SUPERVISOR_INSTANCE
         if SUPERVISOR_THREAD is None or not SUPERVISOR_THREAD.is_alive():
             SUPERVISOR_THREAD = SUPERVISOR_INSTANCE.start()
 

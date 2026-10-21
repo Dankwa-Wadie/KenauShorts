@@ -116,7 +116,8 @@ class BoundedProbeRunner:
 
         if done_event.wait(timeout=to):
             if error_holder[0] is not None:
-                return False, None, str(error_holder[0])
+                exc = error_holder[0]
+                return False, None, f"{type(exc).__name__}: {exc}"
             return True, result_holder[0], None
         else:
             # Caller timed out.
@@ -128,8 +129,34 @@ _GLOBAL_PROBE_RUNNER = BoundedProbeRunner(max_timeout=PROBE_TIMEOUT_SECONDS)
 
 
 # ---------------------------------------------------------------------------
-# Individual Bounded Probes
+# Individual Bounded Probes & Sanitization
 # ---------------------------------------------------------------------------
+def sanitize_probe_error(err: Any) -> str:
+    """
+    Sanitizes raw probe errors to safe generic codes, preventing any leakage
+    of local filesystem paths, environment details, or credentials in telemetry.
+    """
+    if not err:
+        return "unresponsive"
+    if isinstance(err, Exception):
+        return f"error_{type(err).__name__}"
+    err_str = str(err)
+    if err_str in (
+        "probe_timed_out",
+        "probe_worker_busy_previous_timed_out",
+        "unresponsive",
+        "probe_failed",
+    ):
+        return err_str
+    if err_str.startswith("error_"):
+        return err_str
+    if ":" in err_str:
+        prefix = err_str.split(":", 1)[0].strip()
+        if prefix.isalnum() or prefix.endswith("Error") or prefix.endswith("Exception"):
+            return f"error_{prefix}"
+    return "probe_execution_failed"
+
+
 def probe_database(
     db_path: Optional[Path | str] = None,
     runner: Optional[BoundedProbeRunner] = None,
@@ -165,7 +192,7 @@ def probe_database(
     ok, res, err = p_runner.run_probe(_do_query, timeout=PROBE_TIMEOUT_SECONDS)
     if ok and res and res.get("ok"):
         return {"status": "healthy", "latency_sec": res.get("latency_sec", 0.0), "error": None}
-    return {"status": "unresponsive", "latency_sec": None, "error": err or "unresponsive"}
+    return {"status": "unresponsive", "latency_sec": None, "error": sanitize_probe_error(err)}
 
 
 def probe_disk_space(
@@ -203,7 +230,7 @@ def probe_disk_space(
         else:
             status = "healthy"
         return {"status": status, "free_mb": free_mb, "total_mb": total_mb, "error": None}
-    return {"status": "unknown", "free_mb": 0.0, "total_mb": 0.0, "error": err or "probe_failed"}
+    return {"status": "unknown", "free_mb": 0.0, "total_mb": 0.0, "error": sanitize_probe_error(err)}
 
 
 def parse_timestamp_to_epoch(ts: Any) -> Optional[float]:
@@ -302,13 +329,16 @@ class Supervisor:
         self._evaluate_alerts(telemetry)
         with self._state_lock:
             self._ticks_count += 1
+            telemetry["active_supervisor_alerts"] = sorted(list(self._active_alerts))
             self._latest_telemetry = telemetry
         return telemetry
 
     def get_latest_telemetry(self) -> dict[str, Any]:
         with self._state_lock:
             if self._latest_telemetry:
-                return dict(self._latest_telemetry)
+                res = dict(self._latest_telemetry)
+                res["active_supervisor_alerts"] = sorted(list(self._active_alerts))
+                return res
         return self.collect_telemetry()
 
     # -----------------------------------------------------------------------
@@ -613,12 +643,13 @@ class Supervisor:
         db_sub = subsystems.get("database", {})
         fp_db = "supervisor.db.unresponsive"
         if db_sub.get("status") == "unresponsive":
+            safe_err = sanitize_probe_error(db_sub.get("error"))
             self._fire(
                 fp=fp_db,
                 reason="Database probe unresponsive or timed out",
-                message=f"SQLite probe failed: {db_sub.get('error', 'timed out')}",
+                message=f"SQLite probe failed: {safe_err}",
                 severity="critical",
-                metadata={"error": db_sub.get("error")},
+                metadata={"error": safe_err},
             )
         else:
             self._resolve(fp_db, "Database probe responsive")
@@ -777,6 +808,13 @@ def get_health_telemetry() -> dict[str, Any]:
         sup = _GLOBAL_SUPERVISOR
     if sup:
         return sup.get_latest_telemetry()
+    try:
+        from studio import server
+        server_sup = getattr(server, "SUPERVISOR_INSTANCE", None)
+        if server_sup:
+            return server_sup.get_latest_telemetry()
+    except Exception:
+        pass
     # Ad-hoc collection if supervisor is not started
     ad_hoc = Supervisor()
     return ad_hoc.collect_telemetry()

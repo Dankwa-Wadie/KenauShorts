@@ -876,3 +876,148 @@ dialog::backdrop {
   border: 1px solid var(--border);
   color: var(--text-main);
 }
+
+
+/* -------------------------------------------------------------------------- */
+/* Health Telemetry & Diagnostic Widget Styles                                */
+/* -------------------------------------------------------------------------- */
+
+.status-indicator.degraded {
+  background-color: var(--warning);
+  box-shadow: 0 0 8px rgba(245, 158, 11, 0.5);
+}
+
+.status-indicator.unhealthy {
+  background-color: var(--danger);
+  box-shadow: 0 0 8px rgba(244, 33, 46, 0.5);
+}
+
+.status-indicator.stale {
+  background-color: #f59e0b;
+  box-shadow: 0 0 8px rgba(245, 158, 11, 0.3);
+}
+
+.status-indicator.unavailable {
+  background-color: #8899a6;
+  box-shadow: none;
+}
+
+.health-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 10px;
+  border-radius: 12px;
+  font-size: 11px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+}
+
+.health-pill.healthy {
+  background: rgba(0, 186, 124, 0.15);
+  color: var(--success);
+  border: 1px solid rgba(0, 186, 124, 0.3);
+}
+
+.health-pill.degraded {
+  background: rgba(245, 158, 11, 0.15);
+  color: var(--warning);
+  border: 1px solid rgba(245, 158, 11, 0.3);
+}
+
+.health-pill.unhealthy {
+  background: rgba(244, 33, 46, 0.15);
+  color: var(--danger);
+  border: 1px solid rgba(244, 33, 46, 0.3);
+}
+
+.health-pill.stale {
+  background: rgba(245, 158, 11, 0.15);
+  color: var(--warning);
+  border: 1px solid rgba(245, 158, 11, 0.3);
+}
+
+.health-pill.unavailable {
+  background: rgba(139, 148, 158, 0.2);
+  color: #8899a6;
+  border: 1px solid rgba(139, 148, 158, 0.3);
+}
+
+.health-pill.malformed {
+  background: rgba(244, 33, 46, 0.15);
+  color: var(--danger);
+  border: 1px solid rgba(244, 33, 46, 0.3);
+}
+
+.subsystem-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+  gap: 12px;
+  margin: 14px 0;
+}
+
+.subsystem-card {
+  background: rgba(255, 255, 255, 0.02);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  padding: 12px 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.subsystem-card.healthy {
+  border-left: 3px solid var(--success);
+}
+
+.subsystem-card.degraded {
+  border-left: 3px solid var(--warning);
+}
+
+.subsystem-card.unhealthy {
+  border-left: 3px solid var(--danger);
+}
+
+.subsystem-card.stale {
+  border-left: 3px solid #8899a6;
+}
+
+.subsystem-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  font-size: 11px;
+  font-weight: 600;
+  text-transform: uppercase;
+  color: var(--text-muted);
+}
+
+.subsystem-main {
+  font-size: 15px;
+  font-weight: 700;
+  color: var(--text-main);
+}
+
+.subsystem-sub {
+  font-size: 11px;
+  color: var(--text-muted);
+  font-family: var(--font-mono);
+}
+
+.alert-item {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 8px 12px;
+  border-radius: 6px;
+  background: rgba(244, 33, 46, 0.08);
+  border: 1px solid rgba(244, 33, 46, 0.25);
+  margin-bottom: 8px;
+  font-size: 12px;
+}
+
+.alert-item.warning {
+  background: rgba(245, 158, 11, 0.08);
+  border-color: rgba(245, 158, 11, 0.25);
+}

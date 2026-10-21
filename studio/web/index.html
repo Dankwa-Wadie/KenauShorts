@@ -63,7 +63,7 @@
     </nav>
 
     <div class="sidebar-footer">
-      <div class="host-info">
+      <div class="host-info" id="host-info" title="Click to view detailed system health telemetry" style="cursor: pointer;">
         <div class="status-indicator online" id="status-dot"></div>
         <span id="connection-status">Online • PC Daemon</span>
       </div>
@@ -142,6 +142,19 @@
       </div>
       <div class="modal-body" id="job-modal-body">
         <!-- Rendered by app.js -->
+      </div>
+    </div>
+  </dialog>
+
+  <!-- System Health & Telemetry Detail Modal -->
+  <dialog id="health-modal">
+    <div class="modal-box" style="max-width: 680px;">
+      <div class="modal-header">
+        <h3 id="health-modal-title">System Health & Telemetry</h3>
+        <button class="modal-close" id="btn-close-health-modal">✕</button>
+      </div>
+      <div class="modal-body" id="health-modal-body">
+        <!-- Rendered dynamically by app.js -->
       </div>
     </div>
   </dialog>

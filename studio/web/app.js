@@ -20,22 +20,26 @@ async function postJSON(path, body) {
 }
 
 // Initialize on load
-document.addEventListener('DOMContentLoaded', () => {
-  setupNavigation();
-  setupQuickActions();
-  setupWizard();
-  pollStatus();
-  statusInterval = setInterval(pollStatus, 3000);
-  renderPage(currentPage);
-});
+if (typeof document !== 'undefined') {
+  document.addEventListener('DOMContentLoaded', () => {
+    setupNavigation();
+    setupQuickActions();
+    setupWizard();
+    pollStatus();
+    statusInterval = setInterval(pollStatus, 3000);
+    renderPage(currentPage);
+  });
+}
 
-window.addEventListener('beforeunload', () => {
-  clearOverviewCountdown();
-  if (statusInterval) {
-    clearInterval(statusInterval);
-    statusInterval = null;
-  }
-});
+if (typeof window !== 'undefined') {
+  window.addEventListener('beforeunload', () => {
+    clearOverviewCountdown();
+    if (statusInterval) {
+      clearInterval(statusInterval);
+      statusInterval = null;
+    }
+  });
+}
 
 // --------------------------------------------------------------------------
 // Navigation & Router
@@ -51,6 +55,21 @@ function setupNavigation() {
       renderPage(currentPage);
     });
   });
+
+  const hostInfo = document.getElementById('host-info');
+  if (hostInfo) {
+    hostInfo.addEventListener('click', openHealthModal);
+  }
+  const btnCloseHealth = document.getElementById('btn-close-health-modal');
+  if (btnCloseHealth) {
+    btnCloseHealth.addEventListener('click', closeHealthModal);
+  }
+  const healthModal = document.getElementById('health-modal');
+  if (healthModal) {
+    healthModal.addEventListener('click', (e) => {
+      if (e.target === healthModal) closeHealthModal();
+    });
+  }
 }
 
 function renderPage(page) {
@@ -106,26 +125,494 @@ function renderPage(page) {
 }
 
 // --------------------------------------------------------------------------
+// Health Telemetry State & Handlers
+// --------------------------------------------------------------------------
+
+let lastHealthData = null;
+let lastHealthFetchTime = 0;
+let healthFetchInFlight = false;
+
+async function fetchHealthTelemetry() {
+  if (healthFetchInFlight) return lastHealthData;
+  healthFetchInFlight = true;
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), 2500);
+
+  try {
+    const res = await fetch('/api/health', { signal: controller.signal });
+    clearTimeout(timeoutId);
+    if (!res.ok) {
+      const errPayload = {
+        status: 'unavailable',
+        error: `HTTP ${res.status}: ${res.statusText}`,
+        timestamp: new Date().toISOString(),
+        subsystems: {},
+      };
+      lastHealthData = errPayload;
+      return errPayload;
+    }
+    const data = await res.json();
+    if (!data || typeof data !== 'object' || !data.subsystems) {
+      const malformedPayload = {
+        status: 'malformed',
+        error: 'Invalid telemetry response from server',
+        timestamp: new Date().toISOString(),
+        subsystems: {},
+      };
+      lastHealthData = malformedPayload;
+      return malformedPayload;
+    }
+    lastHealthData = data;
+    lastHealthFetchTime = Date.now();
+    return data;
+  } catch (err) {
+    clearTimeout(timeoutId);
+    const isAbort = err.name === 'AbortError';
+    const failPayload = {
+      status: 'unavailable',
+      error: isAbort ? 'Telemetry probe request timed out (2.5s)' : (err.message || 'Connection failed'),
+      timestamp: new Date().toISOString(),
+      subsystems: {},
+      network_error: true,
+    };
+    lastHealthData = failPayload;
+    return failPayload;
+  } finally {
+    healthFetchInFlight = false;
+  }
+}
+
+function evaluateHealthState(healthData, lastSeenTimeMs) {
+  if (!healthData) {
+    return {
+      state: 'unavailable',
+      label: 'Unavailable',
+      severity: 'danger',
+      message: 'No telemetry available from host daemon.',
+      stale: false,
+      dataAgeSec: null,
+    };
+  }
+
+  if (healthData.status === 'unavailable') {
+    return {
+      state: 'unavailable',
+      label: 'Unavailable',
+      severity: 'danger',
+      message: healthData.error || 'Host daemon unreachable.',
+      stale: false,
+      dataAgeSec: null,
+    };
+  }
+
+  if (healthData.status === 'malformed') {
+    return {
+      state: 'malformed',
+      label: 'Malformed',
+      severity: 'danger',
+      message: healthData.error || 'Unrecognized telemetry schema.',
+      stale: false,
+      dataAgeSec: null,
+    };
+  }
+
+  const now = Date.now();
+  let dataAgeSec = null;
+  if (healthData.timestamp) {
+    const tsEpoch = new Date(healthData.timestamp).getTime();
+    if (!isNaN(tsEpoch)) {
+      dataAgeSec = Math.max(0, Math.floor((now - tsEpoch) / 1000));
+    }
+  } else if (lastSeenTimeMs) {
+    dataAgeSec = Math.max(0, Math.floor((now - lastSeenTimeMs) / 1000));
+  }
+
+  const backendStatus = healthData.status;
+
+  if (dataAgeSec != null && dataAgeSec > 45) {
+    if (backendStatus === 'unhealthy') {
+      return {
+        state: 'unhealthy',
+        label: `Critical / Stale (${dataAgeSec}s ago)`,
+        severity: 'danger',
+        message: `${getHealthSummaryMessage(healthData)} (stale: ${dataAgeSec}s ago)`,
+        stale: true,
+        dataAgeSec,
+      };
+    }
+    return {
+      state: 'stale',
+      label: `Stale (${dataAgeSec}s ago)`,
+      severity: 'warning',
+      message: `Telemetry is stale. Last update was ${dataAgeSec}s ago.`,
+      stale: true,
+      dataAgeSec,
+    };
+  }
+  if (backendStatus === 'unhealthy') {
+    return {
+      state: 'unhealthy',
+      label: 'Critical / Unhealthy',
+      severity: 'danger',
+      message: getHealthSummaryMessage(healthData),
+      stale: false,
+      dataAgeSec,
+    };
+  }
+
+  if (backendStatus === 'degraded') {
+    return {
+      state: 'degraded',
+      label: 'Degraded',
+      severity: 'warning',
+      message: getHealthSummaryMessage(healthData),
+      stale: false,
+      dataAgeSec,
+    };
+  }
+
+  return {
+    state: 'healthy',
+    label: 'Healthy',
+    severity: 'success',
+    message: 'All subsystems operational.',
+    stale: false,
+    dataAgeSec,
+  };
+}
+
+function getHealthSummaryMessage(data) {
+  if (!data || !data.subsystems) return 'Diagnostics unavailable';
+  const sub = data.subsystems;
+  const issues = [];
+
+  if (sub.database?.status === 'unresponsive') {
+    issues.push('Database probe unresponsive');
+  }
+  if (sub.storage?.status === 'critical') {
+    issues.push(`Critical disk space (<512MB free: ${sub.storage.free_mb || 0}MB)`);
+  } else if (sub.storage?.status === 'low') {
+    issues.push(`Low disk space (<1GB free: ${sub.storage.free_mb || 0}MB)`);
+  }
+  if (sub.scheduler?.stalled) {
+    issues.push(`Scheduler stalled (overdue ${sub.scheduler.overdue_seconds || 0}s)`);
+  }
+  if (sub.queue_worker?.stalled) {
+    issues.push(`Queue worker dead (${sub.queue_worker.pending_jobs_count || 0} pending)`);
+  }
+  if (sub.active_job?.stalled) {
+    issues.push(`Job ${sub.active_job.job_id || ''} progress stalled (>300s)`);
+  }
+  if (sub.alerts && !sub.alerts.drain_healthy) {
+    issues.push('Alert engine drain worker failure');
+  }
+
+  if (issues.length > 0) {
+    return issues.join(' • ');
+  }
+  return data.status === 'healthy' ? 'All subsystems operational' : 'System degraded';
+}
+
+function renderHealthSubsystemCards(healthData, stateInfo) {
+  if (!healthData || !healthData.subsystems || Object.keys(healthData.subsystems).length === 0) {
+    return `<div style="color: var(--text-muted); font-size: 13px; padding: 12px;">No subsystem metrics available (${escapeHtml(stateInfo.message)}).</div>`;
+  }
+  const sub = healthData.subsystems;
+
+  // 1. Database Card
+  const db = sub.database || {};
+  const dbHealthy = db.status === 'healthy';
+  const dbLatencyMs = db.latency_sec != null ? Math.round(db.latency_sec * 1000) : null;
+  const dbCard = `
+    <div class="subsystem-card ${dbHealthy ? 'healthy' : 'unhealthy'}">
+      <div class="subsystem-header">
+        <span>SQLite Database</span>
+        <span class="health-pill ${dbHealthy ? 'healthy' : 'unhealthy'}" style="font-size: 9px; padding: 2px 6px;">${dbHealthy ? 'OK' : 'Error'}</span>
+      </div>
+      <div class="subsystem-main">${dbHealthy ? 'Responsive' : 'Unresponsive'}</div>
+      <div class="subsystem-sub">${dbLatencyMs !== null ? `${dbLatencyMs}ms probe latency` : (escapeHtml(db.error || 'Connection failed'))}</div>
+    </div>
+  `;
+
+  // 2. Storage Card
+  const storage = sub.storage || {};
+  const diskStatus = storage.status || 'healthy';
+  const freeMb = storage.free_mb || 0;
+  const freeGb = (freeMb / 1024).toFixed(1);
+  const diskCardClass = diskStatus === 'critical' ? 'unhealthy' : (diskStatus === 'low' ? 'degraded' : 'healthy');
+  const storageCard = `
+    <div class="subsystem-card ${diskCardClass}">
+      <div class="subsystem-header">
+        <span>Disk Storage</span>
+        <span class="health-pill ${diskCardClass}" style="font-size: 9px; padding: 2px 6px;">${escapeHtml(diskStatus)}</span>
+      </div>
+      <div class="subsystem-main">${freeGb} GB Free</div>
+      <div class="subsystem-sub">${freeMb.toLocaleString()} MB available • ${diskStatus === 'critical' ? '<512MB critical' : (diskStatus === 'low' ? '<1GB low' : 'Safe')}</div>
+    </div>
+  `;
+
+  // 3. Scheduler Card
+  const sched = sub.scheduler || {};
+  const schedStalled = sched.stalled;
+  const schedEnabled = sched.enabled;
+  const schedCardClass = schedStalled ? 'degraded' : 'healthy';
+  let schedMain = schedEnabled ? 'Active' : 'Disabled';
+  if (schedStalled) schedMain = 'Stalled';
+  let schedDetail = sched.deferral_reason ? `Deferred: ${sched.deferral_reason}` : (sched.scheduler_state || 'idle');
+  if (sched.overdue_seconds > 0) schedDetail += ` • ${sched.overdue_seconds}s overdue`;
+  const schedulerCard = `
+    <div class="subsystem-card ${schedCardClass}">
+      <div class="subsystem-header">
+        <span>Automation Scheduler</span>
+        <span class="health-pill ${schedCardClass}" style="font-size: 9px; padding: 2px 6px;">${schedStalled ? 'Stalled' : (schedEnabled ? 'Active' : 'Off')}</span>
+      </div>
+      <div class="subsystem-main">${schedMain}</div>
+      <div class="subsystem-sub">${escapeHtml(schedDetail)}</div>
+    </div>
+  `;
+
+  // 4. Queue Worker Card
+  const queue = sub.queue_worker || {};
+  const queueStalled = queue.stalled;
+  const pendingCount = queue.pending_jobs_count || 0;
+  const queueCardClass = queueStalled ? 'unhealthy' : 'healthy';
+  const queueCard = `
+    <div class="subsystem-card ${queueCardClass}">
+      <div class="subsystem-header">
+        <span>Queue Worker</span>
+        <span class="health-pill ${queueCardClass}" style="font-size: 9px; padding: 2px 6px;">${queueStalled ? 'Dead' : (queue.thread_alive ? 'Running' : 'Idle')}</span>
+      </div>
+      <div class="subsystem-main">${pendingCount} Pending Jobs</div>
+      <div class="subsystem-sub">${queueStalled ? 'Worker dead with pending jobs' : (queue.thread_alive ? 'Worker thread active' : 'Worker idle (no jobs)')}</div>
+    </div>
+  `;
+
+  // 5. Active Job Progress Card
+  const activeJ = sub.active_job || {};
+  const jobStalled = activeJ.stalled;
+  const jobRunning = activeJ.status === 'running' || activeJ.status === 'stalled';
+  const jobCardClass = jobStalled ? 'unhealthy' : 'healthy';
+  let jobMain = 'Idle (No Job)';
+  let jobSub = 'Pipeline ready';
+  if (jobRunning) {
+    jobMain = jobStalled ? 'Progress Stalled' : 'Processing';
+    jobSub = `${escapeHtml(activeJ.stage || 'In progress')} • ${activeJ.elapsed_without_progress_sec || 0}s in stage`;
+  }
+  const jobCard = `
+    <div class="subsystem-card ${jobCardClass}">
+      <div class="subsystem-header">
+        <span>Active Job</span>
+        <span class="health-pill ${jobCardClass}" style="font-size: 9px; padding: 2px 6px;">${jobStalled ? 'Stalled' : (jobRunning ? 'Running' : 'Idle')}</span>
+      </div>
+      <div class="subsystem-main">${jobMain}</div>
+      <div class="subsystem-sub">${jobSub}</div>
+    </div>
+  `;
+
+  // 6. Alert Engine Card
+  const alertEng = sub.alerts || {};
+  const drainHealthy = alertEng.drain_healthy !== false;
+  const alertCardClass = drainHealthy ? 'healthy' : 'unhealthy';
+  const alertCard = `
+    <div class="subsystem-card ${alertCardClass}">
+      <div class="subsystem-header">
+        <span>Alert Engine</span>
+        <span class="health-pill ${alertCardClass}" style="font-size: 9px; padding: 2px 6px;">${drainHealthy ? 'Healthy' : 'Failure'}</span>
+      </div>
+      <div class="subsystem-main">${drainHealthy ? 'Drain Active' : 'Drain Crash'}</div>
+      <div class="subsystem-sub">Queue depth: ${alertEng.queue_depth || 0} • State: ${escapeHtml(alertEng.engine_state || 'ready')}</div>
+    </div>
+  `;
+
+  return `
+    <div class="subsystem-grid">
+      ${dbCard}
+      ${storageCard}
+      ${schedulerCard}
+      ${queueCard}
+      ${jobCard}
+      ${alertCard}
+    </div>
+  `;
+}
+
+function openHealthModal() {
+  const modal = document.getElementById('health-modal');
+  if (modal) {
+    const stateInfo = evaluateHealthState(lastHealthData, lastHealthFetchTime);
+    renderHealthModal(lastHealthData, stateInfo);
+    if (typeof modal.showModal === 'function') {
+      modal.showModal();
+    } else {
+      modal.setAttribute('open', '');
+    }
+  }
+}
+
+function closeHealthModal() {
+  const modal = document.getElementById('health-modal');
+  if (modal) {
+    if (typeof modal.close === 'function') {
+      modal.close();
+    } else {
+      modal.removeAttribute('open');
+    }
+  }
+}
+
+function renderHealthModal(healthData, stateInfo) {
+  const body = document.getElementById('health-modal-body');
+  if (!body) return;
+
+  const uptimeStr = healthData?.uptime_seconds != null ? `${Math.floor(healthData.uptime_seconds / 60)}m ${Math.floor(healthData.uptime_seconds % 60)}s` : 'N/A';
+  const timestampStr = healthData?.timestamp ? new Date(healthData.timestamp).toLocaleString() : 'N/A';
+  const activeAlerts = healthData?.active_supervisor_alerts || [];
+
+  let alertsHtml = '';
+  if (activeAlerts.length > 0) {
+    alertsHtml = `
+      <div style="margin-top: 16px;">
+        <h4 style="font-size: 13px; font-weight: 700; color: var(--danger); margin-bottom: 8px;">Active Diagnostic Alerts (${activeAlerts.length})</h4>
+        ${activeAlerts.map(fp => `
+          <div class="alert-item">
+            <div>
+              <strong style="font-family: var(--font-mono);">${escapeHtml(fp)}</strong>
+            </div>
+            <span class="health-pill unhealthy" style="font-size: 9px;">ACTIVE</span>
+          </div>
+        `).join('')}
+      </div>
+    `;
+  } else {
+    alertsHtml = `
+      <div style="margin-top: 14px; font-size: 12px; color: var(--text-muted); background: rgba(0, 186, 124, 0.05); border: 1px solid rgba(0, 186, 124, 0.2); padding: 8px 12px; border-radius: 6px;">
+        ✓ Zero active diagnostic stall alerts.
+      </div>
+    `;
+  }
+
+  body.innerHTML = `
+    <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 16px; flex-wrap: wrap; gap: 8px;">
+      <div style="display: flex; align-items: center; gap: 10px;">
+        <span class="health-pill ${stateInfo.state}">${escapeHtml(stateInfo.label)}</span>
+        <span style="font-size: 13px; color: var(--text-muted);">${escapeHtml(stateInfo.message)}</span>
+      </div>
+      <button id="health-modal-refresh" class="btn btn-secondary" style="padding: 4px 10px; font-size: 12px;" onclick="triggerManualHealthRefresh(this)">
+        ↻ Refresh Telemetry
+      </button>
+    </div>
+
+    ${renderHealthSubsystemCards(healthData, stateInfo)}
+
+    <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 12px; margin-top: 14px; font-size: 12px; background: rgba(255, 255, 255, 0.02); border: 1px solid var(--border); border-radius: var(--radius-sm); padding: 12px;">
+      <div>Uptime: <strong>${escapeHtml(uptimeStr)}</strong></div>
+      <div>Probe Timestamp: <strong>${escapeHtml(timestampStr)}</strong></div>
+      <div>Telemetry Age: <strong>${stateInfo.dataAgeSec != null ? `${stateInfo.dataAgeSec}s` : 'Unknown'}</strong></div>
+    </div>
+
+    ${alertsHtml}
+  `;
+}
+
+async function triggerManualHealthRefresh(btn) {
+  if (btn) {
+    btn.disabled = true;
+    btn.textContent = 'Refreshing...';
+  }
+  try {
+    const data = await fetchHealthTelemetry();
+    const stateInfo = evaluateHealthState(data, lastHealthFetchTime);
+    renderHealthModal(data, stateInfo);
+    updateOverviewHealthWidget(data, stateInfo);
+  } finally {
+    if (btn) {
+      btn.disabled = false;
+      btn.textContent = '↻ Refresh Telemetry';
+    }
+  }
+}
+
+function updateOverviewHealthWidget(healthData, stateInfo) {
+  const container = document.getElementById('overview-health-widget');
+  if (!container) return;
+
+  const badgeElem = document.getElementById('overview-health-badge');
+  if (badgeElem) {
+    badgeElem.className = `health-pill ${stateInfo.state}`;
+    badgeElem.textContent = stateInfo.label;
+  }
+
+  const cardsContainer = document.getElementById('overview-health-cards');
+  if (cardsContainer) {
+    cardsContainer.innerHTML = renderHealthSubsystemCards(healthData, stateInfo);
+  }
+
+  const summaryElem = document.getElementById('overview-health-summary');
+  if (summaryElem) {
+    summaryElem.textContent = stateInfo.message;
+  }
+
+  const ageElem = document.getElementById('overview-health-age');
+  if (ageElem) {
+    ageElem.textContent = `Updated ${stateInfo.dataAgeSec != null ? `${stateInfo.dataAgeSec}s ago` : 'just now'}`;
+  }
+}
+
+
+// --------------------------------------------------------------------------
 // Polling & Status
 // --------------------------------------------------------------------------
 
+let pollStatusInFlight = false;
+
 async function pollStatus() {
+  if (pollStatusInFlight) return;
+  pollStatusInFlight = true;
   try {
-    const res = await fetch('/api/status');
-    if (!res.ok) return;
-    const data = await res.json();
-    if (data.csrf) csrfToken = data.csrf;
+    const [statusRes, healthData] = await Promise.all([
+      fetch('/api/status').then(r => r.ok ? r.json() : null).catch(() => null),
+      fetchHealthTelemetry()
+    ]);
 
     const dot = document.getElementById('status-dot');
     const statusText = document.getElementById('connection-status');
     const badgeMode = document.getElementById('badge-mode');
+    const healthState = evaluateHealthState(healthData, lastHealthFetchTime);
 
-    if (data.online) {
-      dot.className = 'status-indicator online';
-      statusText.textContent = `Online • ${data.platform}`;
-    } else {
-      dot.className = 'status-indicator';
-      statusText.textContent = 'Offline (Check connection)';
+    // If the host daemon is unreachable, mark offline and stop
+    if (!statusRes || !statusRes.online) {
+      if (dot) dot.className = 'status-indicator unavailable';
+      if (statusText) statusText.textContent = 'Offline • Daemon unreachable';
+      if (badgeMode) {
+        badgeMode.className = 'badge';
+        badgeMode.textContent = 'Unavailable';
+      }
+      return;
+    }
+
+    const data = statusRes;
+    if (data.csrf) csrfToken = data.csrf;
+
+    // Update connection indicator based on authoritative health telemetry.
+    // Telemetry failures (timeout, 5xx, malformed) do NOT prevent status updates
+    // or falsely mark the online daemon as offline.
+    if (dot && statusText) {
+      if (healthState.state === 'healthy') {
+        dot.className = 'status-indicator online';
+        statusText.textContent = `Online • ${data.platform || 'PC Daemon'}`;
+      } else if (healthState.state === 'degraded') {
+        dot.className = 'status-indicator degraded';
+        statusText.textContent = `Degraded • ${healthState.message}`;
+      } else if (healthState.state === 'unhealthy') {
+        dot.className = 'status-indicator unhealthy';
+        statusText.textContent = `Critical • ${healthState.message}`;
+      } else if (healthState.state === 'stale') {
+        dot.className = 'status-indicator stale';
+        statusText.textContent = `Stale • ${healthState.message}`;
+      } else {
+        dot.className = 'status-indicator degraded';
+        statusText.textContent = `Online • Telemetry ${healthState.label}`;
+      }
     }
 
     activeJobData = data.active_job;
@@ -144,6 +631,17 @@ async function pollStatus() {
     } else {
       badgeMode.className = 'badge';
       badgeMode.textContent = data.busy ? 'Busy' : 'Idle';
+    }
+
+    // Live update health overview widget if on overview page
+    if (currentPage === 'overview') {
+      updateOverviewHealthWidget(healthData, healthState);
+    }
+
+    // Live update health modal if currently open
+    const hModal = document.getElementById('health-modal');
+    if (hModal && (hModal.open || (typeof hModal.hasAttribute === 'function' && hModal.hasAttribute('open')))) {
+      renderHealthModal(healthData, healthState);
     }
 
     // Refresh live logs if on logs page
@@ -166,6 +664,12 @@ async function pollStatus() {
     }
   } catch (e) {
     console.error('Status poll error:', e);
+    const dot = document.getElementById('status-dot');
+    const statusText = document.getElementById('connection-status');
+    if (dot) dot.className = 'status-indicator unavailable';
+    if (statusText) statusText.textContent = 'Offline • Host unreachable';
+  } finally {
+    pollStatusInFlight = false;
   }
 }
 
@@ -388,11 +892,13 @@ async function loadOverview(container) {
   clearOverviewCountdown();
   container.innerHTML = '<p>Loading operational command center...</p>';
   try {
-    const [statusRes, videosRes, failuresRes] = await Promise.all([
-      fetch('/api/status').then(r => r.json()),
-      fetch('/api/videos').then(r => r.json()),
-      fetch('/api/failures').then(r => r.json())
+    const [statusRes, videosRes, failuresRes, healthRes] = await Promise.all([
+      fetch('/api/status').then(r => r.ok ? r.json() : {}).catch(() => ({ online: false })),
+      fetch('/api/videos').then(r => r.ok ? r.json() : []).catch(() => []),
+      fetch('/api/failures').then(r => r.ok ? r.json() : []).catch(() => []),
+      fetchHealthTelemetry()
     ]);
+    const healthState = evaluateHealthState(healthRes, lastHealthFetchTime);
 
     const total = videosRes.length;
     const ready = videosRes.filter(v => v.status === 'ready').length;
@@ -611,31 +1117,39 @@ async function loadOverview(container) {
           </button>
         </div>
 
-        <!-- System & Storage Health Widget -->
-        <div class="panel">
+        <!-- System Health & Telemetry Widget -->
+        <div class="panel" id="overview-health-widget">
           <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px;">
-            <h3 class="panel-title" style="margin-bottom: 0;">System & Storage Health</h3>
-            ${storageBadge}
+            <h3 class="panel-title" style="margin-bottom: 0;">System Health & Telemetry</h3>
+            <span id="overview-health-badge" class="health-pill ${healthState.state}">
+              ${escapeHtml(healthState.label)}
+            </span>
           </div>
 
-          <div style="background: rgba(255, 255, 255, 0.02); border: 1px solid var(--border); border-radius: var(--radius-sm); padding: 14px; margin-bottom: 14px;">
-            <div style="display: flex; justify-content: space-between; align-items: baseline;">
-              <span style="font-size: 12px; color: var(--text-muted);">FREE DISK SPACE</span>
-              <strong style="font-size: 18px; color: var(--text-main);">${freeMb.toLocaleString()} MB</strong>
+          <div style="background: rgba(255, 255, 255, 0.02); border: 1px solid var(--border); border-radius: var(--radius-sm); padding: 12px 14px; margin-bottom: 12px;">
+            <div style="display: flex; justify-content: space-between; align-items: center;">
+              <span style="font-size: 12px; color: var(--text-muted);">HOST DIAGNOSTICS</span>
+              <span id="overview-health-age" style="font-size: 11px; color: var(--text-muted); font-family: var(--font-mono);">
+                ${healthState.dataAgeSec != null ? `Updated ${healthState.dataAgeSec}s ago` : ''}
+              </span>
             </div>
-            <div style="font-size: 11px; color: var(--text-muted); margin-top: 4px;">
-              Thresholds: Safe &gt;1GB • Low space &lt;1GB • Critical &lt;512MB
+            <div id="overview-health-summary" style="font-size: 13px; font-weight: 600; color: var(--text-main); margin-top: 4px;">
+              ${escapeHtml(healthState.message)}
             </div>
           </div>
 
-          <div style="font-size: 13px; color: var(--text-muted); margin-bottom: 16px;">
-            <div>Host Daemon: <strong style="color: var(--text-main);">${statusRes.online ? 'Online' : 'Offline'} • ${escapeHtml(statusRes.platform || 'Local PC')}</strong></div>
-            <div>YouTube OAuth: <strong style="color: ${oauth.healthy ? 'var(--success)' : 'var(--warning)'};">${escapeHtml(oauth.status || 'healthy')}</strong></div>
+          <div id="overview-health-cards">
+            ${renderHealthSubsystemCards(healthRes, healthState)}
           </div>
 
-          <button class="btn btn-secondary" style="width: 100%;" onclick="document.querySelector('[data-page=connections]').click()">
-            Inspect API & OAuth Connections ↗
-          </button>
+          <div style="display: flex; gap: 8px; margin-top: 14px;">
+            <button class="btn btn-secondary" style="flex: 1;" onclick="openHealthModal()">
+              Detailed Diagnostics ↗
+            </button>
+            <button id="overview-health-refresh" class="btn btn-secondary" style="padding: 6px 12px;" onclick="triggerManualHealthRefresh(this)">
+              ↻ Refresh Telemetry
+            </button>
+          </div>
         </div>
       </div>
 
@@ -2720,4 +3234,15 @@ function escapeHtml(str) {
     "'": '&#39;',
     '"': '&quot;'
   }[tag] || tag));
+}
+
+if (typeof module !== 'undefined' && module.exports) {
+  module.exports = {
+    evaluateHealthState,
+    getHealthSummaryMessage,
+    renderHealthSubsystemCards,
+    pollStatus,
+    getPollStatusInFlight: () => pollStatusInFlight,
+    setPollStatusInFlight: (val) => { pollStatusInFlight = val; },
+  };
 }
