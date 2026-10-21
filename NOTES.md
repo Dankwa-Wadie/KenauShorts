@@ -12,6 +12,35 @@ what's actually on `origin/main`.
 
 ## Current state (update this section each handoff)
 
+- **Stage 8 Milestone 8.3 Completed & Verified (Discovery, Staging & Ingestion Pipeline Alignment for Clean Footage & Footage Fit)**:
+  - **Automated & Manual Ingestion Alignment (`core/agent.py`)**:
+    - Added `footage_fit: str = ""` to `Pick` dataclass with backward-compatible default.
+    - Updated `_render_pick()` with unambiguous configuration precedence rule:
+      `pick.field` > `config["layout"][field]` > `config[field]` > `render_config["layout"][field]` > Default (`"card"` / `"auto"`).
+      Guarantees that an explicit operator or config selection is never overridden by preset defaults.
+    - Direct renderer argument passing with defensive signature inspection for mock backward-compatibility.
+    - Persists resolved `presentation_mode` and `footage_fit` in `store.draft()` across both `run_pipeline()` and `run_manual()`.
+    - Added CLI flags `--presentation-mode` (choices `["", "card", "footage_clean"]`) and `--footage-fit` (choices `["", "auto", "cover", "contain"]`) to `core.agent` with fail-closed validation.
+  - **Server Validation & Job Construction (`studio/server.py`)**:
+    - `POST /api/job` with action `"manual"` extracts and validates `presentation_mode` and `footage_fit`.
+    - Rejects reserved `"footage_caption"`, invalid modes, invalid fits, and non-string types with HTTP 400 Bad Request before launching worker subprocesses.
+    - Assembles `--presentation-mode` and `--footage-fit` CLI arguments for `core.agent`.
+    - Preserves options across job retries (`retry_job`).
+  - **Studio Ingestion Modal UI (`studio/web/index.html`, `studio/web/app.js`)**:
+    - Added Presentation Mode selector (`#manual-presentation-mode`) and Footage Fit selector (`#manual-footage-fit` in `#manual-footage-fit-group`) to `<dialog id="manual-url-modal">`.
+    - `openManualUrlModal()` resets selectors to documented defaults (`card`, `auto`).
+    - `onManualPresentationModeChange()` toggles footage fit selector visibility when clean footage is selected.
+    - `submitManualUrl()` includes validated `presentation_mode` and `footage_fit` in `POST /api/job` payload.
+  - **Deterministic Test Suites & Verification Evidence**:
+    - Focused Milestone 8.3 suite (`tests/test_milestone8_3.py`): 8/8 passed (0.5s).
+    - Combined regression suite (`test_milestone8_1.py`, `test_milestone8_2.py`, `test_milestone8_3.py`, `test_operational_smoke.py`, `test_supervisor.py`, `test_frontend_integration.py`): 53/53 passed (22.3s).
+    - Existing discovery and pipeline integration suites (`test_agent_discovery.py`, `test_pipeline_integration.py`): 21/21 passed (0.5s).
+    - Node.js UI health tests: 13/13 passed (`node tests/test_health_ui.js`).
+    - Bytecode compilation: `python -m compileall core studio scripts tests` clean (0 errors).
+    - Formatting check: `git diff --check` clean (0 errors).
+    - Protected invariants: `studio-settings.json` completely untouched (`"interval_hours": 3`), `studio/supervisor.py` untouched (0 diff).
+    - Live YouTube requests/uploads: 0 calls made.
+
 - **Stage 8 Milestone 8.2 Completed & Verified (Studio UI & Workflow Modernization for Clean Footage & Footage Fit)**:
   - **Presentation Mode & Footage Fit Controls (`studio/web/app.js`, `studio/web/style.css`)**:
     - Video modal (`openVideoModal`):

@@ -107,6 +107,23 @@
           <p class="form-help">A direct YouTube video link. This skips normal discovery and licence checks.</p>
         </div>
         <div class="form-group">
+          <label>Presentation Mode</label>
+          <select class="form-input" id="manual-presentation-mode" onchange="onManualPresentationModeChange(this.value)">
+            <option value="card" selected>Card (Branded frame + headline)</option>
+            <option value="footage_clean">Clean Footage (Full-bleed 9:16, no overlays)</option>
+          </select>
+          <p class="form-help">Choose between classic branded card layout and modern clean vertical footage.</p>
+        </div>
+        <div class="form-group" id="manual-footage-fit-group" style="display: none;">
+          <label>Footage Fit Mode</label>
+          <select class="form-input" id="manual-footage-fit">
+            <option value="auto" selected>Auto (contain landscape, cover vertical)</option>
+            <option value="cover">Cover (fill 9:16, crop edges)</option>
+            <option value="contain">Contain (fit inside 9:16, letterbox padding)</option>
+          </select>
+          <p class="form-help">Controls how source video scales into the 9:16 canvas. Auto prevents landscape content from being cropped.</p>
+        </div>
+        <div class="form-group">
           <label>Headline (optional)</label>
           <input type="text" class="form-input" id="manual-headline" placeholder="Leave blank to let AI write one">
         </div>

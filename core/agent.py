@@ -26,7 +26,14 @@ from typing import Any
 import requests
 
 from core.power import keep_awake
-from core.render import Account, RenderResult, render
+from core.render import (
+    Account,
+    RenderResult,
+    RESERVED_PRESENTATION_MODES,
+    SUPPORTED_PRESENTATION_MODES,
+    VALID_FOOTAGE_FIT,
+    render,
+)
 from core.render_story import render_story
 from core.scrape_reddit import fetch_subreddit_posts, get_reddit_token
 from core.state import State
@@ -71,6 +78,7 @@ class Pick:
     mood: str = "neutral"
     style_preset: str = ""
     presentation_mode: str = ""
+    footage_fit: str = ""
 
 def emit_progress(stage: str, **extras) -> None:
     payload = {"stage": stage, **extras}
@@ -1403,6 +1411,8 @@ def _render_pick(pick: Pick, config: dict[str, Any], work_dir: Path, out_dir: Pa
 
         pres_mode = (
             getattr(pick, "presentation_mode", "")
+            or config.get("layout", {}).get("presentation_mode", "")
+            or config.get("presentation_mode", "")
             or render_config.get("layout", {}).get("presentation_mode", "")
             or render_config.get("presentation_mode", "")
             or "card"
@@ -1410,6 +1420,18 @@ def _render_pick(pick: Pick, config: dict[str, Any], work_dir: Path, out_dir: Pa
         pick.presentation_mode = pres_mode
         render_config["presentation_mode"] = pres_mode
         render_config.setdefault("layout", {})["presentation_mode"] = pres_mode
+
+        fit_mode = (
+            getattr(pick, "footage_fit", "")
+            or config.get("layout", {}).get("footage_fit", "")
+            or config.get("footage_fit", "")
+            or render_config.get("layout", {}).get("footage_fit", "")
+            or render_config.get("footage_fit", "")
+            or "auto"
+        )
+        pick.footage_fit = fit_mode
+        render_config["footage_fit"] = fit_mode
+        render_config.setdefault("layout", {})["footage_fit"] = fit_mode
 
         if pres_mode == "footage_clean":
             emit_progress("Rendering clean footage")
@@ -1434,10 +1456,14 @@ def _render_pick(pick: Pick, config: dict[str, Any], work_dir: Path, out_dir: Pa
         try:
             import inspect
             sig = inspect.signature(render)
-            if "presentation_mode" in sig.parameters or any(p.kind == p.VAR_KEYWORD for p in sig.parameters.values()):
+            has_var_kw = any(p.kind == p.VAR_KEYWORD for p in sig.parameters.values())
+            if "presentation_mode" in sig.parameters or has_var_kw:
                 render_kwargs["presentation_mode"] = pres_mode
+            if "footage_fit" in sig.parameters or has_var_kw:
+                render_kwargs["footage_fit"] = fit_mode
         except Exception:
             render_kwargs["presentation_mode"] = pres_mode
+            render_kwargs["footage_fit"] = fit_mode
 
         render(**render_kwargs)
     else:
@@ -1456,13 +1482,32 @@ def _render_pick(pick: Pick, config: dict[str, Any], work_dir: Path, out_dir: Pa
 
     return final_mp4
 
-def run_manual(config_path: Path, url: str, headline: str = "", description: str = "", dry_run: bool = False) -> None:
+def run_manual(
+    config_path: Path,
+    url: str,
+    headline: str = "",
+    description: str = "",
+    dry_run: bool = False,
+    presentation_mode: str = "",
+    footage_fit: str = "",
+) -> None:
     """Render a single, manually-supplied video URL, bypassing discovery entirely.
 
     If headline/description are left blank, falls back to Gemini (via the
     normal pick_stories() editorial step) to generate them, same as a
     regular discovered candidate would get.
     """
+    if presentation_mode:
+        presentation_mode = presentation_mode.strip().lower()
+        if presentation_mode in RESERVED_PRESENTATION_MODES:
+            raise ValueError(f"Presentation mode '{presentation_mode}' is reserved for a future milestone and cannot be selected.")
+        if presentation_mode not in SUPPORTED_PRESENTATION_MODES:
+            raise ValueError(f"Invalid presentation_mode: '{presentation_mode}'. Must be one of {sorted(SUPPORTED_PRESENTATION_MODES)}")
+    if footage_fit:
+        footage_fit = footage_fit.strip().lower()
+        if footage_fit not in VALID_FOOTAGE_FIT:
+            raise ValueError(f"Invalid footage_fit: '{footage_fit}'. Must be one of {sorted(VALID_FOOTAGE_FIT)}")
+
     with keep_awake():
         config = json.loads(config_path.read_text(encoding="utf-8"))
         state = State(ROOT / "state.json")
@@ -1489,6 +1534,8 @@ def run_manual(config_path: Path, url: str, headline: str = "", description: str
                 title=f"{headline.strip()} #Shorts",
                 description=description.strip(),
                 hashtags=["KaydenAmp"],
+                presentation_mode=presentation_mode,
+                footage_fit=footage_fit,
             )
         else:
             emit_progress("AI Editorial Selection")
@@ -1505,6 +1552,10 @@ def run_manual(config_path: Path, url: str, headline: str = "", description: str
             if description.strip():
                 pick.description = description.strip()
                 pick.caption = description.strip()
+            if presentation_mode:
+                pick.presentation_mode = presentation_mode
+            if footage_fit:
+                pick.footage_fit = footage_fit
 
         work_dir = ROOT / "work"
         out_dir = ROOT / "out"
@@ -1534,6 +1585,7 @@ def run_manual(config_path: Path, url: str, headline: str = "", description: str
             candidate_data=dataclasses.asdict(pick.candidate),
             style_preset=getattr(pick, "style_preset", ""),
             presentation_mode=getattr(pick, "presentation_mode", ""),
+            footage_fit=getattr(pick, "footage_fit", ""),
         )
 
         if not dry_run:
@@ -1543,7 +1595,23 @@ def run_manual(config_path: Path, url: str, headline: str = "", description: str
         emit_summary({"status": "ok", "message": "Manual video rendered", "video_id": video_record.get("id", "")}
         )
 
-def run_pipeline(config_path: Path, dry_run: bool = False) -> None:
+def run_pipeline(
+    config_path: Path,
+    dry_run: bool = False,
+    presentation_mode: str = "",
+    footage_fit: str = "",
+) -> None:
+    if presentation_mode:
+        presentation_mode = presentation_mode.strip().lower()
+        if presentation_mode in RESERVED_PRESENTATION_MODES:
+            raise ValueError(f"Presentation mode '{presentation_mode}' is reserved for a future milestone and cannot be selected.")
+        if presentation_mode not in SUPPORTED_PRESENTATION_MODES:
+            raise ValueError(f"Invalid presentation_mode: '{presentation_mode}'. Must be one of {sorted(SUPPORTED_PRESENTATION_MODES)}")
+    if footage_fit:
+        footage_fit = footage_fit.strip().lower()
+        if footage_fit not in VALID_FOOTAGE_FIT:
+            raise ValueError(f"Invalid footage_fit: '{footage_fit}'. Must be one of {sorted(VALID_FOOTAGE_FIT)}")
+
     with keep_awake():
         config = json.loads(config_path.read_text(encoding="utf-8"))
         state = State(ROOT / "state.json")
@@ -1591,6 +1659,10 @@ def run_pipeline(config_path: Path, dry_run: bool = False) -> None:
         final_mp4: Path | None = None
         stem = ""
         for candidate_pick in picks:
+            if presentation_mode:
+                candidate_pick.presentation_mode = presentation_mode
+            if footage_fit:
+                candidate_pick.footage_fit = footage_fit
             LOG.info("Trying pick: %s (%s)", candidate_pick.headline, candidate_pick.candidate.url)
             stem = f"short_{int(time.time())}_{candidate_pick.candidate.key[:10]}"
             try:
@@ -1632,6 +1704,7 @@ def run_pipeline(config_path: Path, dry_run: bool = False) -> None:
             candidate_data=dataclasses.asdict(pick.candidate),
             style_preset=getattr(pick, "style_preset", ""),
             presentation_mode=getattr(pick, "presentation_mode", ""),
+            footage_fit=getattr(pick, "footage_fit", ""),
         )
 
         video_id = ""
@@ -1682,6 +1755,8 @@ if __name__ == "__main__":
     parser.add_argument("--url", default="", help="Render a single manually-supplied video URL instead of running discovery")
     parser.add_argument("--headline", default="", help="Optional headline for --url mode; left blank, AI generates one")
     parser.add_argument("--description", default="", help="Optional description for --url mode; left blank, AI generates one")
+    parser.add_argument("--presentation-mode", default="", choices=["", "card", "footage_clean"], help="Presentation mode ('card' or 'footage_clean')")
+    parser.add_argument("--footage-fit", default="", choices=["", "auto", "cover", "contain"], help="Footage fit mode ('auto', 'cover', or 'contain')")
     args = parser.parse_args()
 
     cfg_file = Path(args.config)
@@ -1689,6 +1764,19 @@ if __name__ == "__main__":
         cfg_file = ROOT / "config.example.json"
 
     if args.url:
-        run_manual(cfg_file, args.url, headline=args.headline, description=args.description, dry_run=args.dry_run)
+        run_manual(
+            cfg_file,
+            args.url,
+            headline=args.headline,
+            description=args.description,
+            dry_run=args.dry_run,
+            presentation_mode=args.presentation_mode,
+            footage_fit=args.footage_fit,
+        )
     else:
-        run_pipeline(cfg_file, dry_run=args.dry_run)
+        run_pipeline(
+            cfg_file,
+            dry_run=args.dry_run,
+            presentation_mode=args.presentation_mode,
+            footage_fit=args.footage_fit,
+        )

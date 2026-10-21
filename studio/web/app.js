@@ -731,10 +731,23 @@ function setupQuickActions() {
   });
 }
 
+function onManualPresentationModeChange(val) {
+  const fitGroup = document.getElementById('manual-footage-fit-group');
+  if (fitGroup) {
+    fitGroup.style.display = val === 'footage_clean' ? 'block' : 'none';
+  }
+}
+
 function openManualUrlModal() {
   document.getElementById('manual-url').value = '';
   document.getElementById('manual-headline').value = '';
   document.getElementById('manual-description').value = '';
+  const presEl = document.getElementById('manual-presentation-mode');
+  if (presEl) presEl.value = 'card';
+  const fitEl = document.getElementById('manual-footage-fit');
+  if (fitEl) fitEl.value = 'auto';
+  const fitGroup = document.getElementById('manual-footage-fit-group');
+  if (fitGroup) fitGroup.style.display = 'none';
   const modal = document.getElementById('manual-url-modal');
   document.getElementById('btn-close-manual-modal').onclick = () => modal.close();
   modal.showModal();
@@ -744,6 +757,8 @@ async function submitManualUrl() {
   const url = document.getElementById('manual-url').value.trim();
   const headline = document.getElementById('manual-headline').value.trim();
   const description = document.getElementById('manual-description').value.trim();
+  const presentation_mode = document.getElementById('manual-presentation-mode')?.value || 'card';
+  const footage_fit = document.getElementById('manual-footage-fit')?.value || 'auto';
 
   if (!url) {
     alert('Please paste a video URL.');
@@ -751,7 +766,14 @@ async function submitManualUrl() {
   }
 
   try {
-    const res = await postJSON('/api/job', { action: 'manual', url, headline, description });
+    const res = await postJSON('/api/job', {
+      action: 'manual',
+      url,
+      headline,
+      description,
+      presentation_mode,
+      footage_fit,
+    });
     const data = await res.json();
     if (data.error) throw new Error(data.error);
     showNotification('Rendering started — check the Library or Logs tab.');
@@ -3347,5 +3369,6 @@ if (typeof module !== 'undefined' && module.exports) {
     getPollStatusInFlight: () => pollStatusInFlight,
     setPollStatusInFlight: (val) => { pollStatusInFlight = val; },
     getPreviewGuidanceText,
+    onManualPresentationModeChange,
   };
 }

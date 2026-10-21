@@ -1688,6 +1688,26 @@ def start_job(action: str, key: str = "", automatic: bool = False, extra: dict |
             command += ["--headline", headline]
         if description:
             command += ["--description", description]
+
+        pres_mode = (extra or {}).get("presentation_mode")
+        if pres_mode is not None and pres_mode != "":
+            if not isinstance(pres_mode, str):
+                raise ValueError(f"Invalid presentation_mode: expected string, got {type(pres_mode).__name__}")
+            pres_mode = pres_mode.strip().lower()
+            if pres_mode in RESERVED_PRESENTATION_MODES:
+                raise ValueError(f"Presentation mode '{pres_mode}' is reserved for a future milestone and cannot be selected.")
+            if pres_mode not in SUPPORTED_PRESENTATION_MODES:
+                raise ValueError(f"Invalid presentation_mode: '{pres_mode}'. Must be one of {sorted(SUPPORTED_PRESENTATION_MODES)}")
+            command += ["--presentation-mode", pres_mode]
+
+        fit = (extra or {}).get("footage_fit")
+        if fit is not None and fit != "":
+            if not isinstance(fit, str):
+                raise ValueError(f"Invalid footage_fit: expected string, got {type(fit).__name__}")
+            fit = fit.strip().lower()
+            if fit not in VALID_FOOTAGE_FIT:
+                raise ValueError(f"Invalid footage_fit: '{fit}'. Must be one of {sorted(VALID_FOOTAGE_FIT)}")
+            command += ["--footage-fit", fit]
     else:
         raise ValueError(f"Unknown job action: {action}")
 
@@ -1782,6 +1802,12 @@ def retry_job(source_id: str) -> dict:
                 command += ["--headline", headline]
             if description:
                 command += ["--description", description]
+            pres_mode = extra.get("presentation_mode")
+            if pres_mode and isinstance(pres_mode, str) and pres_mode.strip().lower() in SUPPORTED_PRESENTATION_MODES:
+                command += ["--presentation-mode", pres_mode.strip().lower()]
+            fit = extra.get("footage_fit")
+            if fit and isinstance(fit, str) and fit.strip().lower() in VALID_FOOTAGE_FIT:
+                command += ["--footage-fit", fit.strip().lower()]
         else:
             raise ValueError(f"Cannot retry unknown job action: {action}")
 
