@@ -2701,11 +2701,20 @@ async function saveAutomationSettings() {
 // Page: Style & Layout
 // --------------------------------------------------------------------------
 
+function onStylePresentationModeChange(val) {
+  const fitGroup = document.getElementById('style-footage-fit-group');
+  if (fitGroup) {
+    fitGroup.style.display = val === 'footage_clean' ? 'block' : 'none';
+  }
+}
+
 async function loadStyle(container) {
   try {
     const data = await fetch('/api/settings').then(r => r.json());
     const acct = data.config.account || {};
     const layout = data.config.layout || {};
+    const presMode = layout.presentation_mode || 'card';
+    const footageFit = layout.footage_fit || 'auto';
 
     container.innerHTML = `
       <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 24px;">
@@ -2730,7 +2739,24 @@ async function loadStyle(container) {
         </div>
 
         <div class="panel">
-          <h3 class="panel-title">Card Styling</h3>
+          <h3 class="panel-title">Presentation & Card Styling</h3>
+          <div class="form-group">
+            <label>Default Presentation Mode</label>
+            <select class="form-input" id="style-presentation-mode" onchange="onStylePresentationModeChange(this.value)">
+              <option value="card" ${presMode === 'card' ? 'selected' : ''}>Card (Branded frame + headline)</option>
+              <option value="footage_clean" ${presMode === 'footage_clean' ? 'selected' : ''}>Clean Footage (Full-bleed 9:16, no overlays)</option>
+            </select>
+            <p class="form-help">Default presentation layout for automated pipeline discovery.</p>
+          </div>
+          <div class="form-group" id="style-footage-fit-group" style="display: ${presMode === 'footage_clean' ? 'block' : 'none'};">
+            <label>Default Footage Fit Mode</label>
+            <select class="form-input" id="style-footage-fit">
+              <option value="auto" ${footageFit === 'auto' ? 'selected' : ''}>Auto (contain landscape, cover vertical)</option>
+              <option value="cover" ${footageFit === 'cover' ? 'selected' : ''}>Cover (fill 9:16, crop edges)</option>
+              <option value="contain" ${footageFit === 'contain' ? 'selected' : ''}>Contain (fit inside 9:16, letterbox padding)</option>
+            </select>
+            <p class="form-help">Controls how source video scales into the 9:16 canvas for clean footage.</p>
+          </div>
           <div class="form-group">
             <label>Border Color</label>
             <input type="color" class="form-input" id="style-border-color" value="${layout.border_color || '#1D9BF0'}" style="height: 44px; padding: 4px;">
@@ -2743,6 +2769,7 @@ async function loadStyle(container) {
             <label>Headline Size (px)</label>
             <input type="number" class="form-input" id="style-headline-size" value="${layout.headline_size || 76}">
           </div>
+          <button class="btn btn-primary" onclick="saveStyleSettings()" style="margin-top: 8px;">Save Style Settings</button>
 
           <h3 style="font-size: 14px; margin: 20px 0 12px; color: var(--text-muted);">Live Preview</h3>
           <div style="background: #000; border-radius: 12px; padding: 20px; display: flex; justify-content: center;">
@@ -2801,12 +2828,23 @@ async function saveStyleSettings() {
   const border_color = document.getElementById('style-border-color').value;
   const corner_radius = parseInt(document.getElementById('style-radius').value, 10);
   const headline_size = parseInt(document.getElementById('style-headline-size').value, 10);
+  const presEl = document.getElementById('style-presentation-mode');
+  const presentation_mode = presEl ? presEl.value : 'card';
+  const fitEl = document.getElementById('style-footage-fit');
+  const footage_fit = fitEl ? fitEl.value : 'auto';
 
   try {
     const data = await fetch('/api/settings').then(r => r.json());
     const cfg = data.config;
     cfg.account = { ...cfg.account, name, handle, verified };
-    cfg.layout = { ...cfg.layout, border_color, corner_radius, headline_size };
+    cfg.layout = {
+      ...cfg.layout,
+      border_color,
+      corner_radius,
+      headline_size,
+      presentation_mode,
+      footage_fit,
+    };
 
     await postJSON('/api/settings', { config: cfg });
     showNotification('Channel & style settings saved.');
@@ -3370,5 +3408,6 @@ if (typeof module !== 'undefined' && module.exports) {
     setPollStatusInFlight: (val) => { pollStatusInFlight = val; },
     getPreviewGuidanceText,
     onManualPresentationModeChange,
+    onStylePresentationModeChange,
   };
 }

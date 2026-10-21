@@ -2209,6 +2209,24 @@ def validate_settings_config(patch: dict) -> dict:
         if not _is_int(v) or not 20 <= v <= 160:
             raise ValueError("Headline size must be 20-160")
         out["headline_size"] = v
+    if "presentation_mode" in layout:
+        pres_mode = layout["presentation_mode"]
+        if not isinstance(pres_mode, str):
+            raise ValueError(f"Invalid presentation_mode: expected string, got {type(pres_mode).__name__}")
+        pres_mode = pres_mode.strip().lower()
+        if pres_mode in RESERVED_PRESENTATION_MODES:
+            raise ValueError(f"Presentation mode '{pres_mode}' is reserved for a future milestone and cannot be selected.")
+        if pres_mode not in SUPPORTED_PRESENTATION_MODES:
+            raise ValueError(f"Invalid presentation_mode: '{pres_mode}'. Must be one of {sorted(SUPPORTED_PRESENTATION_MODES)}")
+        out["presentation_mode"] = pres_mode
+    if "footage_fit" in layout:
+        fit = layout["footage_fit"]
+        if not isinstance(fit, str):
+            raise ValueError(f"Invalid footage_fit: expected string, got {type(fit).__name__}")
+        fit = fit.strip().lower()
+        if fit not in VALID_FOOTAGE_FIT:
+            raise ValueError(f"Invalid footage_fit: '{fit}'. Must be one of {sorted(VALID_FOOTAGE_FIT)}")
+        out["footage_fit"] = fit
     if out:
         cfg["layout"] = out
 

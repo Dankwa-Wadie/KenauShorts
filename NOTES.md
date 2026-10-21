@@ -12,6 +12,31 @@ what's actually on `origin/main`.
 
 ## Current state (update this section each handoff)
 
+- **Stage 8 Milestone 8.4 Completed & Verified (Channel-Wide Presentation Defaults and Settings Persistence)**:
+  - **Settings Whitelist & Validation Governance (`studio/server.py`)**:
+    - Added `presentation_mode` and `footage_fit` recognition and validation to `validate_settings_config()` under `layout`.
+    - Enforces fail-closed validation: accepts only `SUPPORTED_PRESENTATION_MODES` (`"card"`, `"footage_clean"`) and `VALID_FOOTAGE_FIT` (`"auto"`, `"cover"`, `"contain"`).
+    - Strictly rejects reserved `"footage_caption"`, invalid choices, and non-string types with HTTP 400 Bad Request (`ValueError`).
+    - Eliminates the silent configuration stripping bug where saving unrelated settings or channel branding would wipe `presentation_mode` and `footage_fit` from `config.json`.
+    - Preserves existing layout fields (`border_color`, `corner_radius`, `canvas_width`, etc.) during partial settings updates.
+  - **Channel & Style UI (`studio/web/app.js`)**:
+    - Extended Channel & Style page (`loadStyle`) with Default Presentation Mode (`#style-presentation-mode`) and Default Footage Fit (`#style-footage-fit` in `#style-footage-fit-group`).
+    - Loaded current values from `layout.presentation_mode` and `layout.footage_fit`, defaulting to Card and Auto only when genuinely absent.
+    - Added `onStylePresentationModeChange()` to toggle `#style-footage-fit-group` visibility without mutating the selected fit value.
+    - Updated `saveStyleSettings()` to package `presentation_mode` and `footage_fit` inside `cfg.layout` for persistence via `POST /api/settings`.
+    - Exported `onStylePresentationModeChange` for Node.js contract test compatibility.
+  - **Schema Documentation (`config.example.json`)**:
+    - Documented `"presentation_mode": "card"` and `"footage_fit": "auto"` under `"layout"`.
+  - **Deterministic Test Suites & Verification Evidence**:
+    - Focused Milestone 8.4 suite (`tests/test_milestone8_4.py`): 7/7 passed (0.46s).
+    - Combined regression suite (`test_milestone8_1.py`, `test_milestone8_2.py`, `test_milestone8_3.py`, `test_milestone8_4.py`, `test_operational_smoke.py`, `test_supervisor.py`, `test_frontend_integration.py`): 60/60 passed (26.4s).
+    - Existing discovery and pipeline integration suites (`test_agent_discovery.py`, `test_pipeline_integration.py`): 21/21 passed (0.58s).
+    - Node.js UI health tests: 13/13 passed (`node tests/test_health_ui.js`).
+    - Bytecode compilation: `python -m compileall core studio scripts tests` clean (0 errors).
+    - Formatting check: `git diff --check` clean (0 errors).
+    - Protected invariants: `studio-settings.json` completely untouched (`"interval_hours": 3`), `studio/supervisor.py` untouched (0 diff).
+    - Live YouTube requests/uploads: 0 calls made.
+
 - **Stage 8 Milestone 8.3 Completed & Verified (Discovery, Staging & Ingestion Pipeline Alignment for Clean Footage & Footage Fit)**:
   - **Automated & Manual Ingestion Alignment (`core/agent.py`)**:
     - Added `footage_fit: str = ""` to `Pick` dataclass with backward-compatible default.

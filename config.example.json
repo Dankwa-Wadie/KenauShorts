@@ -80,6 +80,8 @@
   "layout": {
     "canvas_width": 1080,
     "canvas_height": 1920,
+    "presentation_mode": "card",
+    "footage_fit": "auto",
     "background": "#000000",
     "side_margin": 72,
     "video_margin": 36,
