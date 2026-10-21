@@ -38,7 +38,7 @@ if __name__ == "__main__" and __package__ is None:
     # the service tries to start.
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from core.render import RESERVED_PRESENTATION_MODES, SUPPORTED_PRESENTATION_MODES, VALID_PRESENTATION_MODES
+from core.render import RESERVED_PRESENTATION_MODES, SUPPORTED_PRESENTATION_MODES, VALID_FOOTAGE_FIT, VALID_PRESENTATION_MODES
 from core.style_presets import STYLE_PRESETS
 from studio import alerts, retention as studio_retention, supervisor
 from studio import settings as studio_settings
@@ -2739,6 +2739,21 @@ class StudioHandler(BaseHTTPRequestHandler):
                     if mode_val not in SUPPORTED_PRESENTATION_MODES:
                         raise ValueError(f"Invalid presentation_mode: '{mode_val}'. Must be one of {sorted(SUPPORTED_PRESENTATION_MODES)}")
                     record["presentation_mode"] = mode_val
+                    if isinstance(record.get("config"), dict):
+                        record["config"].setdefault("layout", {})["presentation_mode"] = mode_val
+                if "footage_fit" in data:
+                    val = data["footage_fit"]
+                    if val is None or val == "":
+                        fit_val = "auto"
+                    elif isinstance(val, str):
+                        fit_val = val.strip().lower()
+                    else:
+                        raise ValueError(f"Invalid footage_fit: expected string, got {type(val).__name__}")
+                    if fit_val not in VALID_FOOTAGE_FIT:
+                        raise ValueError(f"Invalid footage_fit: '{fit_val}'. Must be one of {sorted(VALID_FOOTAGE_FIT)}")
+                    record["footage_fit"] = fit_val
+                    if isinstance(record.get("config"), dict):
+                        record["config"].setdefault("layout", {})["footage_fit"] = fit_val
                 if "review_status" in data:
                     val = data["review_status"]
                     if not isinstance(val, str):

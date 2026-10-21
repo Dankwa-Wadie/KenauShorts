@@ -12,6 +12,37 @@ what's actually on `origin/main`.
 
 ## Current state (update this section each handoff)
 
+- **Stage 8 Milestone 8.2 Completed & Verified (Studio UI & Workflow Modernization for Clean Footage & Footage Fit)**:
+  - **Presentation Mode & Footage Fit Controls (`studio/web/app.js`, `studio/web/style.css`)**:
+    - Video modal (`openVideoModal`):
+      - Added Presentation Mode selector (`#edit-presentation-mode`) allowing operators to toggle between Card (`card`) and Clean Footage (`footage_clean`).
+      - Added Footage Fit selector (`#edit-footage-fit` in `#footage-fit-group`), exposed dynamically when Clean Footage is active, supporting Auto (`auto`), Cover (`cover`), and Contain (`contain`).
+      - Dynamic Re-render Action button (`#btn-rerender-draft`): dynamically labels action as `Re-render Clean Footage` versus `Re-render Card` based on chosen presentation mode.
+    - Representative 9:16 Preview Guidance (`#preview-mode-banner`):
+      - Displays contextual explanations directly beneath the video player explaining scaling and cropping behavior across modes and fit options:
+        - Clean Footage (Cover): explains that video fills the entire 9:16 frame with center-cropping on left and right for landscape content.
+        - Clean Footage (Contain): explains that full video fits inside the 9:16 frame with black letterbox bars and zero cropping.
+        - Clean Footage (Auto): explains adaptive behavior (vertical content covers frame; landscape content contains with black padding).
+        - Card: explains classic branded 9:16 layout with bold headline, style borders, and avatar branding.
+    - Library Grid Presentation Mode Badges:
+      - Displayed on video cards in library grid (`.badge-mode-clean` and `.badge-mode-card`) for instant visual distinction between clean footage shorts and card shorts.
+  - **API Validation & State Synchronization (`studio/server.py`)**:
+    - `POST /api/video`: validates `presentation_mode` (`"card"`, `"footage_clean"`, rejecting reserved `"footage_caption"` and unsupported modes with 400 Bad Request) and `footage_fit` (`"auto"`, `"cover"`, `"contain"`, rejecting invalid/non-string values with 400 Bad Request).
+    - Synchronizes top-level record fields (`record["presentation_mode"]`, `record["footage_fit"]`) and nested layout configuration (`record["config"]["layout"]`).
+  - **Persistence & Worker Re-rendering (`studio/store.py`, `studio/worker.py`)**:
+    - `studio/store.py`: `store.draft()` accepts and records `footage_fit`; `enrich_video_record()` supplies backward-compatible default `"auto"` for unmigrated records.
+    - `studio/worker.py`: worker `"render"` action resolves both `presentation_mode` and `footage_fit` from SQLite record or configuration, passes both to `render.render()`, and persists both upon render completion.
+    - `core/agent.py`: Reverted to exact HEAD (Milestone 8.1 committed state) to keep Milestone 8.2 strictly isolated to Studio UI and worker re-rendering workflows without touching automated discovery pipeline logic.
+  - **Deterministic Test Suites & Verification Evidence**:
+    - Focused Milestone 8.2 suite (`tests/test_milestone8_2.py`): 7/7 passed (2.1s) after Option A test scope alignment (removed pick dataclass propagation test to keep `core/agent.py` untouched at HEAD).
+    - Combined regression suites (`test_milestone8_1.py`, `test_milestone8_2.py`, `test_operational_smoke.py`, `test_supervisor.py`, `test_frontend_integration.py`): 45/45 passed (21.1s).
+    - Node.js UI health tests: 13/13 passed (`node tests/test_health_ui.js`).
+    - Python bytecode compilation: `python -m compileall core studio scripts tests` clean (0 errors).
+    - Formatting check: `git diff --check` clean (0 errors).
+    - Invariant verification: `core/agent.py`, `studio/supervisor.py`, and `studio-settings.json` have 0 diff against HEAD; `studio-settings.json` verified with `"interval_hours": 3`.
+    - Live YouTube requests/uploads: 0 calls made.
+
+
 - **Stage 8 Milestone 8.1 Completed & Verified (Footage-First and Clean-Footage Rendering Modes in `76e48cb53264465e8cde9399c1ed47c5a203c8a2`)**:
   - **Core Rendering Foundation (`core/render.py`)**:
     - Defined presentation mode constants: `PRESENTATION_MODE_CARD = "card"`, `PRESENTATION_MODE_FOOTAGE_CLEAN = "footage_clean"`, `PRESENTATION_MODE_FOOTAGE_CAPTION = "footage_caption"`, `VALID_PRESENTATION_MODES = ("card", "footage_clean", "footage_caption")`, `DEFAULT_PRESENTATION_MODE = "card"`.

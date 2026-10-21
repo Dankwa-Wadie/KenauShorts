@@ -106,7 +106,7 @@ class TestHealthEndpointAndLifecycle(unittest.TestCase):
 
         self.stop_event = threading.Event()
         self.sup = supervisor.Supervisor(
-            tick_interval=15.0,
+            tick_interval=3600.0,
             db_path=self.db_path,
             stop_event=self.stop_event,
         )

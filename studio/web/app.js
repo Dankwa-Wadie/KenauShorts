@@ -1544,13 +1544,20 @@ function renderLibraryGrid() {
     const revBadgeClass = `badge-review-${rev}`;
     const revLabel = rev === 'approved' ? '✓ Approved' : rev === 'rejected' ? '✕ Rejected' : 'Unreviewed';
     const missingBadge = (v.video_exists === false) ? `<span class="badge badge-missing" style="position: absolute; bottom: 8px; right: 8px; z-index: 2;">⚠ Missing File</span>` : '';
-    const presetLabel = v.style_preset ? `<span class="preset-tag" style="position: absolute; top: 10px; right: 10px; z-index: 2;">${escapeHtml(v.style_preset.replace('_', ' '))}</span>` : '';
+    const isCleanMode = v.presentation_mode === 'footage_clean';
+    const modeBadge = `<span class="${isCleanMode ? 'badge-mode-clean' : 'badge-mode-card'}" title="Presentation Mode: ${isCleanMode ? 'Clean Footage' : 'Card'}">${isCleanMode ? 'Clean Footage' : 'Card'}</span>`;
+    const topBadges = `
+      <div style="position: absolute; top: 10px; right: 10px; z-index: 2; display: flex; gap: 4px; align-items: center;">
+        ${modeBadge}
+        ${v.style_preset ? `<span class="preset-tag">${escapeHtml(v.style_preset.replace('_', ' '))}</span>` : ''}
+      </div>
+    `;
 
     return `
       <div class="video-card">
         <input type="checkbox" class="video-select-checkbox" ${checked} onclick="event.stopPropagation(); toggleLibrarySelect('${v.id}')"
                style="position: absolute; top: 10px; left: 10px; z-index: 2;">
-        ${presetLabel}
+        ${topBadges}
         <div onclick="openVideoModal('${v.id}')">
           <div class="video-thumb" style="position: relative;">
             ${posterUrl ? `<img src="${posterUrl}" alt="Preview" onerror="this.style.display='none'">` : ''}
@@ -1624,6 +1631,8 @@ async function openVideoModal(id) {
 
     const cand = v.candidate || {};
     const rev = v.review_status || 'unreviewed';
+    const presMode = v.presentation_mode || 'card';
+    const footageFit = v.footage_fit || 'auto';
 
     // Build Licensing technical evidence badge
     const lic = (cand.licence || cand.license || '').toLowerCase();
@@ -1713,6 +1722,16 @@ async function openVideoModal(id) {
         <!-- Left Column: Media Preview & Artifact Health -->
         <div>
           ${previewHtml}
+          <div id="preview-mode-banner" class="preview-mode-guidance ${presMode === 'footage_clean' ? 'clean' : 'card'}">
+            <div class="preview-mode-guidance-title">
+              ${presMode === 'footage_clean'
+                ? `<span style="font-size: 13px;">✦</span> Clean Footage (${footageFit.charAt(0).toUpperCase() + footageFit.slice(1)} Fit)`
+                : `<span style="font-size: 13px;">■</span> Card Presentation Mode`}
+            </div>
+            <div class="preview-mode-guidance-text">
+              ${getPreviewGuidanceText(presMode, footageFit)}
+            </div>
+          </div>
           <div style="margin-top: 14px; display: flex; flex-direction: column; gap: 6px;">
             ${videoHealthPill}
             ${posterHealthPill}
@@ -1766,6 +1785,25 @@ async function openVideoModal(id) {
           </div>
 
           <div class="form-group">
+            <label>Presentation Mode</label>
+            <select class="form-input" id="edit-presentation-mode" onchange="onPresentationModeChange(this.value)">
+              <option value="card" ${presMode === 'card' ? 'selected' : ''}>Card (Branded frame + headline)</option>
+              <option value="footage_clean" ${presMode === 'footage_clean' ? 'selected' : ''}>Clean Footage (Full-bleed 9:16, no overlays)</option>
+            </select>
+            <p class="form-help">Choose between classic branded card layout and modern clean vertical footage.</p>
+          </div>
+
+          <div class="form-group" id="footage-fit-group" style="display: ${presMode === 'footage_clean' ? 'block' : 'none'};">
+            <label>Footage Fit Mode</label>
+            <select class="form-input" id="edit-footage-fit" onchange="onFootageFitChange(this.value)">
+              <option value="auto" ${footageFit === 'auto' ? 'selected' : ''}>Auto (contain landscape, cover vertical)</option>
+              <option value="cover" ${footageFit === 'cover' ? 'selected' : ''}>Cover (fill 9:16, crop edges)</option>
+              <option value="contain" ${footageFit === 'contain' ? 'selected' : ''}>Contain (fit inside 9:16, letterbox padding)</option>
+            </select>
+            <p class="form-help">Controls how source video scales into the 9:16 canvas. Auto prevents landscape content from being cropped.</p>
+          </div>
+
+          <div class="form-group">
             <label>Card Headline</label>
             <input type="text" class="form-input" id="edit-headline" value="${escapeHtml(v.headline || '')}">
             <p class="form-help">Headline text rendered in bold monospace on top of the card.</p>
@@ -1816,7 +1854,7 @@ async function openVideoModal(id) {
           <!-- Action Buttons -->
           <div style="display: flex; gap: 12px; margin-top: 24px; flex-wrap: wrap;">
             <button class="btn btn-secondary" onclick="saveVideoEdits('${v.id}')"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="vertical-align:-2px;margin-right:4px;"><path d="M19 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11l5 5v11a2 2 0 0 1-2 2Z"></path><polyline points="17 21 17 13 7 13 7 21"></polyline><polyline points="7 3 7 8 15 8"></polyline></svg>Save Details</button>
-            <button class="btn btn-secondary" onclick="reRenderDraft('${v.id}')"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="vertical-align:-2px;margin-right:4px;"><polyline points="23 4 23 10 17 10"></polyline><polyline points="1 20 1 14 7 14"></polyline><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"></path></svg>Re-render Card</button>
+            <button id="btn-rerender-draft" class="btn btn-secondary" onclick="reRenderDraft('${v.id}')"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="vertical-align:-2px;margin-right:4px;"><polyline points="23 4 23 10 17 10"></polyline><polyline points="1 20 1 14 7 14"></polyline><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"></path></svg>${presMode === 'footage_clean' ? 'Re-render Clean Footage' : 'Re-render Card'}</button>
             ${v.status === 'uploaded' ? `
               <span class="badge" style="color: var(--success); padding: 10px 16px; font-weight: 600;">✓ Uploaded (<a href="https://youtube.com/shorts/${escapeHtml(v.youtube_id || '')}" target="_blank" rel="noopener noreferrer" style="color: inherit; text-decoration: underline;">View Short ↗</a>)</span>
             ` : v.status === 'uploading' ? `
@@ -1853,6 +1891,54 @@ function updateReviewPill(val) {
   pill.className = `badge-review-${val}`;
   pill.textContent = val === 'approved' ? '✓ Approved' : val === 'rejected' ? '✕ Rejected' : 'Unreviewed';
 }
+
+function getPreviewGuidanceText(mode, fit) {
+  if (mode === 'footage_clean') {
+    if (fit === 'cover') {
+      return 'Video scales and center-crops to fill the 9:16 frame completely. Landscape video will be cropped on the left and right edges.';
+    } else if (fit === 'contain') {
+      return 'Entire video fits inside the 9:16 frame with black letterbox bars. No content is cropped.';
+    } else {
+      return 'Adaptive fit: Portrait/vertical footage fills the 9:16 frame (cover), while landscape footage is letterboxed with black padding (contain) to prevent cropping.';
+    }
+  }
+  return 'Framed in a classic 9:16 card with bold headline, style borders, and avatar branding.';
+}
+
+function onPresentationModeChange(val) {
+  const fitGroup = document.getElementById('footage-fit-group');
+  const rerenderBtn = document.getElementById('btn-rerender-draft');
+  const fitVal = document.getElementById('edit-footage-fit')?.value || 'auto';
+  if (fitGroup) {
+    fitGroup.style.display = val === 'footage_clean' ? 'block' : 'none';
+  }
+  if (rerenderBtn) {
+    rerenderBtn.innerHTML = val === 'footage_clean'
+      ? `<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="vertical-align:-2px;margin-right:4px;"><polyline points="23 4 23 10 17 10"></polyline><polyline points="1 20 1 14 7 14"></polyline><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"></path></svg>Re-render Clean Footage`
+      : `<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="vertical-align:-2px;margin-right:4px;"><polyline points="23 4 23 10 17 10"></polyline><polyline points="1 20 1 14 7 14"></polyline><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"></path></svg>Re-render Card`;
+  }
+  updatePreviewGuidanceBanner(val, fitVal);
+}
+
+function onFootageFitChange(val) {
+  const modeVal = document.getElementById('edit-presentation-mode')?.value || 'footage_clean';
+  updatePreviewGuidanceBanner(modeVal, val);
+}
+
+function updatePreviewGuidanceBanner(mode, fit) {
+  const banner = document.getElementById('preview-mode-banner');
+  if (!banner) return;
+  banner.className = `preview-mode-guidance ${mode === 'footage_clean' ? 'clean' : 'card'}`;
+  const title = mode === 'footage_clean'
+    ? `<span style="font-size: 13px;">✦</span> Clean Footage (${fit.charAt(0).toUpperCase() + fit.slice(1)} Fit)`
+    : `<span style="font-size: 13px;">■</span> Card Presentation Mode`;
+  const text = getPreviewGuidanceText(mode, fit);
+  banner.innerHTML = `
+    <div class="preview-mode-guidance-title">${title}</div>
+    <div class="preview-mode-guidance-text">${text}</div>
+  `;
+}
+
 
 async function retryFromVideoModal(jobId) {
   try {
@@ -1891,12 +1977,26 @@ async function saveVideoEdits(id) {
   const privacy = privacyEl ? privacyEl.value : 'public';
   const reviewEl = document.getElementById('edit-review-status');
   const review_status = reviewEl ? reviewEl.value : 'unreviewed';
+  const presModeEl = document.getElementById('edit-presentation-mode');
+  const presentation_mode = presModeEl ? presModeEl.value : 'card';
+  const fitEl = document.getElementById('edit-footage-fit');
+  const footage_fit = fitEl ? fitEl.value : 'auto';
 
   try {
-    const res = await postJSON('/api/video', { id, title, headline, description, style_preset, privacy, review_status });
+    const res = await postJSON('/api/video', {
+      id,
+      title,
+      headline,
+      description,
+      style_preset,
+      privacy,
+      review_status,
+      presentation_mode,
+      footage_fit,
+    });
     const data = await res.json();
     if (!res.ok || data.error) throw new Error(data.error || 'Save failed');
-    showNotification('Video details and review status saved.', 'success');
+    showNotification('Video details and presentation mode saved.', 'success');
 
     // Update in-memory cache
     const item = libraryVideos.find(x => x.id === id);
@@ -1907,6 +2007,8 @@ async function saveVideoEdits(id) {
       item.style_preset = style_preset;
       item.privacy = privacy;
       item.review_status = review_status;
+      item.presentation_mode = presentation_mode;
+      item.footage_fit = footage_fit;
       renderLibraryGrid();
     }
   } catch (e) {
@@ -3244,5 +3346,6 @@ if (typeof module !== 'undefined' && module.exports) {
     pollStatus,
     getPollStatusInFlight: () => pollStatusInFlight,
     setPollStatusInFlight: (val) => { pollStatusInFlight = val; },
+    getPreviewGuidanceText,
   };
 }

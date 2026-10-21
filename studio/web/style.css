@@ -1021,3 +1021,67 @@ dialog::backdrop {
   background: rgba(245, 158, 11, 0.08);
   border-color: rgba(245, 158, 11, 0.25);
 }
+
+/* Stage 8 Milestone 8.2: Presentation Mode & Footage Fit UI */
+.badge-mode-clean {
+  font-size: 11px;
+  font-weight: 600;
+  padding: 2px 7px;
+  border-radius: 3px;
+  background: rgba(16, 185, 129, 0.15);
+  color: #34d399;
+  border: 1px solid rgba(16, 185, 129, 0.35);
+  letter-spacing: 0.2px;
+}
+
+.badge-mode-card {
+  font-size: 11px;
+  font-weight: 500;
+  padding: 2px 7px;
+  border-radius: 3px;
+  background: rgba(59, 130, 246, 0.12);
+  color: #60a5fa;
+  border: 1px solid rgba(59, 130, 246, 0.3);
+  letter-spacing: 0.2px;
+}
+
+.preview-mode-guidance {
+  margin-top: 12px;
+  padding: 10px 12px;
+  border-radius: var(--radius-sm);
+  background: rgba(255, 255, 255, 0.03);
+  border: 1px solid var(--border);
+  font-size: 11px;
+  line-height: 1.5;
+}
+
+.preview-mode-guidance.clean {
+  background: rgba(16, 185, 129, 0.06);
+  border-color: rgba(16, 185, 129, 0.25);
+}
+
+.preview-mode-guidance.card {
+  background: rgba(59, 130, 246, 0.06);
+  border-color: rgba(59, 130, 246, 0.25);
+}
+
+.preview-mode-guidance-title {
+  font-weight: 700;
+  font-size: 12px;
+  margin-bottom: 4px;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.preview-mode-guidance.clean .preview-mode-guidance-title {
+  color: #34d399;
+}
+
+.preview-mode-guidance.card .preview-mode-guidance-title {
+  color: #60a5fa;
+}
+
+.preview-mode-guidance-text {
+  color: var(--text-muted);
+}

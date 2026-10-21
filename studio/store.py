@@ -184,11 +184,13 @@ def draft(
     review_status: str = "unreviewed",
     privacy: str = "",
     presentation_mode: str = "",
+    footage_fit: str = "",
 ) -> dict[str, Any]:
     posting_cfg = config.get("posting", {}) if isinstance(config, dict) else {}
     eff_privacy = privacy or posting_cfg.get("privacy", "public")
     layout_cfg = config.get("layout", {}) if isinstance(config, dict) else {}
     eff_mode = presentation_mode or layout_cfg.get("presentation_mode") or (config.get("presentation_mode") if isinstance(config, dict) else "") or "card"
+    eff_fit = footage_fit or layout_cfg.get("footage_fit") or (config.get("footage_fit") if isinstance(config, dict) else "") or "auto"
     record = {
         "id": video_stem,
         "created_at": now(),
@@ -203,6 +205,7 @@ def draft(
         "candidate": candidate_data or {},
         "style_preset": style_preset,
         "presentation_mode": eff_mode,
+        "footage_fit": eff_fit,
         "privacy": eff_privacy,
         "youtube_id": "",
         "youtube_url": "",
@@ -224,6 +227,7 @@ def enrich_video_record(record: dict[str, Any]) -> dict[str, Any]:
     rec.setdefault("status", "ready")
     rec.setdefault("privacy", "public")
     rec.setdefault("presentation_mode", "card")
+    rec.setdefault("footage_fit", "auto")
 
     yt_id = rec.get("youtube_id", "").strip()
     if yt_id and not rec.get("youtube_url"):

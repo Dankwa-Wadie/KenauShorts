@@ -60,12 +60,24 @@ VALID_PRESENTATION_MODES = SUPPORTED_PRESENTATION_MODES | RESERVED_PRESENTATION_
 
 DEFAULT_PRESENTATION_MODE = PRESENTATION_MODE_CARD
 
+FOOTAGE_FIT_AUTO = "auto"
+FOOTAGE_FIT_COVER = "cover"
+FOOTAGE_FIT_CONTAIN = "contain"
+
+VALID_FOOTAGE_FIT = {
+    FOOTAGE_FIT_AUTO,
+    FOOTAGE_FIT_COVER,
+    FOOTAGE_FIT_CONTAIN,
+}
+
+DEFAULT_FOOTAGE_FIT = FOOTAGE_FIT_AUTO
+
 DEFAULT_LAYOUT: dict[str, Any] = {
     "canvas_width": 1080,
     "canvas_height": 1920,
     "background": "#000000",
     "presentation_mode": DEFAULT_PRESENTATION_MODE,
-    "footage_fit": "auto",
+    "footage_fit": DEFAULT_FOOTAGE_FIT,
     "side_margin": 72,
     "video_margin": None,
     "vertical_bias": 0.40,
@@ -210,6 +222,7 @@ class RenderResult:
     duration: float
     poster: Path | None = None
     presentation_mode: str = DEFAULT_PRESENTATION_MODE
+    footage_fit: str = DEFAULT_FOOTAGE_FIT
 
 def _text_size(draw: ImageDraw.ImageDraw, text: str, font) -> tuple[int, int]:
     box = draw.textbbox((0, 0), text, font=font)
@@ -546,9 +559,9 @@ def composite(
 
     if is_clean:
         music_input_idx = 1
-        footage_fit = str(layout.get("footage_fit", "auto")).strip().lower()
-        if footage_fit not in ("auto", "cover", "contain"):
-            footage_fit = "auto"
+        footage_fit = str(layout.get("footage_fit", DEFAULT_FOOTAGE_FIT)).strip().lower()
+        if footage_fit not in VALID_FOOTAGE_FIT:
+            footage_fit = DEFAULT_FOOTAGE_FIT
 
         use_cover = False
         if footage_fit == "cover":
@@ -682,6 +695,7 @@ def render(
     music: Path | None = None,
     timeout: float = RENDER_TIMEOUT,
     presentation_mode: str | None = None,
+    footage_fit: str | None = None,
 ) -> RenderResult:
     cfg = config or {}
     layout = {**DEFAULT_LAYOUT, **cfg.get("layout", {})}
@@ -697,6 +711,14 @@ def render(
 
     if mode == PRESENTATION_MODE_FOOTAGE_CAPTION:
         raise NotImplementedError("Presentation mode 'footage_caption' is reserved for a future milestone.")
+
+    fit = footage_fit or layout.get("footage_fit") or cfg.get("footage_fit") or DEFAULT_FOOTAGE_FIT
+    if not isinstance(fit, str):
+        raise ValueError(f"Invalid footage_fit: expected string, got {type(fit).__name__}")
+    fit = fit.strip().lower()
+    if fit not in VALID_FOOTAGE_FIT:
+        raise ValueError(f"Invalid footage_fit: '{fit}'. Must be one of {sorted(VALID_FOOTAGE_FIT)}")
+    layout["footage_fit"] = fit
 
     if mode == PRESENTATION_MODE_FOOTAGE_CLEAN:
         W = int(layout.get("canvas_width", 1080))
@@ -722,6 +744,7 @@ def render(
             duration=dur,
             poster=poster,
             presentation_mode=mode,
+            footage_fit=fit,
         )
 
     # Card mode
@@ -748,4 +771,5 @@ def render(
         duration=dur,
         poster=poster,
         presentation_mode=mode,
+        footage_fit=fit,
     )
