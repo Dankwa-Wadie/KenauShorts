@@ -12,6 +12,14 @@ what's actually on `origin/main`.
 
 ## Current state (update this section each handoff)
 
+- **Stage 8 Closed with Documented Caveat (Milestones 8.1–8.5 Complete)**:
+  - **Status & Scope**: Stage 8 (Clean-Footage Rendering, Presentation Modes, Ingestion Propagation, Channel Defaults, and Re-render Integrity) is formally closed across Milestones 8.1–8.5. No Milestone 8.6 is approved or required by current evidence.
+  - **Verified Targeted Tests**: 160 tests across 7 targeted test suites (`test_milestone8_*.py`, `test_stage5_library.py`, `test_stage2_queue_cancel.py`, `test_server_lifecycle.py` + `test_alerts.py`, `test_operational_smoke.py` + `test_supervisor.py` + `test_frontend_integration.py`, `test_agent_discovery.py` + `test_pipeline_integration.py`, and `test_health_ui.js`) confirmed passing with exit code 0 at HEAD (`c31b367`).
+  - **Documented Test-Evidence Caveats**:
+    - The historical 413-test full-discovery result belongs to Milestone 8.1 at commit `76e48cb`; it is not evidence of a clean full-suite run at current HEAD (which contains ~452 discoverable tests).
+    - The queue-cancellation test (`tests/test_stage2_queue_cancel.py`) passes 11/11 in standalone runs, but its intermittent 3.0s timeout during monolithic Windows single-process test discovery (`unittest discover`) remains unconfirmed as resolved under cumulative process load.
+    - A full monolithic test-discovery pass at the current HEAD has not been verified.
+
 - **Stage 8 Milestone 8.5 Completed & Verified (Re-render Pipeline Integrity, Raw-Source Guards, and Library Presentation Filtering)**:
   - **Worker Presentation Settings Precedence (`studio/worker.py`)**:
     - Realigned background worker re-render configuration precedence:
