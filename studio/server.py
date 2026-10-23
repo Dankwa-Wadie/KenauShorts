@@ -1668,6 +1668,18 @@ def start_job(action: str, key: str = "", automatic: bool = False, extra: dict |
                 record["privacy"] = p_val
                 store.put("videos", key, record)
 
+    if action == "render":
+        if not key:
+            raise ValueError("A video ID is required for re-rendering.")
+        record = store.get("videos", key)
+        if not record:
+            raise ValueError(f"Video '{key}' not found.")
+        enriched = store.enrich_video_record(record)
+        if not enriched.get("raw_exists"):
+            raise ValueError(
+                f"Cannot re-render video '{key}': original raw source video not found on disk."
+            )
+
     python = sys.executable
     if action in ("preview", "run"):
         command = [python, "-u", "-m", "core.agent"]

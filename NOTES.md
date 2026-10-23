@@ -12,6 +12,49 @@ what's actually on `origin/main`.
 
 ## Current state (update this section each handoff)
 
+- **Stage 8 Milestone 8.5 Completed & Verified (Re-render Pipeline Integrity, Raw-Source Guards, and Library Presentation Filtering)**:
+  - **Worker Presentation Settings Precedence (`studio/worker.py`)**:
+    - Realigned background worker re-render configuration precedence:
+      `record field` > `config["layout"][field]` > `config[field]` > `render_config["layout"][field]` > `render_config[field]` > Default (`"card"` / `"auto"`).
+    - Applied consistently to both `presentation_mode` and `footage_fit`.
+    - Eliminates the silent bug where presets with hardcoded `"presentation_mode": "card"` in layout overrode the channel-wide default (`config["layout"]["presentation_mode"] = "footage_clean"`) for legacy/unmigrated records.
+    - Proved that explicit settings on the record continue to override channel defaults.
+  - **Fail-Closed Raw Source Verification (`studio/worker.py`)**:
+    - Replaced silent fallback to `record["video"]` with strict fail-closed validation: checks `work/{key}_raw.mp4`, edit lineage `work/{orig_key}_raw.mp4`, and `record.get("raw_video")` (relative or absolute).
+    - If no valid raw source exists on disk, raises descriptive `ValueError("Cannot re-render video '{key}': original raw source video not found on disk. Re-rendering from an already-composited output is disabled to prevent video corruption.")`.
+    - Strictly prevents feeding already-composited 9:16 card outputs into the renderer, eliminating corrupted center-cropped avatar/headline artifacts and nested card compounding.
+    - Preserves worker exception handling: marks video `status="render_failed"` with error details and emits failure summary.
+  - **Server Preflight Re-render Validation (`studio/server.py`)**:
+    - Added preflight checks in `start_job()` for `action == "render"` before spawning subprocesses or inserting job records into SQLite:
+      - Validates video ID is non-empty.
+      - Confirms video record exists in SQLite.
+      - Utilizes repository's established `store.enrich_video_record(record)["raw_exists"]` check to confirm original raw source file exists on disk.
+      - Rejects invalid requests with HTTP 400 Bad Request (`ValueError`).
+      - Strictly prevents creating orphaned jobs or falsely reporting successful scheduling.
+  - **Library Presentation Mode Filtering & Modal UI Guard (`studio/web/app.js`)**:
+    - Added Presentation Mode filter dropdown (`#library-filter-mode`) to Library filter bar:
+      - `All Modes` (`all`)
+      - `Clean Footage` (`footage_clean`)
+      - `Card Mode` (`card`)
+    - Added `libraryFilterMode` state variable, change listener, and integrated into `resetLibraryFilters()`.
+    - Integrated seamlessly with existing status, review, source, style preset, and media health filters.
+    - In `renderLibraryGrid()`, checks `matchesLibraryMode(v, libraryFilterMode)` where legacy records without `presentation_mode` evaluate to `"card"`.
+    - In draft review modal (`openVideoModal`), if `v.raw_exists === false`, disables `#btn-rerender-draft` with `disabled style="opacity: 0.5; cursor: not-allowed;"` and tooltip `"Cannot re-render: Original raw source video is missing from disk"`, with defensive guard in `reRenderDraft()` to prevent issuing requests.
+    - Exported `matchesLibraryMode`, `getLibraryFilterMode`, `setLibraryFilterMode`, and `resetLibraryFilters` for automated Node.js contract testing.
+  - **Deterministic Test Suites & Verification Evidence**:
+    - Focused Milestone 8.5 suite (`tests/test_milestone8_5.py`): 13/13 passed (1.95s).
+    - Combined Stage 8 regression suite (`test_milestone8_1.py`, `test_milestone8_2.py`, `test_milestone8_3.py`, `test_milestone8_4.py`, `test_milestone8_5.py`): 47/47 passed (14.53s).
+    - Stage 5 Library suite (`tests/test_stage5_library.py`): 15/15 passed (1.10s) with verified raw source fixture for queue test.
+    - Process queue and cancellation suite (`tests/test_stage2_queue_cancel.py`): 11/11 passed (6.82s).
+    - Server lifecycle and alert engine suites (`test_server_lifecycle.py`, `test_alerts.py`): 27/27 passed (4.81s).
+    - Operational smoke, supervisor daemon, and frontend integration suites (`test_operational_smoke.py`, `test_supervisor.py`, `test_frontend_integration.py`): 26/26 passed (7.87s).
+    - Existing discovery and pipeline integration suites (`test_agent_discovery.py`, `test_pipeline_integration.py`): 21/21 passed (0.35s).
+    - Node.js UI health tests (`tests/test_health_ui.js`): 13/13 passed.
+    - Bytecode compilation: `python -m compileall core studio scripts tests` clean (0 errors).
+    - Formatting check: `git diff --check` clean (0 errors).
+    - Protected invariants: `studio-settings.json` completely untouched (`"interval_hours": 3`), `studio/supervisor.py` untouched (0 diff against HEAD), `core/agent.py` untouched (0 diff against HEAD).
+    - Live YouTube requests/uploads: 0 calls made.
+
 - **Stage 8 Milestone 8.4 Completed & Verified (Channel-Wide Presentation Defaults and Settings Persistence)**:
   - **Settings Whitelist & Validation Governance (`studio/server.py`)**:
     - Added `presentation_mode` and `footage_fit` recognition and validation to `validate_settings_config()` under `layout`.

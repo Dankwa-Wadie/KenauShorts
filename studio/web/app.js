@@ -1285,6 +1285,7 @@ let libraryFilterReview = 'all';
 let libraryFilterSource = 'all';
 let libraryFilterPreset = 'all';
 let libraryFilterHealth = 'all';
+let libraryFilterMode = 'all';
 let librarySort = 'newest';
 let librarySelected = new Set();
 
@@ -1318,6 +1319,11 @@ async function loadLibrary(container) {
             <option value="uploaded">Uploaded</option>
             <option value="failed">Failed</option>
             <option value="rendering">Rendering</option>
+          </select>
+          <select class="form-input" id="library-filter-mode" style="width: auto; min-width: 140px;">
+            <option value="all">All Modes</option>
+            <option value="footage_clean">Clean Footage</option>
+            <option value="card">Card Mode</option>
           </select>
           <select class="form-input" id="library-filter-review" style="width: auto; min-width: 140px;">
             <option value="all">All Reviews</option>
@@ -1377,6 +1383,15 @@ async function loadLibrary(container) {
       renderLibraryGrid();
     });
 
+    const modeSel = document.getElementById('library-filter-mode');
+    if (modeSel) {
+      modeSel.value = libraryFilterMode;
+      modeSel.addEventListener('change', (e) => {
+        libraryFilterMode = e.target.value;
+        renderLibraryGrid();
+      });
+    }
+
     const reviewSel = document.getElementById('library-filter-review');
     reviewSel.value = libraryFilterReview;
     reviewSel.addEventListener('change', (e) => {
@@ -1421,6 +1436,7 @@ async function loadLibrary(container) {
 function resetLibraryFilters() {
   librarySearch = '';
   libraryFilterStatus = 'all';
+  libraryFilterMode = 'all';
   libraryFilterReview = 'all';
   libraryFilterSource = 'all';
   libraryFilterPreset = 'all';
@@ -1431,6 +1447,8 @@ function resetLibraryFilters() {
   if (sInput) sInput.value = '';
   const fs = document.getElementById('library-filter-status');
   if (fs) fs.value = 'all';
+  const fm = document.getElementById('library-filter-mode');
+  if (fm) fm.value = 'all';
   const fr = document.getElementById('library-filter-review');
   if (fr) fr.value = 'all';
   const fsrc = document.getElementById('library-filter-source');
@@ -1476,6 +1494,11 @@ function renderLibraryGrid() {
       } else {
         if (v.status !== libraryFilterStatus) return false;
       }
+    }
+
+    // 2b. Presentation mode filter
+    if (!matchesLibraryMode(v, libraryFilterMode)) {
+      return false;
     }
 
     // 3. Editorial review status filter
@@ -1876,7 +1899,11 @@ async function openVideoModal(id) {
           <!-- Action Buttons -->
           <div style="display: flex; gap: 12px; margin-top: 24px; flex-wrap: wrap;">
             <button class="btn btn-secondary" onclick="saveVideoEdits('${v.id}')"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="vertical-align:-2px;margin-right:4px;"><path d="M19 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11l5 5v11a2 2 0 0 1-2 2Z"></path><polyline points="17 21 17 13 7 13 7 21"></polyline><polyline points="7 3 7 8 15 8"></polyline></svg>Save Details</button>
-            <button id="btn-rerender-draft" class="btn btn-secondary" onclick="reRenderDraft('${v.id}')"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="vertical-align:-2px;margin-right:4px;"><polyline points="23 4 23 10 17 10"></polyline><polyline points="1 20 1 14 7 14"></polyline><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"></path></svg>${presMode === 'footage_clean' ? 'Re-render Clean Footage' : 'Re-render Card'}</button>
+            ${v.raw_exists === false ? `
+              <button id="btn-rerender-draft" class="btn btn-secondary" disabled style="opacity: 0.5; cursor: not-allowed;" title="Cannot re-render: Original raw source video is missing from disk"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="vertical-align:-2px;margin-right:4px;"><polyline points="23 4 23 10 17 10"></polyline><polyline points="1 20 1 14 7 14"></polyline><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"></path></svg>${presMode === 'footage_clean' ? 'Re-render Clean Footage' : 'Re-render Card'}</button>
+            ` : `
+              <button id="btn-rerender-draft" class="btn btn-secondary" onclick="reRenderDraft('${v.id}')"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="vertical-align:-2px;margin-right:4px;"><polyline points="23 4 23 10 17 10"></polyline><polyline points="1 20 1 14 7 14"></polyline><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"></path></svg>${presMode === 'footage_clean' ? 'Re-render Clean Footage' : 'Re-render Card'}</button>
+            `}
             ${v.status === 'uploaded' ? `
               <span class="badge" style="color: var(--success); padding: 10px 16px; font-weight: 600;">✓ Uploaded (<a href="https://youtube.com/shorts/${escapeHtml(v.youtube_id || '')}" target="_blank" rel="noopener noreferrer" style="color: inherit; text-decoration: underline;">View Short ↗</a>)</span>
             ` : v.status === 'uploading' ? `
@@ -2039,6 +2066,11 @@ async function saveVideoEdits(id) {
 }
 
 async function reRenderDraft(id) {
+  const rerenderBtn = document.getElementById('btn-rerender-draft');
+  if (rerenderBtn && rerenderBtn.disabled) {
+    showNotification('Cannot re-render: Original raw source video is missing from disk.', 'error');
+    return;
+  }
   await saveVideoEdits(id);
   try {
     const res = await postJSON('/api/job', { action: 'render', key: id });
@@ -3398,6 +3430,12 @@ function escapeHtml(str) {
   }[tag] || tag));
 }
 
+function matchesLibraryMode(v, filterMode) {
+  if (!filterMode || filterMode === 'all') return true;
+  const mode = v?.presentation_mode || 'card';
+  return mode === filterMode;
+}
+
 if (typeof module !== 'undefined' && module.exports) {
   module.exports = {
     evaluateHealthState,
@@ -3409,5 +3447,9 @@ if (typeof module !== 'undefined' && module.exports) {
     getPreviewGuidanceText,
     onManualPresentationModeChange,
     onStylePresentationModeChange,
+    getLibraryFilterMode: () => libraryFilterMode,
+    setLibraryFilterMode: (val) => { libraryFilterMode = val; },
+    resetLibraryFilters,
+    matchesLibraryMode,
   };
 }

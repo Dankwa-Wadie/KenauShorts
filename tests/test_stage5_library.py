@@ -406,11 +406,15 @@ class Stage5LibraryTests(unittest.TestCase):
     def test_review_status_not_reset_when_job_merely_queued(self):
         """Verify queueing a render job does not reset review_status before completion."""
         vid_id = "short_approved_render"
+        raw_clip = self.root / "work" / f"{vid_id}_raw.mp4"
+        raw_clip.write_bytes(b"dummy raw")
+
         store.put("videos", vid_id, {
             "id": vid_id,
             "status": "ready",
             "review_status": "approved",
             "title": "Approved Title",
+            "raw_video": str(raw_clip.relative_to(self.root)),
         })
 
         # Queue render job

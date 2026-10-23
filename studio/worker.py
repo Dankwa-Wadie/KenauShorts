@@ -221,7 +221,7 @@ def work(action: str, key: str) -> None:
                         config=render_config,
                     )
                 else:
-                    # Look for raw clip in work dir
+                    # Look for raw clip in work dir or record metadata
                     raw_candidate = store.ROOT / "work" / f"{key}_raw.mp4"
                     if raw_candidate.is_file():
                         raw_clip = raw_candidate
@@ -231,7 +231,23 @@ def work(action: str, key: str) -> None:
                         if orig_raw.is_file():
                             raw_clip = orig_raw
                         else:
-                            raw_clip = Path(record.get("raw_video", record["video"]))
+                            raw_video_field = record.get("raw_video")
+                            if raw_video_field:
+                                cand_path = Path(raw_video_field)
+                                if not cand_path.is_absolute():
+                                    cand_path = (store.ROOT / cand_path).resolve()
+                                if cand_path.is_file():
+                                    raw_clip = cand_path
+                                else:
+                                    raw_clip = None
+                            else:
+                                raw_clip = None
+
+                    if not raw_clip or not raw_clip.is_file():
+                        raise ValueError(
+                            f"Cannot re-render video '{key}': original raw source video not found on disk. "
+                            "Re-rendering from an already-composited output is disabled to prevent video corruption."
+                        )
 
                     if not preset:
                         agent.emit_progress("Analyzing source aspect ratio")
@@ -258,12 +274,16 @@ def work(action: str, key: str) -> None:
 
                     presentation_mode = (
                         record.get("presentation_mode")
+                        or config.get("layout", {}).get("presentation_mode")
+                        or config.get("presentation_mode")
                         or render_config.get("layout", {}).get("presentation_mode")
                         or render_config.get("presentation_mode")
                         or "card"
                     )
                     footage_fit = (
                         record.get("footage_fit")
+                        or config.get("layout", {}).get("footage_fit")
+                        or config.get("footage_fit")
                         or render_config.get("layout", {}).get("footage_fit")
                         or render_config.get("footage_fit")
                         or "auto"
