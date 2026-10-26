@@ -1866,6 +1866,33 @@ async function openVideoModal(id) {
             <p class="form-help">Border color and aspect ratio preset. Auto matches the source video's shape.</p>
           </div>
 
+          <details class="visual-effects-details" id="edit-visual-effects-section" style="margin-bottom: 16px; border: 1px solid var(--border); border-radius: var(--radius-sm); padding: 10px 14px; background: rgba(255,255,255,0.015); display: ${presMode === 'footage_clean' ? 'none' : 'block'};">
+            <summary style="font-weight: 600; font-size: 13px; cursor: pointer; color: var(--text-main); user-select: none;">
+              Visual Effects (Background & Shadow)
+            </summary>
+            <div style="margin-top: 12px; display: flex; flex-direction: column; gap: 12px;">
+              <div class="form-group" style="margin-bottom: 0;">
+                <label style="font-size: 12px;">Card Background Mode</label>
+                <select class="form-input" id="edit-card-bg-mode">
+                  <option value="" ${v.card_background_mode == null ? 'selected' : ''}>Default (Inherit channel setting)</option>
+                  <option value="solid" ${v.card_background_mode === 'solid' ? 'selected' : ''}>Solid Background</option>
+                  <option value="blurred_ambient" ${v.card_background_mode === 'blurred_ambient' ? 'selected' : ''}>Blurred Ambient Footage</option>
+                </select>
+                <p class="form-help" style="font-size: 11px;">Override channel background mode for this draft.</p>
+              </div>
+
+              <div class="form-group" style="margin-bottom: 0;">
+                <label style="font-size: 12px;">Video Window Shadow</label>
+                <select class="form-input" id="edit-card-shadow">
+                  <option value="" ${v.card_shadow == null ? 'selected' : ''}>Default (Inherit channel setting)</option>
+                  <option value="true" ${v.card_shadow === true ? 'selected' : ''}>Enabled (Soft shadow)</option>
+                  <option value="false" ${v.card_shadow === false ? 'selected' : ''}>Disabled (No shadow)</option>
+                </select>
+                <p class="form-help" style="font-size: 11px;">Override channel shadow setting. Explicitly choosing 'Disabled' turns off shadows even if enabled by channel default.</p>
+              </div>
+            </div>
+          </details>
+
           <div class="form-group">
             <label>Publishing Privacy</label>
             <select class="form-input" id="edit-privacy">
@@ -1961,6 +1988,10 @@ function onPresentationModeChange(val) {
   if (fitGroup) {
     fitGroup.style.display = val === 'footage_clean' ? 'block' : 'none';
   }
+  const visualEffects = document.getElementById('edit-visual-effects-section');
+  if (visualEffects) {
+    visualEffects.style.display = val === 'footage_clean' ? 'none' : 'block';
+  }
   if (rerenderBtn) {
     rerenderBtn.innerHTML = val === 'footage_clean'
       ? `<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="vertical-align:-2px;margin-right:4px;"><polyline points="23 4 23 10 17 10"></polyline><polyline points="1 20 1 14 7 14"></polyline><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"></path></svg>Re-render Clean Footage`
@@ -2031,6 +2062,16 @@ async function saveVideoEdits(id) {
   const fitEl = document.getElementById('edit-footage-fit');
   const footage_fit = fitEl ? fitEl.value : 'auto';
 
+  const bgModeEl = document.getElementById('edit-card-bg-mode');
+  const card_background_mode = bgModeEl && bgModeEl.value ? bgModeEl.value : null;
+
+  const shadowEl = document.getElementById('edit-card-shadow');
+  let card_shadow = null;
+  if (shadowEl) {
+    if (shadowEl.value === 'true') card_shadow = true;
+    else if (shadowEl.value === 'false') card_shadow = false;
+  }
+
   try {
     const res = await postJSON('/api/video', {
       id,
@@ -2042,6 +2083,8 @@ async function saveVideoEdits(id) {
       review_status,
       presentation_mode,
       footage_fit,
+      card_background_mode,
+      card_shadow,
     });
     const data = await res.json();
     if (!res.ok || data.error) throw new Error(data.error || 'Save failed');
@@ -2747,6 +2790,9 @@ async function loadStyle(container) {
     const layout = data.config.layout || {};
     const presMode = layout.presentation_mode || 'card';
     const footageFit = layout.footage_fit || 'auto';
+    const cardBgMode = layout.card_background_mode || 'solid';
+    const ambientDim = typeof layout.ambient_dim === 'number' ? layout.ambient_dim : 0.45;
+    const cardShadow = !!layout.card_shadow;
 
     container.innerHTML = `
       <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 24px;">
@@ -2801,15 +2847,46 @@ async function loadStyle(container) {
             <label>Headline Size (px)</label>
             <input type="number" class="form-input" id="style-headline-size" value="${layout.headline_size || 76}">
           </div>
+          <div class="form-group">
+            <label>Card Background Mode</label>
+            <select class="form-input" id="style-card-bg-mode" onchange="onStyleCardBgModeChange(this.value)">
+              <option value="solid" ${cardBgMode === 'solid' ? 'selected' : ''}>Solid Background</option>
+              <option value="blurred_ambient" ${cardBgMode === 'blurred_ambient' ? 'selected' : ''}>Blurred Ambient Footage</option>
+            </select>
+            <p class="form-help">Choose between classic solid background and full-frame blurred ambient footage background.</p>
+          </div>
+          <div class="form-group" id="style-ambient-dim-group" style="display: ${cardBgMode === 'blurred_ambient' ? 'block' : 'none'};">
+            <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 6px;">
+              <label style="margin-bottom: 0;">Ambient Dim</label>
+              <span id="style-ambient-dim-val" style="font-family: var(--font-mono); font-size: 13px; font-weight: 700; color: var(--accent);">${Number(ambientDim).toFixed(2)}</span>
+            </div>
+            <input type="range" class="form-range" id="style-ambient-dim" min="0.00" max="1.00" step="0.05" value="${Number(ambientDim).toFixed(2)}" oninput="document.getElementById('style-ambient-dim-val').textContent = parseFloat(this.value).toFixed(2)">
+            <p class="form-help">Dark scrim overlay over the ambient background (0.00 = clear, 1.00 = completely dark).</p>
+          </div>
+          <div class="form-group">
+            <label>Video Window Shadow</label>
+            <select class="form-input" id="style-card-shadow">
+              <option value="false" ${!cardShadow ? 'selected' : ''}>Disabled</option>
+              <option value="true" ${cardShadow ? 'selected' : ''}>Enabled (Soft drop shadow around video)</option>
+            </select>
+            <p class="form-help">Renders a soft Gaussian drop shadow beneath the video cutout for visual depth.</p>
+          </div>
           <button class="btn btn-primary" onclick="saveStyleSettings()" style="margin-top: 8px;">Save Style Settings</button>
 
-          <h3 style="font-size: 14px; margin: 20px 0 12px; color: var(--text-muted);">Live Preview</h3>
-          <div style="background: #000; border-radius: 12px; padding: 20px; display: flex; justify-content: center;">
-            <div id="style-preview-card" style="width: 260px; background: #15181f; overflow: hidden;">
-              <div style="padding: 16px;">
-                <div id="style-preview-headline" style="color: #fff; font-family: 'JetBrains Mono', monospace; font-weight: 700; line-height: 1.15;">
-                  SAMPLE HEADLINE TEXT GOES HERE
-                </div>
+          <h3 style="font-size: 14px; margin: 20px 0 4px; color: var(--text-muted);">Representative Preview</h3>
+          <p style="font-size: 11px; color: var(--text-muted); margin-bottom: 12px;">Representative layout mock only (does not reproduce source footage or exact FFmpeg rendering).</p>
+          <div id="style-preview-container" style="background: #000; border-radius: 12px; padding: 20px; display: flex; justify-content: center; position: relative; overflow: hidden;">
+            <div id="style-preview-ambient-backdrop" style="position: absolute; inset: 0; pointer-events: none; opacity: 0; transition: opacity 0.2s ease;"></div>
+            <div id="style-preview-card" style="width: 260px; background: #15181f; position: relative; z-index: 1; overflow: hidden; padding: 16px; border-radius: 10px;">
+              <div style="display: flex; align-items: center; gap: 8px; margin-bottom: 10px;">
+                <div style="width: 22px; height: 22px; border-radius: 50%; background: #333; display: flex; align-items: center; justify-content: center; font-size: 10px; color: #aaa;">★</div>
+                <div style="font-size: 11px; font-weight: 700; color: #fff;">${escapeHtml(acct.name || 'Channel')}</div>
+              </div>
+              <div id="style-preview-headline" style="color: #fff; font-family: 'JetBrains Mono', monospace; font-weight: 700; line-height: 1.15; margin-bottom: 12px;">
+                SAMPLE HEADLINE TEXT
+              </div>
+              <div id="style-preview-video-frame" style="width: 100%; aspect-ratio: 16/9; background: #222; display: flex; align-items: center; justify-content: center; color: var(--text-muted); font-size: 10px; font-family: var(--font-mono);">
+                [ Video Frame Cutout ]
               </div>
             </div>
           </div>
@@ -2823,34 +2900,87 @@ async function loadStyle(container) {
   }
 }
 
+function onStyleCardBgModeChange(val) {
+  const dimGroup = document.getElementById('style-ambient-dim-group');
+  if (dimGroup) {
+    dimGroup.style.display = val === 'blurred_ambient' ? 'block' : 'none';
+  }
+  updateStylePreview();
+}
+
+function updateStylePreview() {
+  const colorInput = document.getElementById('style-border-color');
+  const radiusInput = document.getElementById('style-radius');
+  const headlineInput = document.getElementById('style-headline-size');
+  const bgModeInput = document.getElementById('style-card-bg-mode');
+  const dimInput = document.getElementById('style-ambient-dim');
+  const shadowInput = document.getElementById('style-card-shadow');
+
+  const card = document.getElementById('style-preview-card');
+  const headline = document.getElementById('style-preview-headline');
+  const videoFrame = document.getElementById('style-preview-video-frame');
+  const ambientBackdrop = document.getElementById('style-preview-ambient-backdrop');
+  if (!card || !headline) return;
+
+  const borderColor = colorInput ? (colorInput.value || '#1D9BF0') : '#1D9BF0';
+  const radius = radiusInput ? (parseInt(radiusInput.value, 10) || 40) : 40;
+  const headlineSize = headlineInput ? (parseInt(headlineInput.value, 10) || 76) : 76;
+  const bgMode = bgModeInput ? bgModeInput.value : 'solid';
+  const dim = dimInput ? (parseFloat(dimInput.value) || 0.45) : 0.45;
+  const shadow = shadowInput ? shadowInput.value === 'true' : false;
+
+  const scale = 260 / 1080;
+  const scaledRadius = Math.round(radius * scale);
+  const scaledHeadline = Math.round(headlineSize * scale);
+
+  if (videoFrame) {
+    videoFrame.style.border = `2px solid ${borderColor}`;
+    videoFrame.style.borderRadius = `${scaledRadius}px`;
+    if (shadow) {
+      videoFrame.style.boxShadow = '0 6px 16px rgba(0, 0, 0, 0.85)';
+    } else {
+      videoFrame.style.boxShadow = 'none';
+    }
+  }
+
+  headline.style.fontSize = `${scaledHeadline}px`;
+
+  if (bgMode === 'blurred_ambient') {
+    card.style.background = 'rgba(21, 24, 31, 0.55)';
+    card.style.backdropFilter = 'blur(4px)';
+    if (ambientBackdrop) {
+      ambientBackdrop.style.opacity = '1';
+      const scrimAlpha = Math.min(Math.max(dim, 0.0), 1.0);
+      ambientBackdrop.style.background = `
+        radial-gradient(circle at 50% 40%, rgba(40, 70, 120, 0.85) 0%, rgba(15, 25, 45, 0.95) 100%),
+        linear-gradient(rgba(0, 0, 0, ${scrimAlpha}), rgba(0, 0, 0, ${scrimAlpha}))
+      `;
+    }
+  } else {
+    card.style.background = '#15181f';
+    card.style.backdropFilter = 'none';
+    if (ambientBackdrop) {
+      ambientBackdrop.style.opacity = '0';
+      ambientBackdrop.style.background = 'none';
+    }
+  }
+}
+
 function setupStylePreview() {
   const colorInput = document.getElementById('style-border-color');
   const radiusInput = document.getElementById('style-radius');
   const headlineInput = document.getElementById('style-headline-size');
+  const bgModeInput = document.getElementById('style-card-bg-mode');
+  const dimInput = document.getElementById('style-ambient-dim');
+  const shadowInput = document.getElementById('style-card-shadow');
 
-  function updatePreview() {
-    const card = document.getElementById('style-preview-card');
-    const headline = document.getElementById('style-preview-headline');
-    if (!card || !headline) return;
-
-    const borderColor = colorInput.value || '#1D9BF0';
-    const radius = parseInt(radiusInput.value, 10) || 40;
-    // Preview card is a fixed 260px wide mock, while real cards render at
-    // 1080px â€” scale the px values down proportionally so the preview
-    // actually looks like what will render, not just uses the raw numbers.
-    const scale = 260 / 1080;
-    const scaledRadius = Math.round(radius * scale);
-    const scaledHeadline = Math.round((parseInt(headlineInput.value, 10) || 76) * scale);
-
-    card.style.border = `3px solid ${borderColor}`;
-    card.style.borderRadius = `${scaledRadius}px`;
-    headline.style.fontSize = `${scaledHeadline}px`;
-  }
-
-  [colorInput, radiusInput, headlineInput].forEach(el => {
-    el.addEventListener('input', updatePreview);
+  [colorInput, radiusInput, headlineInput, bgModeInput, dimInput, shadowInput].forEach(el => {
+    if (el) {
+      el.addEventListener('input', updateStylePreview);
+      el.addEventListener('change', updateStylePreview);
+    }
   });
-  updatePreview();
+  updateStylePreview();
 }
 
 async function saveStyleSettings() {
@@ -2864,6 +2994,9 @@ async function saveStyleSettings() {
   const presentation_mode = presEl ? presEl.value : 'card';
   const fitEl = document.getElementById('style-footage-fit');
   const footage_fit = fitEl ? fitEl.value : 'auto';
+  const card_background_mode = document.getElementById('style-card-bg-mode')?.value || 'solid';
+  const ambient_dim = parseFloat(document.getElementById('style-ambient-dim')?.value) || 0.45;
+  const card_shadow = document.getElementById('style-card-shadow')?.value === 'true';
 
   try {
     const data = await fetch('/api/settings').then(r => r.json());
@@ -2876,6 +3009,9 @@ async function saveStyleSettings() {
       headline_size,
       presentation_mode,
       footage_fit,
+      card_background_mode,
+      ambient_dim,
+      card_shadow,
     };
 
     await postJSON('/api/settings', { config: cfg });
@@ -3446,7 +3582,11 @@ if (typeof module !== 'undefined' && module.exports) {
     setPollStatusInFlight: (val) => { pollStatusInFlight = val; },
     getPreviewGuidanceText,
     onManualPresentationModeChange,
+    onPresentationModeChange,
     onStylePresentationModeChange,
+    onStyleCardBgModeChange,
+    setupStylePreview,
+    updateStylePreview,
     getLibraryFilterMode: () => libraryFilterMode,
     setLibraryFilterMode: (val) => { libraryFilterMode = val; },
     resetLibraryFilters,

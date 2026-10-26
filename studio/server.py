@@ -38,7 +38,13 @@ if __name__ == "__main__" and __package__ is None:
     # the service tries to start.
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from core.render import RESERVED_PRESENTATION_MODES, SUPPORTED_PRESENTATION_MODES, VALID_FOOTAGE_FIT, VALID_PRESENTATION_MODES
+from core.render import (
+    RESERVED_PRESENTATION_MODES,
+    SUPPORTED_PRESENTATION_MODES,
+    VALID_CARD_BACKGROUND_MODES,
+    VALID_FOOTAGE_FIT,
+    VALID_PRESENTATION_MODES,
+)
 from core.style_presets import STYLE_PRESETS
 from studio import alerts, retention as studio_retention, supervisor
 from studio import settings as studio_settings
@@ -2239,6 +2245,44 @@ def validate_settings_config(patch: dict) -> dict:
         if fit not in VALID_FOOTAGE_FIT:
             raise ValueError(f"Invalid footage_fit: '{fit}'. Must be one of {sorted(VALID_FOOTAGE_FIT)}")
         out["footage_fit"] = fit
+    if "card_background_mode" in layout:
+        bg_mode = layout["card_background_mode"]
+        if not isinstance(bg_mode, str):
+            raise ValueError(f"Invalid card_background_mode: expected string, got {type(bg_mode).__name__}")
+        bg_mode = bg_mode.strip().lower()
+        if bg_mode not in VALID_CARD_BACKGROUND_MODES:
+            raise ValueError(f"Invalid card_background_mode: '{bg_mode}'. Must be one of {sorted(VALID_CARD_BACKGROUND_MODES)}")
+        out["card_background_mode"] = bg_mode
+    if "card_shadow" in layout:
+        s_val = layout["card_shadow"]
+        if not isinstance(s_val, bool):
+            raise ValueError(f"Invalid card_shadow: expected boolean, got {type(s_val).__name__}")
+        out["card_shadow"] = s_val
+    if "ambient_dim" in layout:
+        dim = layout["ambient_dim"]
+        if isinstance(dim, bool) or not isinstance(dim, (int, float)) or not 0.0 <= dim <= 1.0:
+            raise ValueError("Ambient dim must be a number between 0.0 and 1.0")
+        out["ambient_dim"] = float(dim)
+    if "ambient_blur" in layout:
+        blur = layout["ambient_blur"]
+        if not _is_int(blur) or not 1 <= blur <= 50:
+            raise ValueError("Ambient blur must be an integer between 1 and 50")
+        out["ambient_blur"] = blur
+    if "shadow_blur" in layout:
+        sblur = layout["shadow_blur"]
+        if not _is_int(sblur) or not 1 <= sblur <= 100:
+            raise ValueError("Shadow blur must be an integer between 1 and 100")
+        out["shadow_blur"] = sblur
+    if "shadow_opacity" in layout:
+        sopacity = layout["shadow_opacity"]
+        if isinstance(sopacity, bool) or not isinstance(sopacity, (int, float)) or not 0.0 <= sopacity <= 1.0:
+            raise ValueError("Shadow opacity must be a number between 0.0 and 1.0")
+        out["shadow_opacity"] = float(sopacity)
+    if "shadow_offset_y" in layout:
+        soff = layout["shadow_offset_y"]
+        if not _is_int(soff) or not -50 <= soff <= 50:
+            raise ValueError("Shadow offset Y must be an integer between -50 and 50")
+        out["shadow_offset_y"] = soff
     if out:
         cfg["layout"] = out
 
@@ -2810,6 +2854,49 @@ class StudioHandler(BaseHTTPRequestHandler):
                     record["footage_fit"] = fit_val
                     if isinstance(record.get("config"), dict):
                         record["config"].setdefault("layout", {})["footage_fit"] = fit_val
+                if "card_background_mode" in data:
+                    val = data["card_background_mode"]
+                    if val is None or val == "":
+                        record["card_background_mode"] = None
+                        if isinstance(record.get("config"), dict) and "layout" in record["config"]:
+                            record["config"]["layout"].pop("card_background_mode", None)
+                    elif isinstance(val, str):
+                        mode_val = val.strip().lower()
+                        if mode_val not in VALID_CARD_BACKGROUND_MODES:
+                            raise ValueError(f"Invalid card_background_mode: '{val}'. Must be one of {sorted(VALID_CARD_BACKGROUND_MODES)}")
+                        record["card_background_mode"] = mode_val
+                        if isinstance(record.get("config"), dict):
+                            record["config"].setdefault("layout", {})["card_background_mode"] = mode_val
+                    else:
+                        raise ValueError(f"Invalid card_background_mode: expected string or null, got {type(val).__name__}")
+                if "card_shadow" in data:
+                    val = data["card_shadow"]
+                    if val is None or val == "":
+                        record["card_shadow"] = None
+                        if isinstance(record.get("config"), dict) and "layout" in record["config"]:
+                            record["config"]["layout"].pop("card_shadow", None)
+                    elif isinstance(val, bool):
+                        record["card_shadow"] = val
+                        if isinstance(record.get("config"), dict):
+                            record["config"].setdefault("layout", {})["card_shadow"] = val
+                    elif isinstance(val, str):
+                        lowered = val.strip().lower()
+                        if lowered in ("true", "1", "yes", "on", "enable", "enabled"):
+                            record["card_shadow"] = True
+                            if isinstance(record.get("config"), dict):
+                                record["config"].setdefault("layout", {})["card_shadow"] = True
+                        elif lowered in ("false", "0", "no", "off", "disable", "disabled"):
+                            record["card_shadow"] = False
+                            if isinstance(record.get("config"), dict):
+                                record["config"].setdefault("layout", {})["card_shadow"] = False
+                        elif lowered in ("none", "default", "inherit"):
+                            record["card_shadow"] = None
+                            if isinstance(record.get("config"), dict) and "layout" in record["config"]:
+                                record["config"]["layout"].pop("card_shadow", None)
+                        else:
+                            raise ValueError(f"Invalid card_shadow: expected boolean, got '{val}'")
+                    else:
+                        raise ValueError(f"Invalid card_shadow: expected boolean or null, got {type(val).__name__}")
                 if "review_status" in data:
                     val = data["review_status"]
                     if not isinstance(val, str):

@@ -13,6 +13,11 @@ from pathlib import Path
 
 from core import agent, render, render_story
 from core.agent import UploadSessionExpiredError
+from core.render import (
+    DEFAULT_CARD_BACKGROUND_MODE,
+    DEFAULT_CARD_SHADOW,
+    VALID_CARD_BACKGROUND_MODES,
+)
 from core.state import State
 from core.style_presets import (
     apply_style_preset,
@@ -289,6 +294,86 @@ def work(action: str, key: str) -> None:
                         or "auto"
                     )
 
+                    # Visual setting resolution order:
+                    # 1. Explicit per-draft override on record
+                    # 2. Live channel-level setting (config["layout"])
+                    # 3. Legacy root configuration / style preset fallback
+                    # 4. Milestone 9.1 renderer default
+
+                    # Step 1: Explicit per-draft background mode override
+                    card_background_mode = None
+                    rec_bg = record.get("card_background_mode")
+                    if rec_bg is not None and str(rec_bg).strip():
+                        val = str(rec_bg).strip().lower()
+                        if val in VALID_CARD_BACKGROUND_MODES:
+                            card_background_mode = val
+
+                    # Step 2: Live channel-level layout setting
+                    if card_background_mode is None:
+                        cfg_bg = (config.get("layout") or {}).get("card_background_mode")
+                        if cfg_bg is not None and str(cfg_bg).strip():
+                            val = str(cfg_bg).strip().lower()
+                            if val in VALID_CARD_BACKGROUND_MODES:
+                                card_background_mode = val
+
+                    # Step 3: Legacy root configuration / style preset fallback
+                    if card_background_mode is None:
+                        cfg_root_bg = config.get("card_background_mode")
+                        if cfg_root_bg is not None and str(cfg_root_bg).strip():
+                            val = str(cfg_root_bg).strip().lower()
+                            if val in VALID_CARD_BACKGROUND_MODES:
+                                card_background_mode = val
+                        else:
+                            rcfg_bg = (render_config.get("layout") or {}).get("card_background_mode")
+                            if rcfg_bg is not None and str(rcfg_bg).strip():
+                                val = str(rcfg_bg).strip().lower()
+                                if val in VALID_CARD_BACKGROUND_MODES:
+                                    card_background_mode = val
+
+                    # Step 4: Milestone 9.1 renderer default
+                    if card_background_mode is None:
+                        card_background_mode = DEFAULT_CARD_BACKGROUND_MODE
+
+                    card_shadow = None
+                    def _parse_bool(v):
+                        if v is None or v == "":
+                            return None
+                        if isinstance(v, bool):
+                            return v
+                        if isinstance(v, str):
+                            low = v.strip().lower()
+                            if low in ("true", "1", "yes", "on", "enable", "enabled"):
+                                return True
+                            if low in ("false", "0", "no", "off", "disable", "disabled"):
+                                return False
+                        return None
+
+                    # Step 1: Explicit per-draft shadow override (preserves explicit False)
+                    if "card_shadow" in record and record["card_shadow"] is not None:
+                        parsed = _parse_bool(record["card_shadow"])
+                        if parsed is not None:
+                            card_shadow = parsed
+
+                    # Step 2: Live channel-level layout setting
+                    if card_shadow is None:
+                        parsed = _parse_bool((config.get("layout") or {}).get("card_shadow"))
+                        if parsed is not None:
+                            card_shadow = parsed
+
+                    # Step 3: Legacy root configuration / style preset fallback
+                    if card_shadow is None:
+                        parsed = _parse_bool(config.get("card_shadow"))
+                        if parsed is not None:
+                            card_shadow = parsed
+                        else:
+                            parsed = _parse_bool((render_config.get("layout") or {}).get("card_shadow"))
+                            if parsed is not None:
+                                card_shadow = parsed
+
+                    # Step 4: Milestone 9.1 renderer default
+                    if card_shadow is None:
+                        card_shadow = DEFAULT_CARD_SHADOW
+
                     if presentation_mode == "footage_clean":
                         agent.emit_progress("Rendering clean footage")
                     else:
@@ -302,6 +387,8 @@ def work(action: str, key: str) -> None:
                         poster=new_poster,
                         presentation_mode=presentation_mode,
                         footage_fit=footage_fit,
+                        card_background_mode=card_background_mode,
+                        card_shadow=card_shadow,
                     )
 
                 agent.emit_progress("Finalizing render")
@@ -314,6 +401,8 @@ def work(action: str, key: str) -> None:
                     style_preset=record.get("style_preset", ""),
                     presentation_mode=presentation_mode,
                     footage_fit=footage_fit,
+                    card_background_mode=record.get("card_background_mode"),
+                    card_shadow=record.get("card_shadow"),
                     error="",
                 )
                 store.put("videos", key, record)

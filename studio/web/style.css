@@ -1085,3 +1085,22 @@ dialog::backdrop {
 .preview-mode-guidance-text {
   color: var(--text-muted);
 }
+
+/* Visual Effects controls & slider styling */
+.form-range {
+  width: 100%;
+  height: 6px;
+  background: var(--surface-light);
+  border-radius: 3px;
+  outline: none;
+  cursor: pointer;
+  accent-color: var(--accent);
+}
+
+.visual-effects-details summary::-webkit-details-marker {
+  color: var(--text-muted);
+}
+
+.visual-effects-details[open] summary {
+  margin-bottom: 10px;
+}
