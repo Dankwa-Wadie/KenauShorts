@@ -28,7 +28,7 @@ from pathlib import Path
 from typing import Any
 
 try:
-    from PIL import Image, ImageDraw, ImageFont, ImageChops
+    from PIL import Image, ImageDraw, ImageFont, ImageChops, ImageFilter
 except ImportError:
     sys.exit("Pillow is required: pip install Pillow")
 
@@ -72,12 +72,35 @@ VALID_FOOTAGE_FIT = {
 
 DEFAULT_FOOTAGE_FIT = FOOTAGE_FIT_AUTO
 
+CARD_BACKGROUND_MODE_SOLID = "solid"
+CARD_BACKGROUND_MODE_BLURRED_AMBIENT = "blurred_ambient"
+
+VALID_CARD_BACKGROUND_MODES = {
+    CARD_BACKGROUND_MODE_SOLID,
+    CARD_BACKGROUND_MODE_BLURRED_AMBIENT,
+}
+
+DEFAULT_CARD_BACKGROUND_MODE = CARD_BACKGROUND_MODE_SOLID
+DEFAULT_AMBIENT_DIM = 0.45
+DEFAULT_AMBIENT_BLUR = 10
+DEFAULT_CARD_SHADOW = False
+DEFAULT_SHADOW_BLUR = 24
+DEFAULT_SHADOW_OPACITY = 0.40
+DEFAULT_SHADOW_OFFSET_Y = 8
+
 DEFAULT_LAYOUT: dict[str, Any] = {
     "canvas_width": 1080,
     "canvas_height": 1920,
     "background": "#000000",
     "presentation_mode": DEFAULT_PRESENTATION_MODE,
     "footage_fit": DEFAULT_FOOTAGE_FIT,
+    "card_background_mode": DEFAULT_CARD_BACKGROUND_MODE,
+    "ambient_dim": DEFAULT_AMBIENT_DIM,
+    "ambient_blur": DEFAULT_AMBIENT_BLUR,
+    "card_shadow": DEFAULT_CARD_SHADOW,
+    "shadow_blur": DEFAULT_SHADOW_BLUR,
+    "shadow_opacity": DEFAULT_SHADOW_OPACITY,
+    "shadow_offset_y": DEFAULT_SHADOW_OFFSET_Y,
     "side_margin": 72,
     "video_margin": None,
     "vertical_bias": 0.40,
@@ -223,6 +246,8 @@ class RenderResult:
     poster: Path | None = None
     presentation_mode: str = DEFAULT_PRESENTATION_MODE
     footage_fit: str = DEFAULT_FOOTAGE_FIT
+    card_background_mode: str = DEFAULT_CARD_BACKGROUND_MODE
+    card_shadow: bool = DEFAULT_CARD_SHADOW
 
 def _text_size(draw: ImageDraw.ImageDraw, text: str, font) -> tuple[int, int]:
     box = draw.textbbox((0, 0), text, font=font)
@@ -352,7 +377,17 @@ def build_overlay(
     margin = int(layout["side_margin"])
     content_w = W - margin * 2
 
-    canvas = Image.new("RGBA", (W, H), layout["background"])
+    raw_bg_mode = layout.get("card_background_mode", DEFAULT_CARD_BACKGROUND_MODE)
+    if not isinstance(raw_bg_mode, str):
+        raise ValueError(f"Invalid card_background_mode: expected string, got {type(raw_bg_mode).__name__}")
+    card_bg_mode = raw_bg_mode.strip().lower()
+    if card_bg_mode not in VALID_CARD_BACKGROUND_MODES:
+        raise ValueError(f"Invalid card_background_mode: '{raw_bg_mode}'. Must be one of {sorted(VALID_CARD_BACKGROUND_MODES)}")
+
+    if card_bg_mode == CARD_BACKGROUND_MODE_BLURRED_AMBIENT:
+        canvas = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+    else:
+        canvas = Image.new("RGBA", (W, H), layout["background"])
     draw = ImageDraw.Draw(canvas)
 
     mono = load_font(MONO_CANDIDATES, int(layout["headline_size"]), layout.get("mono_font", ""), role="headline")
@@ -422,6 +457,50 @@ def build_overlay(
     frame_x = vid_margin
     frame_y = top + header_h + int(layout["header_to_headline"]) + headline_h + int(layout["headline_to_video"])
     radius = int(layout["corner_radius"])
+
+    raw_shadow = layout.get("card_shadow", DEFAULT_CARD_SHADOW)
+    if isinstance(raw_shadow, str):
+        lowered = raw_shadow.strip().lower()
+        if lowered in ("true", "1", "yes", "on", "enable", "enabled"):
+            use_shadow = True
+        elif lowered in ("false", "0", "no", "off", "disable", "disabled", "none", ""):
+            use_shadow = False
+        else:
+            raise ValueError(f"Invalid card_shadow: expected boolean, got '{raw_shadow}'")
+    elif isinstance(raw_shadow, bool):
+        use_shadow = raw_shadow
+    elif raw_shadow is None:
+        use_shadow = False
+    else:
+        raise ValueError(f"Invalid card_shadow: expected boolean, got {type(raw_shadow).__name__}")
+
+    if use_shadow:
+        raw_sblur = layout.get("shadow_blur", DEFAULT_SHADOW_BLUR)
+        if not isinstance(raw_sblur, int) or isinstance(raw_sblur, bool) or not (1 <= raw_sblur <= 100):
+            raise ValueError(f"Invalid shadow_blur: expected integer between 1 and 100, got {raw_sblur}")
+        shadow_blur = int(raw_sblur)
+
+        raw_sopacity = layout.get("shadow_opacity", DEFAULT_SHADOW_OPACITY)
+        if not isinstance(raw_sopacity, (int, float)) or isinstance(raw_sopacity, bool) or not (0.0 <= raw_sopacity <= 1.0):
+            raise ValueError(f"Invalid shadow_opacity: expected float between 0.0 and 1.0, got {raw_sopacity}")
+        shadow_opacity = float(raw_sopacity)
+
+        raw_soffset_y = layout.get("shadow_offset_y", DEFAULT_SHADOW_OFFSET_Y)
+        if not isinstance(raw_soffset_y, int) or isinstance(raw_soffset_y, bool) or not (-50 <= raw_soffset_y <= 50):
+            raise ValueError(f"Invalid shadow_offset_y: expected integer between -50 and 50, got {raw_soffset_y}")
+        shadow_offset_y = int(raw_soffset_y)
+
+        shadow_mask = Image.new("L", (W, H), 0)
+        draw_m = ImageDraw.Draw(shadow_mask)
+        draw_m.rounded_rectangle(
+            [frame_x, frame_y + shadow_offset_y, frame_x + frame_w - 1, frame_y + frame_h - 1 + shadow_offset_y],
+            radius=radius,
+            fill=int(255 * shadow_opacity),
+        )
+        shadow_mask = shadow_mask.filter(ImageFilter.GaussianBlur(radius=shadow_blur))
+        shadow_layer = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+        shadow_layer.paste((0, 0, 0, 255), (0, 0), shadow_mask)
+        canvas.alpha_composite(shadow_layer)
 
     hole = rounded_mask(frame_w, frame_h, radius)
     canvas.paste((0, 0, 0, 0), (frame_x, frame_y), hole)
@@ -605,13 +684,42 @@ def composite(
         ay = min(max(float(layout.get("background_anchor_y", 0.5)), 0.0), 1.0)
         sw, sh = int(w * zoom), int(h * zoom)
 
-        fchain = (
-            f"[0:v]scale={sw}:{sh}:force_original_aspect_ratio=increase,"
-            f"crop={w}:{h}:(in_w-out_w)*{ax}:(in_h-out_h)*{ay},"
-            f"pad={W}:{H}:{x}:{y}:color={layout['background']},"
-            f"setsar=1[stage];"
-            f"[stage][1:v]overlay=0:0:format=auto,format=yuv420p[v]"
-        )
+        raw_bg_mode = layout.get("card_background_mode", DEFAULT_CARD_BACKGROUND_MODE)
+        if not isinstance(raw_bg_mode, str):
+            raise ValueError(f"Invalid card_background_mode: expected string, got {type(raw_bg_mode).__name__}")
+        card_bg_mode = raw_bg_mode.strip().lower()
+        if card_bg_mode not in VALID_CARD_BACKGROUND_MODES:
+            raise ValueError(f"Invalid card_background_mode: '{raw_bg_mode}'. Must be one of {sorted(VALID_CARD_BACKGROUND_MODES)}")
+
+        if card_bg_mode == CARD_BACKGROUND_MODE_BLURRED_AMBIENT:
+            raw_dim = layout.get("ambient_dim", DEFAULT_AMBIENT_DIM)
+            if not isinstance(raw_dim, (int, float)) or isinstance(raw_dim, bool) or not (0.0 <= raw_dim <= 1.0):
+                raise ValueError(f"Invalid ambient_dim: expected float between 0.0 and 1.0, got {raw_dim}")
+            ambient_dim = float(raw_dim)
+
+            raw_blur = layout.get("ambient_blur", DEFAULT_AMBIENT_BLUR)
+            if not isinstance(raw_blur, int) or isinstance(raw_blur, bool) or not (1 <= raw_blur <= 50):
+                raise ValueError(f"Invalid ambient_blur: expected integer between 1 and 50, got {raw_blur}")
+            ambient_blur = int(raw_blur)
+
+            dim_filter = f",drawbox=x=0:y=0:w={W}:h={H}:color=black@{ambient_dim:.2f}:t=fill" if ambient_dim > 0 else ""
+            fchain = (
+                f"[0:v]split=2[bg_src][fg_src];"
+                f"[bg_src]scale=270:480:force_original_aspect_ratio=increase,crop=270:480,"
+                f"boxblur={ambient_blur}:3,scale={W}:{H}:flags=bilinear{dim_filter}[bg];"
+                f"[fg_src]scale={sw}:{sh}:force_original_aspect_ratio=increase,"
+                f"crop={w}:{h}:(in_w-out_w)*{ax}:(in_h-out_h)*{ay},setsar=1[fg];"
+                f"[bg][fg]overlay={x}:{y}:format=auto[stage];"
+                f"[stage][1:v]overlay=0:0:format=auto,format=yuv420p[v]"
+            )
+        else:
+            fchain = (
+                f"[0:v]scale={sw}:{sh}:force_original_aspect_ratio=increase,"
+                f"crop={w}:{h}:(in_w-out_w)*{ax}:(in_h-out_h)*{ay},"
+                f"pad={W}:{H}:{x}:{y}:color={layout['background']},"
+                f"setsar=1[stage];"
+                f"[stage][1:v]overlay=0:0:format=auto,format=yuv420p[v]"
+            )
 
     # Music is input when present
     if music:
@@ -696,6 +804,9 @@ def render(
     timeout: float = RENDER_TIMEOUT,
     presentation_mode: str | None = None,
     footage_fit: str | None = None,
+    card_background_mode: str | None = None,
+    card_shadow: bool | None = None,
+    ambient_dim: float | None = None,
 ) -> RenderResult:
     cfg = config or {}
     layout = {**DEFAULT_LAYOUT, **cfg.get("layout", {})}
@@ -719,6 +830,34 @@ def render(
     if fit not in VALID_FOOTAGE_FIT:
         raise ValueError(f"Invalid footage_fit: '{fit}'. Must be one of {sorted(VALID_FOOTAGE_FIT)}")
     layout["footage_fit"] = fit
+
+    if card_background_mode is not None:
+        if not isinstance(card_background_mode, str):
+            raise ValueError(f"Invalid card_background_mode: expected string, got {type(card_background_mode).__name__}")
+        mode_val = card_background_mode.strip().lower()
+        if mode_val not in VALID_CARD_BACKGROUND_MODES:
+            raise ValueError(f"Invalid card_background_mode: '{card_background_mode}'. Must be one of {sorted(VALID_CARD_BACKGROUND_MODES)}")
+        layout["card_background_mode"] = mode_val
+
+    if card_shadow is not None:
+        if isinstance(card_shadow, str):
+            lowered = card_shadow.strip().lower()
+            if lowered in ("true", "1", "yes", "on", "enable", "enabled"):
+                shadow_val = True
+            elif lowered in ("false", "0", "no", "off", "disable", "disabled", "none", ""):
+                shadow_val = False
+            else:
+                raise ValueError(f"Invalid card_shadow: expected boolean, got '{card_shadow}'")
+        elif isinstance(card_shadow, bool):
+            shadow_val = card_shadow
+        else:
+            raise ValueError(f"Invalid card_shadow: expected boolean, got {type(card_shadow).__name__}")
+        layout["card_shadow"] = shadow_val
+
+    if ambient_dim is not None:
+        if not isinstance(ambient_dim, (int, float)) or isinstance(ambient_dim, bool) or not (0.0 <= ambient_dim <= 1.0):
+            raise ValueError(f"Invalid ambient_dim: expected float between 0.0 and 1.0, got {ambient_dim}")
+        layout["ambient_dim"] = float(ambient_dim)
 
     if mode == PRESENTATION_MODE_FOOTAGE_CLEAN:
         W = int(layout.get("canvas_width", 1080))
@@ -745,6 +884,8 @@ def render(
             poster=poster,
             presentation_mode=mode,
             footage_fit=fit,
+            card_background_mode=layout.get("card_background_mode", DEFAULT_CARD_BACKGROUND_MODE),
+            card_shadow=bool(layout.get("card_shadow", DEFAULT_CARD_SHADOW)),
         )
 
     # Card mode
@@ -772,4 +913,6 @@ def render(
         poster=poster,
         presentation_mode=mode,
         footage_fit=fit,
+        card_background_mode=layout.get("card_background_mode", DEFAULT_CARD_BACKGROUND_MODE),
+        card_shadow=bool(layout.get("card_shadow", DEFAULT_CARD_SHADOW)),
     )
