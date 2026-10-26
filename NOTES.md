@@ -12,6 +12,34 @@ what's actually on `origin/main`.
 
 ## Current state (update this section each handoff)
 
+- **Stage 9 Milestones 9.1 & 9.2 Completed & Published (Card Visual Effects Foundation, Settings Governance, and Studio Controls)**:
+  - **Current Handoff Baseline**: Local `main` and `origin/main` synchronized at commit `b9665d223372e445fae25d907407feaeb747826e` (`feat(studio): expose card visual effects controls`).
+  - **Milestone 9.1 Completed & Published (`b0b0a3f37d5c6a5b32794d3d7d68896824a4c182`)**:
+    - **Ambient Background Engine (`core/render.py`)**: Added `card_background_mode` setting supporting `"solid"` (default, classic solid card background) and `"blurred_ambient"` (full-bleed blurred ambient background derived from source footage).
+    - **Optimized FFmpeg Filterchain**: Implemented downscale-before-blur pipeline (`scale=270:480` -> `boxblur=10:3` -> `scale=1080:1920` -> configurable dark scrim overlay via `ambient_dim`, default 0.45, blur radius 1–50 via `ambient_blur`).
+    - **Video Window Drop Shadow (`core/render.py`)**: Added `card_shadow` support rendering a soft Gaussian drop shadow behind the video cutout in Pillow overlay (`shadow_blur=24`, `shadow_opacity=0.40`, `shadow_offset_y=8`).
+    - **Dataclass & Invariants**: Extended `RenderResult` dataclass with `card_background_mode` and `card_shadow` fields without breaking positional construction or downstream serialization. Preserved `footage_clean` presentation mode and source aspect ratio cropping invariants.
+    - **Reported Benchmark**: Solid card ~1.15s, Blurred Ambient + Shadow ~2.50s.
+  - **Milestone 9.2 Completed & Published (`b9665d223372e445fae25d907407feaeb747826e`)**:
+    - **Settings Whitelist & Validation Governance (`studio/server.py`)**: Updated `validate_settings_config()` to recognize and strictly validate `card_background_mode`, `ambient_dim`, `ambient_blur`, `card_shadow`, `shadow_blur`, `shadow_opacity`, and `shadow_offset_y` under `layout`. Enforces strict boolean type for `card_shadow` (rejecting strings and non-booleans in config). Eliminates silent stripping of visual settings during partial settings updates.
+    - **Channel & Style Studio Controls (`studio/web/app.js`, `studio/web/style.css`, `config.example.json`)**: Added Card Background Mode selector, Ambient Dim range slider (with live numeric readout), Video Window Shadow toggle, and representative CSS preview (`#style-preview-container`) in `loadStyle()`.
+    - **Draft Review Modal & Per-Draft Overrides (`studio/web/app.js`, `studio/server.py`)**: Added visual effects accordion section in `#video-modal` allowing per-draft selection between `Default (Inherit channel setting)`, `Solid Background`, and `Blurred Ambient Footage`, and shadow selection between `Default (Inherit channel setting)`, `Enabled`, and `Disabled`. Properly coupled section visibility to presentation mode (`footage_clean` hides visual effects).
+    - **Worker Inheritance Precedence Fixed (`studio/worker.py`)**:
+      - Realigned visual setting resolution order:
+        1. Explicit per-draft override on record (`record.get("card_shadow")` / `record.get("card_background_mode")`)
+        2. Live channel-level setting (`config.get("layout", {}).get(...)`)
+        3. Legacy root configuration / style preset fallback (`config.get(...)` / `render_config.get("layout", {}).get(...)`)
+        4. Milestone 9.1 renderer default (`DEFAULT_CARD_BACKGROUND_MODE = "solid"`, `DEFAULT_CARD_SHADOW = False`)
+      - Completely removed stale draft creation snapshots `record.get("config", {}).get("layout")` from the lookup chain, allowing unreviewed drafts to inherit live channel setting updates while honoring explicit draft overrides (including explicit `False`).
+  - **Test Evidence (Reported vs Verified)**:
+    - **Milestone 9.2 Test Suite ([`tests/test_milestone9_2.py`](file:///c:/Users/Afriyie/KenauShorts/tests/test_milestone9_2.py))**: 36/36 tests passed (reported at 4.24s) covering settings validation, production `StudioHandler.mutate` execution, worker precedence with snapshot isolation, explicit False preservation, legacy draft compatibility, and Node.js UI contracts.
+    - **Milestone 9.1 Test Suite ([`tests/test_milestone9_1.py`](file:///c:/Users/Afriyie/KenauShorts/tests/test_milestone9_1.py))**: 18/18 tests passed (reported at 14.46s) covering filtergraph construction, shadow alpha compositing, clean-footage isolation, and performance benchmark.
+    - **Node.js UI Health Suite ([`tests/test_health_ui.js`](file:///c:/Users/Afriyie/KenauShorts/tests/test_health_ui.js))**: 13/13 tests passed.
+    - **Bytecode & Formatting**: `python -m compileall core studio tests` (0 errors), `git diff --check` (0 errors).
+    - **Protected Invariants**: `studio-settings.json` completely untouched (`"interval_hours": 3`), `studio/supervisor.py` and `core/agent.py` untouched (0 diff against `origin/main`), 0 live YouTube calls/uploads.
+  - **Remaining Stage 9 Scope (Pending / Proposed)**:
+    - Milestone 9.3: Options under evaluation include Card Container Plate Styles & Typography Legibility (translucent rounded card plate, headline text drop shadow/outline) or Modernized Style Presets & Stage 9 Closure (`core/style_presets.py` curation and formal Stage 9 wrap-up).
+
 - **Stage 8 Closed with Documented Caveat (Milestones 8.1–8.5 Complete)**:
   - **Status & Scope**: Stage 8 (Clean-Footage Rendering, Presentation Modes, Ingestion Propagation, Channel Defaults, and Re-render Integrity) is formally closed across Milestones 8.1–8.5. No Milestone 8.6 is approved or required by current evidence.
   - **Verified Targeted Tests**: 160 tests across 7 targeted test suites (`test_milestone8_*.py`, `test_stage5_library.py`, `test_stage2_queue_cancel.py`, `test_server_lifecycle.py` + `test_alerts.py`, `test_operational_smoke.py` + `test_supervisor.py` + `test_frontend_integration.py`, `test_agent_discovery.py` + `test_pipeline_integration.py`, and `test_health_ui.js`) confirmed passing with exit code 0 at HEAD (`c31b367`).
@@ -664,8 +692,13 @@ bug.
   `_render_pick()` → `render()`), just needs actual instrumental track
   file(s) placed in `assets/music/`. Recommended source: pixabay.com/music
   (free, no attribution required). Not yet resumed.
-- **Card visual effects**: requested but not yet scoped — needs a concrete
-  idea (zoom/pan? transition? vignette?) before implementation starts.
+- **Card visual effects**: Stage 9 Milestones 9.1 (ambient background blur
+  and video window drop shadows in `core/render.py`) and 9.2 (channel defaults,
+  settings governance, Studio UI controls, draft overrides, and worker
+  inheritance) are completed and published at commit `b9665d2`. Remaining
+  scope for Stage 9 (e.g. enclosed card container plates, headline text
+  contrast enhancement, and modernized style presets) is pending user roadmap
+  decision.
 - **Bulk upload**: considered, deliberately not built — uploading is
   irreversible/public-facing and costs real quota, unlike bulk delete.
 
